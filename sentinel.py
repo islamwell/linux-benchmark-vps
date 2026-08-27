@@ -34,8 +34,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.4.0"
-UPDATED = "2026-08-27 15:11"
+VERSION = "1.4.1"
+UPDATED = "2026-08-27 15:45"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -1128,6 +1128,147 @@ def check_services(cur, prev, dt, T):
     return c.finalize()
 
 
+def _scan_php_slowlogs():
+    """Scan Plesk & Linux PHP-FPM slow logs and pool configurations."""
+    results = {
+        "slow_entries": [],
+        "slow_count_1h": 0,
+        "slow_count_24h": 0,
+        "top_slow_scripts": [],
+        "unlogged_pools": [],
+        "active_php_pools": 0,
+        "is_plesk": os.path.exists("/usr/local/psa") or os.path.exists("/opt/plesk/php"),
+    }
+    
+    log_candidates = []
+    # Plesk PHP log paths
+    for ver in ("70", "71", "72", "73", "74", "80", "81", "82", "83", "84", "85"):
+        d = f"/var/log/plesk-php{ver}-fpm"
+        if os.path.isdir(d):
+            try:
+                for f in os.listdir(d):
+                    if "slow" in f.lower() and f.endswith(".log"):
+                        log_candidates.append(os.path.join(d, f))
+            except Exception:
+                pass
+    
+    # Generic & distro PHP-FPM log paths
+    for pattern_dir in ("/var/log/php-fpm", "/var/log/php", "/var/log"):
+        if os.path.isdir(pattern_dir):
+            try:
+                for f in os.listdir(pattern_dir):
+                    if "slow" in f.lower() and (f.endswith(".log") or "fpm" in f.lower()):
+                        log_candidates.append(os.path.join(pattern_dir, f))
+            except Exception:
+                pass
+
+    # Plesk per-domain system logs
+    if os.path.isdir("/var/www/vhosts/system"):
+        try:
+            for domain in os.listdir("/var/www/vhosts/system"):
+                logs_dir = os.path.join("/var/www/vhosts/system", domain, "logs")
+                if os.path.isdir(logs_dir):
+                    for f in os.listdir(logs_dir):
+                        if "slow" in f.lower() and f.endswith(".log"):
+                            log_candidates.append(os.path.join(logs_dir, f))
+        except Exception:
+            pass
+
+    seen_blocks = []
+    for log_path in set(log_candidates):
+        try:
+            content = read(log_path)
+            if not content:
+                continue
+            if len(content) > 300000:
+                content = content[-300000:]
+            
+            blocks = re.split(r'\n(?=\[\d{2}-[A-Za-z]{3}-\d{4}\s+\d{2}:\d{2}:\d{2}\])', content)
+            for block in blocks:
+                block = block.strip()
+                if not block or "script_filename" not in block:
+                    continue
+                header_m = re.search(r'\[(\d{2}-[A-Za-z]{3}-\d{4}\s+\d{2}:\d{2}:\d{2})\].*?\[pool\s+([^\]]+)\]', block)
+                script_m = re.search(r'script_filename\s*=\s*(.+)', block)
+                
+                ts_str = header_m.group(1) if header_m else ""
+                pool_name = header_m.group(2) if header_m else "default"
+                script_path = script_m.group(1).strip() if script_m else "unknown"
+                
+                trace_lines = [l.strip() for l in block.splitlines() if re.search(r'\[0x[0-9a-fA-F]+\]|\.php:\d+', l)]
+                top_trace = trace_lines[0] if trace_lines else ""
+                top_trace = re.sub(r'^\[0x[0-9a-fA-F]+\]\s*', '', top_trace)[:120]
+                
+                entry_age_hours = 0
+                try:
+                    dt_entry = datetime.strptime(ts_str, "%d-%b-%Y %H:%M:%S")
+                    entry_age_hours = (datetime.now() - dt_entry).total_seconds() / 3600.0
+                except Exception:
+                    pass
+                
+                if entry_age_hours <= 1.0:
+                    results["slow_count_1h"] += 1
+                if entry_age_hours <= 24.0:
+                    results["slow_count_24h"] += 1
+                    
+                seen_blocks.append({
+                    "pool": pool_name,
+                    "script": script_path,
+                    "time": ts_str,
+                    "trace": top_trace,
+                    "age_h": round(entry_age_hours, 1)
+                })
+        except Exception:
+            continue
+
+    seen_blocks.sort(key=lambda x: x["age_h"])
+    results["slow_entries"] = seen_blocks[:20]
+    
+    script_counts = {}
+    for b in seen_blocks[:50]:
+        key = (b["pool"], b["script"], b["trace"])
+        script_counts[key] = script_counts.get(key, 0) + 1
+    
+    top_scripts = []
+    for (pool, script, trace), count in sorted(script_counts.items(), key=lambda kv: -kv[1])[:6]:
+        display_script = script.replace("/var/www/vhosts/", ".../")
+        top_scripts.append({
+            "pool": pool,
+            "script": display_script,
+            "duration": f"{count}× slow",
+            "trace": trace
+        })
+    results["top_slow_scripts"] = top_scripts
+
+    pool_conf_dirs = [
+        "/opt/plesk/php/8.4/etc/php-fpm.d",
+        "/opt/plesk/php/8.3/etc/php-fpm.d",
+        "/opt/plesk/php/8.2/etc/php-fpm.d",
+        "/opt/plesk/php/8.1/etc/php-fpm.d",
+        "/opt/plesk/php/8.0/etc/php-fpm.d",
+        "/opt/plesk/php/7.4/etc/php-fpm.d",
+        "/etc/php/8.3/fpm/pool.d",
+        "/etc/php/8.2/fpm/pool.d",
+        "/etc/php/8.1/fpm/pool.d",
+        "/etc/php/7.4/fpm/pool.d",
+        "/etc/php-fpm.d",
+    ]
+    for pdir in pool_conf_dirs:
+        if os.path.isdir(pdir):
+            try:
+                for f in os.listdir(pdir):
+                    if f.endswith(".conf"):
+                        results["active_php_pools"] += 1
+                        conf_path = os.path.join(pdir, f)
+                        conf_txt = read(conf_path)
+                        if not re.search(r'^\s*request_slowlog_timeout\s*=\s*[1-9]', conf_txt, re.M):
+                            results["unlogged_pools"].append(f.replace(".conf", ""))
+            except Exception:
+                pass
+
+    return results
+
+
 # 10 ── LOGS & SECURITY ───────────────────────────────────────────────────────
 def check_logs(cur, prev, dt, T):
     c = Check("logs", "Logs & Security Signals", "shield", 1.0)
@@ -1152,18 +1293,32 @@ def check_logs(cur, prev, dt, T):
     rc3, jstat = sh(["journalctl", "--disk-usage"], ttl=300)
     permit_root = bool(re.search(r"^\s*PermitRootLogin\s+yes", read("/etc/ssh/sshd_config"), re.M | re.I))
 
+    php_data = _scan_php_slowlogs()
+
     c.metrics = {"errors_1h": nerr, "top_errors": [{"count": n, "text": t} for t, n in top],
                  "auth_fails_1h": len(fails), "top_ips": top_ips, "segfaults": len(segv),
                  "journal_usage": (jstat or "").strip().split("take up ")[-1].strip(". \n"),
-                 "permit_root_login": permit_root}
+                 "permit_root_login": permit_root,
+                 "php_slow_1h": php_data["slow_count_1h"],
+                 "php_slow_24h": php_data["slow_count_24h"],
+                 "top_slow_scripts": php_data["top_slow_scripts"],
+                 "unlogged_php_pools": len(php_data["unlogged_pools"]),
+                 "is_plesk": php_data["is_plesk"]}
     c.value, c.unit = f"{nerr}", "errors/h"
     scores = [score_from(nerr, T["logerr_warn"], T["logerr_crit"]),
               score_from(len(fails), T["authfail_warn"], T["authfail_crit"])]
+    if php_data["slow_count_1h"] > 0:
+        s_php, st_php = score_from(php_data["slow_count_1h"], 5, 25)
+        scores.append((s_php, st_php))
     c.score = min(s for s, _ in scores)
     c.status = LEVELS[max(RANK[st] for _, st in scores)]
     c.pct = clamp(nerr / max(T["logerr_crit"], 1) * 100)
+    
+    extra_summary = ""
+    if php_data["slow_count_1h"] > 0:
+        extra_summary = f" · {php_data['slow_count_1h']} PHP slow/h"
     c.summary = (f"{nerr} journal errors/h · {len(fails)} failed logins/h · "
-                 f"{len(segv)} segfaults · journal {c.metrics['journal_usage'] or 'n/a'}")
+                 f"{len(segv)} segfaults{extra_summary} · journal {c.metrics['journal_usage'] or 'n/a'}")
 
     if nerr >= T["logerr_warn"]:
         c.add("crit" if nerr >= T["logerr_crit"] else "warn",
@@ -1193,6 +1348,30 @@ def check_logs(cur, prev, dt, T):
                "Disable password auth: sshd_config → `PasswordAuthentication no`, `PermitRootLogin no`, "
                "`KbdInteractiveAuthentication no` → `sudo sshd -t && sudo systemctl reload sshd`",
                "Restrict SSH to a VPN/bastion CIDR in the security group, or move to WireGuard"])
+    if php_data["slow_count_1h"] > 0:
+        c.add("crit" if php_data["slow_count_1h"] >= 20 else "warn",
+              f"{php_data['slow_count_1h']} PHP slow script execution(s) in the last hour",
+              "Top: " + (" | ".join(f"{s['script']} ({s['pool']}, {s['duration']})" for s in php_data["top_slow_scripts"][:3]) or "see details"),
+              "Slow PHP scripts lock up worker processes in the FPM pool until pm.max_children "
+              "is exhausted, triggering 502 Bad Gateway and 504 Gateway Timeout errors.",
+              ["tail -f /var/log/plesk-php*-fpm/slow.log 2>/dev/null || tail -f /var/log/php*-fpm.slow.log",
+               "grep -rn 'script_filename' /var/log/plesk-php*-fpm/ /var/log/php*-fpm/ 2>/dev/null | tail -20",
+               "plesk bin php_handler --list 2>/dev/null || php -v"],
+              ["Inspect the backtrace function/plugin above to optimize slow DB queries or unbuffered external cURL calls",
+               "Enable Redis / Memcached object cache (e.g. `redis-server` + WP Redis plugin)",
+               "Tune PHP OPcache in php.ini: `opcache.enable=1 opcache.memory_consumption=256 opcache.max_accelerated_files=20000`",
+               "Raise FPM pool capacity: adjust `pm.max_children` in /opt/plesk/php/*/etc/php-fpm.d/<domain>.conf"])
+    if php_data["active_php_pools"] > 0 and len(php_data["unlogged_pools"]) > 0:
+        c.add("info" if php_data["slow_count_1h"] == 0 else "warn",
+              f"PHP-FPM slow logging disabled on {len(php_data['unlogged_pools'])} pool(s)",
+              "e.g. " + ", ".join(php_data["unlogged_pools"][:6]),
+              "When PHP requests freeze or exceed 5–10s, PHP slow logging records the exact script "
+              "filename, line number, and function backtrace (e.g. plugin xyz) for instant resolution.",
+              ["grep -rnE 'request_slowlog_timeout|slowlog' /opt/plesk/php/*/etc/php-fpm.d/ /etc/php/*/fpm/pool.d/ 2>/dev/null",
+               "ls -la /opt/plesk/php/*/etc/php-fpm.d/ 2>/dev/null"],
+              ["Run `sudo bash deploy/enable-plesk-php-slowlog.sh` to auto-configure all Plesk PHP pools",
+               "Plesk CLI per domain: `plesk bin site -u <domain> -php_handler_type fpm -additional-settings $'slowlog = /var/log/plesk-php82-fpm/slow.log\\nrequest_slowlog_timeout = 5s\\nrequest_slowlog_trace_depth = 20'`",
+               "Standard PHP-FPM: Add `request_slowlog_timeout = 5s` & `slowlog = /var/log/php-fpm/www-slow.log` to pool config, then reload"])
     if permit_root:
         c.add("warn", "SSH allows direct root login",
               "PermitRootLogin yes in /etc/ssh/sshd_config",
@@ -1936,6 +2115,7 @@ function tables(c){
  if(c.metrics.top_cpu) t.push(list(c.metrics.top_cpu,['comm','pid','cpu'],'Top CPU (%)'));
  if(c.metrics.top_mem) t.push(list(c.metrics.top_mem,['comm','pid','rss'],'Top memory (RSS)'));
  if(c.metrics.top_errors) t.push(list(c.metrics.top_errors,['count','text'],'Most frequent log errors'));
+ if(c.metrics.top_slow_scripts) t.push(list(c.metrics.top_slow_scripts,['pool','script','duration','trace'],'PHP-FPM Slow Script Executions'));
  if(c.metrics.failed_units&&c.metrics.failed_units.length)
    t.push(`<h4 style="margin-top:12px">Failed units</h4><table class="mtable">`+
     c.metrics.failed_units.map(u=>`<tr><td colspan="2" style="color:var(--crit)">${esc(u)}</td></tr>`).join('')+'</table>');
