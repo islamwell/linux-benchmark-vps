@@ -224,4 +224,4 @@ When `web.enabled` is `true`:
 ---
 
 ## 📜 Versioning
-Current Version: **v1.5.0 (updated 2026-08-27 16:05)**
+Current Version: **v1.5.1 (updated 2026-08-27 16:18)**

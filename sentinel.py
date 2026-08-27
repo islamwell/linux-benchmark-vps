@@ -36,8 +36,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.5.0"
-UPDATED = "2026-08-27 16:05"
+VERSION = "1.5.1"
+UPDATED = "2026-08-27 16:18"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -2134,9 +2134,15 @@ const ICONS = {
 const CLR={ok:'var(--ok)',warn:'var(--warn)',crit:'var(--crit)',info:'var(--acc)'};
 let REPORT=null, HIST=[], INCIDENTS=[], FILTER='all', AUTO=true, TIMER=null, OPEN=new Set();
 
-const $=s=>document.querySelector(s), esc=s=>String(s==null?'':s)
- .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-const api=(p,o={})=>fetch(p,{headers:{'X-Auth-Token':BOOT.token||''},...o}).then(r=>r.json());
+const URL_TOKEN = (new URLSearchParams(window.location.search).get('token') || BOOT.token || '').trim();
+const api=(p,o={})=>{
+ const sep = p.includes('?') ? '&' : '?';
+ const url = URL_TOKEN ? `${p}${sep}token=${encodeURIComponent(URL_TOKEN)}` : p;
+ return fetch(url,{headers:{'X-Auth-Token':URL_TOKEN},...o}).then(r=>{
+  if(r.status === 401) throw new Error('Unauthorized - Invalid token');
+  return r.json();
+ });
+};
 const bytes=n=>{n=+n||0;const u=['B','K','M','G','T','P'];let i=0;while(n>=1024&&i<5){n/=1024;i++}
  return (i?n.toFixed(1):n)+u[i]};
 
@@ -2365,8 +2371,11 @@ class Handler(BaseHTTPRequestHandler):
         if not tok:
             return True
         q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-        return (self.headers.get("X-Auth-Token") == tok or q.get("token", [""])[0] == tok
-                or self.headers.get("Authorization", "") == f"Bearer {tok}")
+        req_token = q.get("token", [""])[0].strip() or (self.headers.get("X-Auth-Token") or "").strip()
+        auth_hdr = (self.headers.get("Authorization") or "").strip()
+        if auth_hdr.startswith("Bearer "):
+            req_token = auth_hdr[7:].strip()
+        return req_token == tok
 
     def _send(self, code, body, ctype="application/json; charset=utf-8"):
         if isinstance(body, (dict, list)):
