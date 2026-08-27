@@ -13,8 +13,10 @@
 """
 
 import argparse
+import glob
 import json
 import os
+import pwd
 import re
 import shutil
 import smtplib
@@ -34,8 +36,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.4.2"
-UPDATED = "2026-08-27 15:50"
+VERSION = "1.5.0"
+UPDATED = "2026-08-27 16:05"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -58,6 +60,8 @@ DEFAULTS = {
     "scan_interval": 30,                 # seconds between background scans
     "history_points": 720,
     "state_file": "/var/lib/health-sentinel/state.json",
+    "incidents_dir": "/var/lib/health-sentinel/incidents",
+    "incident_history": 50,
     "web": {"enabled": True, "bind": "127.0.0.1", "port": 8686, "token": ""},
     "thresholds": {
         "cpu_warn": 85, "cpu_crit": 95,
@@ -78,6 +82,7 @@ DEFAULTS = {
         "zombie_warn": 15, "zombie_crit": 60,
         "logerr_warn": 25, "logerr_crit": 150,        # journal errors / hour
         "authfail_warn": 30, "authfail_crit": 250,    # failed logins / hour
+        "php_slow_warn": 3, "php_slow_crit": 15,      # slow PHP scripts / hour
     },
     "alerts": {
         "enabled": True,
@@ -109,14 +114,17 @@ def deep_merge(base, over):
 def load_config(path):
     cfg = json.loads(json.dumps(DEFAULTS))
     if path and os.path.exists(path):
-        with open(path) as fh:
-            cfg = deep_merge(cfg, json.load(fh))
+        try:
+            with open(path) as fh:
+                cfg = deep_merge(cfg, json.load(fh))
+        except Exception as e:
+            print(f"[sentinel] warning: failed to parse config file {path}: {e}", file=sys.stderr)
     cfg["hostname"] = cfg["hostname"] or socket.gethostname()
     return cfg
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  LOW LEVEL HELPERS
+#  LOW LEVEL HELPERS & SAFE LOG TAILING
 # ─────────────────────────────────────────────────────────────────────────────
 
 def read(path, default=""):
@@ -133,6 +141,21 @@ def read_int(path, default=0):
         return int(val.split()[0]) if val else default
     except Exception:
         return default
+
+
+def read_tail(path, max_bytes=262144):
+    """Read only the tail of a file from disk without loading the whole file into memory."""
+    try:
+        if not os.path.isfile(path):
+            return ""
+        size = os.path.getsize(path)
+        with open(path, "r", errors="replace") as fh:
+            if size > max_bytes:
+                fh.seek(size - max_bytes)
+                fh.readline()  # discard partial first line
+            return fh.read()
+    except Exception:
+        return ""
 
 
 _cache = {}
@@ -160,6 +183,18 @@ def sh(cmd, timeout=4, ttl=0):
         with _cache_lock:
             _cache[key] = (now, res)
     return res
+
+
+_user_cache = {}
+
+
+def get_username(uid):
+    if uid not in _user_cache:
+        try:
+            _user_cache[uid] = pwd.getpwuid(int(uid)).pw_name
+        except Exception:
+            _user_cache[uid] = str(uid)
+    return _user_cache[uid]
 
 
 def fmt_bytes(n, digits=1):
@@ -308,10 +343,42 @@ def sample_procs():
             continue
         try:
             state = f[0]
-            procs[pid] = {"comm": comm, "state": state,
-                          "ticks": int(f[11]) + int(f[12]),
-                          "rss": int(f[21]) * PAGE,
-                          "threads": int(f[17])}
+            ppid = int(f[1])
+            uid = 0
+            try:
+                uid = os.stat(f"/proc/{pid}").st_uid
+            except Exception:
+                pass
+            
+            cmdline = read(f"/proc/{pid}/cmdline").replace("\0", " ").strip()
+            if not cmdline:
+                cmdline = f"[{comm}]"
+                
+            cgroup = ""
+            for cg in read(f"/proc/{pid}/cgroup").splitlines():
+                if ":name=systemd:" in cg or cg.startswith("0::"):
+                    cgroup = cg.split(":")[-1].strip()
+                    break
+
+            stack = ""
+            if state == "D":
+                stack_lines = read(f"/proc/{pid}/stack").splitlines()[:3]
+                stack = " -> ".join(re.sub(r'^\s*\[<\w+>\]\s*', '', l) for l in stack_lines)
+
+            procs[pid] = {
+                "pid": int(pid),
+                "ppid": ppid,
+                "uid": uid,
+                "user": get_username(uid),
+                "comm": comm,
+                "cmdline": cmdline[:250],
+                "cgroup": cgroup,
+                "state": state,
+                "ticks": int(f[11]) + int(f[12]),
+                "rss": int(f[21]) * PAGE,
+                "threads": int(f[17]),
+                "stack": stack
+            }
             states[state] = states.get(state, 0) + 1
         except ValueError:
             continue
@@ -398,21 +465,21 @@ class Check:
 def top_cpu(cur, prev, dt, n=5):
     out = []
     pc, pp = cur["procs"][0], prev["procs"][0]
-    for pid, p in pc.items():
-        old = pp.get(pid)
+    for pid_str, p in pc.items():
+        old = pp.get(pid_str)
         if not old:
             continue
         used = (p["ticks"] - old["ticks"]) / CLK / dt * 100.0
         if used > 0.8:
-            out.append((round(used, 1), pid, p["comm"]))
-    out.sort(reverse=True)
+            out.append((round(used, 1), p["pid"], p["comm"], p["user"], p["cmdline"]))
+    out.sort(key=lambda x: -x[0])
     return out[:n]
 
 
 def top_mem(cur, n=5):
-    ps = [(p["rss"], pid, p["comm"]) for pid, p in cur["procs"][0].items()]
-    ps.sort(reverse=True)
-    return [(fmt_bytes(r), pid, c) for r, pid, c in ps[:n]]
+    ps = [(p["rss"], p["pid"], p["comm"], p["user"], p["cmdline"]) for p in cur["procs"][0].values()]
+    ps.sort(key=lambda x: -x[0])
+    return [(fmt_bytes(r), pid, c, u, cmd) for r, pid, c, u, cmd in ps[:n]]
 
 
 # 1 ── CPU ────────────────────────────────────────────────────────────────────
@@ -441,48 +508,47 @@ def check_cpu(cur, prev, dt, T):
 
     if busy >= T["cpu_warn"]:
         sev = "crit" if busy >= T["cpu_crit"] else "warn"
+        top_str = ", ".join(f"{u}% {n}[{pid}] ({user})" for u, pid, n, user, _ in tops) or "n/a"
         c.add(sev, f"CPU saturated at {busy:.0f}%",
-              "Top consumers: " + (", ".join(f"{n}({pid}) {u}%" for u, pid, n in tops) or "n/a"),
-              "Sustained >85% CPU means runnable threads wait for cores: request latency grows "
-              "non-linearly and queues (nginx/php-fpm/DB) start backing up.",
+              f"Top consumers: {top_str}",
+              "Sustained >85% CPU causes runnable threads to wait for cores; latency degrades "
+              "non-linearly and HTTP / PHP / database request backlogs build up rapidly.",
               ["top -bn1 -o %CPU | head -20",
-               "pidstat -u 2 5            # per-process trend",
-               "ps -eo pid,ppid,%cpu,comm --sort=-%cpu | head",
-               "perf top -F 99 --stdio   # kernel/user hotspots (5s, Ctrl-C)"],
-              [f"renice +10 -p {tops[0][1]}   # deprioritise the hog" if tops else "renice +10 -p <PID>",
-               "systemctl set-property <unit> CPUQuota=200%   # cgroup cap, persists",
-               "Scale out: add workers/replicas or move the noisy job off this box",
-               "If it is a cron/batch job: run it with `nice -n 19 ionice -c3 …` off-peak"])
+               "pidstat -u 2 5            # per-process CPU trend",
+               "ps -eo pid,user,%cpu,cmd --sort=-%cpu | head -15",
+               "perf top -F 99 --stdio   # live user & kernel hotspots"],
+              [f"Renice top process: `sudo renice +10 -p {tops[0][1]}`" if tops else "Renice hog: `sudo renice +10 -p <PID>`",
+               "Set cgroup limit: `sudo systemctl set-property <unit> CPUQuota=200%`",
+               "If background batch/cron job: launch with `nice -n 19 ionice -c3 <command>`",
+               "Scale horizontally or upgrade CPU cores on hosting provider"])
     if d["system"] > 30:
-        c.add("warn", f"Kernel (system) time high: {d['system']:.0f}%",
-              "More than 30% of CPU is spent in kernel space.",
-              "Usually excessive syscalls, context switches, softirq/network interrupts, "
-              "or a chatty container runtime.",
-              ["vmstat 1 5                # cs/in columns",
-               "pidstat -w 2 5            # context switch offenders",
+        c.add("warn", f"Kernel (system) CPU time high: {d['system']:.0f}%",
+              "More than 30% of CPU time is consumed in kernel space.",
+              "Common causes: excessive syscall storms, rapid context switching, network interrupt saturation.",
+              ["vmstat 1 5                # inspect cs (context switches) and in (interrupts)",
+               "pidstat -w 2 5            # identify context switch offenders",
                "cat /proc/interrupts | sort -k2 -nr | head"],
-              ["Batch I/O (larger buffers), enable connection pooling / keep-alive",
-               "Spread NIC interrupts: `sudo systemctl enable --now irqbalance`",
-               "Check for a syscall storm: `strace -c -f -p <PID>` (30s)"])
+              ["Spread network interrupts: `sudo systemctl enable --now irqbalance`",
+               "Enable connection keep-alive & HTTP connection pooling",
+               "Trace syscall storm: `sudo strace -c -f -p <PID>`"])
     if d["steal"] >= T["steal_warn"]:
         c.add("crit" if d["steal"] >= T["steal_crit"] else "warn",
               f"Hypervisor steal time {d['steal']:.1f}%",
-              "The host is not giving this VM the CPU it asks for.",
-              "Steal time = noisy neighbours or a CPU-credit/burst limit exhausted "
-              "(AWS T-series, GCP shared-core, oversold VPS).",
+              "The underlying physical hypervisor is depriving this VM of CPU time.",
+              "Steal time signifies an oversold host node or exhausted burst/CPU credits (e.g. AWS T-series, burstable VPS).",
               ["mpstat -P ALL 2 5", "grep -c ^processor /proc/cpuinfo",
-               "curl -s http://169.254.169.254/latest/meta-data/instance-type  # AWS"],
-              ["Switch to a dedicated/unlimited instance type (t3→m6i, or enable T3 Unlimited)",
-               "Migrate the VM to another host (stop/start on cloud = new host)",
-               "Open a ticket with the provider quoting steal% and timestamps"])
+               "curl -s http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || true"],
+              ["Upgrade to a dedicated CPU instance or enable burstable unlimited credits",
+               "Reboot / migrate VM to land on a less congested hypervisor host node",
+               "Contact hosting support with steal% timestamps and metrics"])
     if p.get("some_avg10", 0) > 40:
-        c.add("warn", f"CPU pressure (PSI) {p['some_avg10']:.0f}%",
-              "Tasks are stalling waiting for CPU time even if utilisation looks ok.",
-              "PSI counts real stall time — the most accurate saturation signal.",
+        c.add("warn", f"CPU pressure stall (PSI) {p['some_avg10']:.0f}%",
+              "Tasks are stalling waiting for CPU run-queue time.",
+              "PSI measures real latency stalls, providing early warning before load spikes.",
               ["cat /proc/pressure/cpu",
-               "for f in /sys/fs/cgroup/*/cpu.pressure; do echo $f; cat $f; done"],
-              ["Find the cgroup with the highest cpu.pressure and raise CPUQuota or move it",
-               "Reduce worker concurrency so it matches core count"])
+               "grep -r '' /sys/fs/cgroup/*/cpu.pressure 2>/dev/null | sort -t= -k2 -nr | head"],
+              ["Throttle rogue cgroups using CPUQuota=",
+               "Align worker thread counts with actual core count"])
     return c.finalize()
 
 
@@ -509,26 +575,24 @@ def check_load(cur, prev, dt, T):
 
     if n1 >= T["load_warn"]:
         sev = "crit" if n1 >= T["load_crit"] else "warn"
-        cause = ("I/O wait — most of the queue is in uninterruptible D state"
-                 if blocked >= max(2, running) else "CPU contention — runnable tasks exceed cores")
-        c.add(sev, f"Run queue {n1:.2f}× cores ({l1:.2f} on {CORES} cores)",
-              f"Likely cause: {cause}. R={running}, D={blocked}.",
-              "Load counts runnable AND uninterruptible tasks. >1×cores sustained = "
-              "everything queues; >2× and latency SLOs break.",
+        cause = ("I/O Wait (D-state processes blocked on storage/NFS)"
+                 if blocked >= max(2, running) else "CPU saturation (runnable threads exceed core count)")
+        c.add(sev, f"Run queue elevated: {n1:.2f}× cores ({l1:.2f} on {CORES} cores)",
+              f"Dominant cause: {cause}. Running (R)={running}, Blocked (D)={blocked}.",
+              "Load average counts runnable AND uninterruptible tasks. >1.0 per core indicates queuing.",
               ["uptime; vmstat 1 5",
-               "ps -eo state,pid,comm | awk '$1~/^[RD]/' | sort | uniq -c | sort -rn | head",
-               "ps -eo pid,stat,wchan:25,comm | awk '$2~/D/'   # what are they blocked on?"],
-              ["If D-state dominated → fix storage/NFS first (see Disk I/O check)",
-               "If R dominated → cap concurrency, add cores, scale horizontally",
-               "Kill/pause the batch job: `systemctl stop <unit>` then re-run with nice/ionice"])
+               "ps -eo state,pid,user,comm,cmd | awk '$1~/^[RD]/' | sort | head -20",
+               "for p in $(ps -eo pid,stat | awk '$2~/D/{print $1}'); do echo \"PID $p:\"; cat /proc/$p/stack 2>/dev/null; done"],
+              ["If D-state dominated: inspect disk latency and unmount stale NFS mounts",
+               "If R-state dominated: identify and throttle top CPU process",
+               "Restart or terminate wedged jobs: `sudo kill -15 <PID>`"])
     if l1 > l15 * 2 and n1 > 0.7:
-        c.add("info", "Load is spiking fast",
-              f"1m load is {l1 / max(l15, .01):.1f}× the 15m average.",
-              "A sudden burst — deploy, cron storm, traffic spike or a stuck retry loop.",
-              ["journalctl --since '-10 min' -p warning --no-pager | tail -40",
-               "ss -s ; systemctl list-jobs"],
-              ["Correlate with cron: `grep CRON /var/log/syslog | tail`",
-               "Add jitter/backoff to retries; stagger cron with RandomizedDelaySec="])
+        c.add("info", "Sudden load spike detected",
+              f"1-minute load is {l1 / max(l15, .01):.1f}× higher than the 15-minute baseline.",
+              "Points to a sudden burst: traffic spike, deployment, or concurrent scheduled cron jobs.",
+              ["journalctl --since '-10 min' -p warning --no-pager | tail -30",
+               "grep CRON /var/log/syslog 2>/dev/null | tail -20"],
+              ["Check recent cron executions and stagger with RandomizedDelaySec="])
     return c.finalize()
 
 
@@ -565,58 +629,39 @@ def check_memory(cur, prev, dt, T):
 
     if used_pct >= T["mem_warn"]:
         c.add("crit" if used_pct >= T["mem_crit"] else "warn",
-              f"Only {fmt_bytes(avail)} available ({used_pct:.0f}% used)",
-              "Top RSS: " + ", ".join(f"{n}({pid}) {r}" for r, pid, n in top_mem(cur)),
-              "Below ~10% available the kernel reclaims page cache aggressively → disk reads "
-              "explode; then the OOM killer picks a victim (often your DB).",
-              ["free -h ; ps -eo pid,rss,comm --sort=-rss | head -15",
-               "smem -tk -c 'pid user command rss uss pss' 2>/dev/null | tail -15",
-               "sudo slabtop -o | head -15     # kernel/slab leaks",
-               "cat /proc/meminfo | egrep 'MemAvail|Committed|Slab|Shmem'"],
-              ["Cap the offender: `systemctl set-property <unit> MemoryMax=2G MemoryHigh=1.6G`",
-               "Tune app heaps: JVM -Xmx, PHP memory_limit, PG shared_buffers ≈25% RAM, "
-               "MySQL innodb_buffer_pool_size ≈50–60% RAM (do not overcommit!)",
-               "Reduce worker count: gunicorn/php-fpm workers × RSS must fit in RAM",
-               "Protect critical services: `systemctl set-property db.service OOMScoreAdjust=-800`",
-               "Long-term: add RAM or move the memory-heavy tier to its own node"])
+              f"RAM critically low: only {fmt_bytes(avail)} available ({used_pct:.0f}% used)",
+              "Top RSS: " + ", ".join(f"{r} {n}[{pid}] ({user})" for r, pid, n, user, _ in top_mem(cur)),
+              "Below ~10% available memory, page cache is evicted aggressively causing severe disk thrashing, "
+              "eventually leading the OOM Killer to terminate vital services (databases/web servers).",
+              ["free -h ; ps -eo pid,user,rss,pmem,cmd --sort=-rss | head -15",
+               "smem -tk -c 'pid user command rss pss' 2>/dev/null | tail -15",
+               "sudo slabtop -o | head -15"],
+              ["Limit memory per systemd unit: `sudo systemctl set-property <unit> MemoryMax=2G`",
+               "Tune DB buffer sizes: MySQL `innodb_buffer_pool_size` (50–60% RAM max), PG `shared_buffers` (25% RAM)",
+               "Protect critical services: `sudo systemctl set-property mariadb.service OOMScoreAdjust=-800`",
+               "Upgrade server RAM if workloads legitimately exceed current capacity"])
     if sw_t and sw_pct >= T["swap_warn"]:
         c.add("crit" if sw_pct >= T["swap_crit"] else "warn",
-              f"Swap {sw_pct:.0f}% used ({fmt_bytes(sw_t - sw_f)})",
-              f"Swap-in {si:.0f} pg/s · swap-out {so:.0f} pg/s",
-              "Anonymous memory on disk is ~1000× slower than RAM. Heavy swap traffic "
-              "(thrashing) looks like a total outage while CPU appears idle.",
-              ["vmstat 1 5   # watch si/so",
-               "for f in /proc/*/status; do awk '/^Name|VmSwap/{printf \"%s \",$2}END{print \"\"}' $f; "
-               "done | sort -k2 -h | tail -10"],
-              ["Free RAM first (see above) — swap is a symptom, not the disease",
-               "Lower swappiness for latency-sensitive boxes: "
-               "`sudo sysctl -w vm.swappiness=10` (persist in /etc/sysctl.d/99-tune.conf)",
-               "Then reset swap once RAM is free: `sudo swapoff -a && sudo swapon -a`",
-               "Consider zram instead of disk swap on small VMs"])
+              f"Swap heavily utilized: {sw_pct:.0f}% ({fmt_bytes(sw_t - sw_f)})",
+              f"Swap activity: in {si:.0f} pg/s · out {so:.0f} pg/s",
+              "Swap memory on disk is orders of magnitude slower than RAM. Heavy swapping causes severe latency spikes.",
+              ["vmstat 1 5   # check si/so columns",
+               "for f in /proc/*/status; do awk '/^Name|VmSwap/{printf \"%s \",$2}END{print \"\"}' $f; done | sort -k2 -h | tail -10"],
+              ["Reduce swappiness: `sudo sysctl -w vm.swappiness=10` (persist in /etc/sysctl.d/99-sentinel.conf)",
+               "Reset swap once RAM is freed: `sudo swapoff -a && sudo swapon -a`"])
     if si + so > 200:
-        c.add("crit", "Swap thrashing detected", f"{si + so:.0f} pages/s moving in+out of swap.",
-              "The working set no longer fits in RAM; the box is effectively down.",
-              ["vmstat 1", "dstat -tmsg 1"],
-              ["Immediately stop the largest non-critical consumer",
-               "Then add RAM / reduce workers — do not just add more swap"])
-    if p.get("some_avg10", 0) > 20:
-        c.add("warn", f"Memory pressure (PSI) {p['some_avg10']:.0f}%",
-              "Tasks stalled on memory reclaim in the last 10s.",
-              "Best early-warning signal for OOM — fires before free memory hits zero.",
-              ["cat /proc/pressure/memory",
-               "grep -r '' /sys/fs/cgroup/*/memory.pressure 2>/dev/null | sort -t= -k2 -nr | head"],
-              ["Set MemoryHigh= on the guilty cgroup to throttle it instead of OOM-killing it",
-               "Trim page-cache-hostile jobs (big rsync/backup) with `nocache` or ionice"])
+        c.add("crit", "Active swap thrashing detected",
+              f"{si + so:.0f} pages/s moving in/out of swap continuously.",
+              "Working set does not fit into RAM. Application responsiveness will drop to near zero.",
+              ["vmstat 1 5", "dstat -tmsg 1 5 2>/dev/null || true"],
+              ["Immediately terminate or scale down non-critical memory consumers"])
     oom = _recent_oom()
     if oom:
-        c.add("crit", f"OOM killer fired {len(oom)}× recently", " | ".join(oom[:3]),
-              "The kernel had to kill processes to survive. Data loss / partial writes possible.",
-              ["journalctl -k --since '-24h' | grep -iE 'out of memory|oom-kill' ",
-               "dmesg -T | grep -i 'killed process'",
-               "systemctl status <killed-unit>"],
-              ["Add RAM or MemoryMax limits so the *right* process is throttled",
-               "Set OOMScoreAdjust=-500 on critical units, +500 on batch units",
-               "Verify the killed service restarted: `Restart=always` + `RestartSec=5`"])
+        c.add("crit", f"OOM killer executed {len(oom)}× recently", " | ".join(oom[:3]),
+              "The Linux kernel terminated processes due to memory starvation. Risk of partial writes or service disruption.",
+              ["journalctl -k --since '-24h' | grep -iE 'out of memory|oom-kill|killed process'",
+               "dmesg -T | grep -i 'killed process' | tail -10"],
+              ["Review killed processes and set `Restart=always` with proper memory constraints in service units"])
     return c.finalize()
 
 
@@ -640,7 +685,6 @@ def _mounts():
     seen, out = set(), []
     mounts_content = read("/proc/mounts")
     if not mounts_content:
-        # Fallback to root mount
         try:
             s = os.statvfs("/")
             total = s.f_blocks * s.f_frsize
@@ -691,47 +735,40 @@ def check_disk_space(cur, prev, dt, T):
                  f"({fmt_bytes(top['free'])} free)" if top else "no filesystems")
 
     for r in rows:
-        if r["pct"] < T["disk_warn"]:
+        if r["pct"] < T["disk_warn"] and not r["ro"]:
             continue
         sev = "crit" if r["pct"] >= T["disk_crit"] else "warn"
         mp = r["mount"]
-        c.add(sev, f"{mp} is {r['pct']:.0f}% full ({fmt_bytes(r['free'])} free)",
-              f"{r['dev']} · {r['fs']} · total {fmt_bytes(r['total'])}",
-              "A full filesystem breaks everything writing to it: DBs go read-only and "
-              "corrupt, logs stop, sessions/uploads fail, package upgrades break. "
-              "ext4 also reserves 5% for root — non-root writes fail before 100%.",
-              [f"du -xh --max-depth=1 {mp} 2>/dev/null | sort -h | tail -15",
-               f"find {mp} -xdev -type f -size +500M -printf '%s\\t%p\\n' 2>/dev/null | sort -rn | head",
-               "journalctl --disk-usage",
-               "sudo lsof +L1 | head       # deleted files still held open by a process",
-               f"df -h {mp}; df -i {mp}"],
-              ["Logs: `sudo journalctl --vacuum-size=300M` and set "
-               "SystemMaxUse=300M in /etc/systemd/journald.conf",
-               "Rotate now: `sudo logrotate -f /etc/logrotate.conf`",
-               "Packages: `sudo apt clean && sudo apt autoremove --purge` "
-               "(RHEL: `sudo dnf clean all`)",
-               "Containers: `docker system prune -af --volumes` (⚠ removes unused volumes)",
-               "Deleted-but-open files: restart the holder shown by `lsof +L1` "
-               "(truncating with `: > /proc/<pid>/fd/<n>` is a last resort)",
-               "Old kernels: `sudo apt autoremove --purge` / `sudo dnf remove --oldinstallonly`",
-               f"Still tight → grow it: `sudo lvextend -l +100%FREE {r['dev']} && "
-               f"sudo resize2fs {r['dev']}` (xfs: `xfs_growfs {mp}`)"])
+        if r["pct"] >= T["disk_warn"]:
+            c.add(sev, f"Filesystem {mp} is {r['pct']:.0f}% full ({fmt_bytes(r['free'])} free)",
+                  f"Device {r['dev']} ({r['fs']}) · total {fmt_bytes(r['total'])}",
+                  "A full disk crashes databases, prevents log writing, halts file uploads, and breaks package updates.",
+                  [f"du -xh --max-depth=1 {mp} 2>/dev/null | sort -h | tail -15",
+                   f"find {mp} -xdev -type f -size +500M -printf '%s\\t%p\\n' 2>/dev/null | sort -rn | head -10",
+                   "sudo journalctl --disk-usage",
+                   "sudo lsof +L1 | head -10  # unlinked files still held open by processes"],
+                  ["Vacuum journal logs: `sudo journalctl --vacuum-size=300M`",
+                   "Rotate application logs: `sudo logrotate -f /etc/logrotate.conf`",
+                   "Clean package caches: `sudo apt clean` or `sudo dnf clean all`",
+                   "Prune Docker unused data: `docker system prune -af --volumes` (caution: deletes unused volumes)",
+                   "Restart processes holding deleted open files (shown by `lsof +L1`)",
+                   f"Expand LVM volume if needed: `sudo lvextend -l +100%FREE {r['dev']} && sudo resize2fs {r['dev']}`"])
         if r["ro"]:
-            c.add("crit", f"{mp} is mounted READ-ONLY",
-                  "The kernel remounted it ro — almost always after an I/O or fs error.",
-                  "Writes are silently failing across every service using this mount.",
+            c.add("crit", f"Filesystem {mp} remounted READ-ONLY",
+                  f"Kernel remounted {r['dev']} as read-only due to underlying I/O errors or filesystem corruption.",
+                  "All writes are failing across all services using this mount point.",
                   ["dmesg -T | grep -iE 'ext4|xfs|i/o error|remount' | tail -20",
-                   f"sudo smartctl -a {re.sub(r'[0-9]+$', '', r['dev'])}"],
-                  [f"Check & repair (unmounted!): `sudo fsck -y {r['dev']}` / `xfs_repair {r['dev']}`",
-                   "Replace the disk if SMART shows reallocated/pending sectors",
-                   f"Temporary: `sudo mount -o remount,rw {mp}` — only after fsck"])
+                   f"sudo smartctl -a {re.sub(r'[0-9]+$', '', r['dev'])} 2>/dev/null || true"],
+                  [f"Run filesystem repair: `sudo fsck -y {r['dev']}` (ensure unmounted or in maintenance mode)",
+                   "Check SMART drive health and replace failing drive hardware"])
     return c.finalize()
 
 
-# 5 ── DISK I/O BOTTLENECK ────────────────────────────────────────────────────
+# 5 ── DISK I/O BOTTLENECK (Independent Device Attribution) ───────────────────
 def check_disk_io(cur, prev, dt, T):
     c = Check("io", "Disk I/O Bottleneck", "gauge", 1.2)
     devs, worst_util, worst_await, worst_dev = [], 0.0, 0.0, "—"
+    
     for name, a in cur["disk"].items():
         b = prev["disk"].get(name)
         if not b:
@@ -741,21 +778,41 @@ def check_disk_io(cur, prev, dt, T):
         awt = ((a["rticks"] - b["rticks"]) + (a["wticks"] - b["wticks"])) / ios if ios else 0.0
         rmb = (a["rsect"] - b["rsect"]) * 512 / dt
         wmb = (a["wsect"] - b["wsect"]) * 512 / dt
-        devs.append({"dev": name, "util": round(util, 1), "await_ms": round(awt, 1),
-                     "iops": round(ios / dt, 1), "read_s": rmb, "write_s": wmb,
-                     "inflight": a["inflight"], "rotational": bool(a["rot"])})
+        dev_entry = {
+            "dev": name, "util": round(util, 1), "await_ms": round(awt, 1),
+            "iops": round(ios / dt, 1), "read_s": rmb, "write_s": wmb,
+            "inflight": a["inflight"], "rotational": bool(a["rot"])
+        }
+        devs.append(dev_entry)
+        
         if util > worst_util:
             worst_util, worst_dev = util, name
         worst_await = max(worst_await, awt)
+        
+        # Check independent device thresholds
+        if util >= T["io_util_warn"] or awt >= T["await_warn"]:
+            sev = "crit" if (util >= T["io_util_crit"] or awt >= T["await_crit"]) else "warn"
+            c.add(sev, f"Storage bottleneck on device {name}",
+                  f"util {util:.1f}% · await {awt:.1f}ms · IOPS {ios/dt:.0f} · {'HDD' if a['rot'] else 'SSD/NVMe'}",
+                  "When disk await climbs or utilization approaches 100%, disk queues form, blocking processes in D-state.",
+                  [f"iostat -xz 2 5", f"sudo iotop -oPa", f"pidstat -d 2 5",
+                   f"sudo smartctl -a /dev/{name} | egrep -i 'reallocat|pending|error|wear' 2>/dev/null || true"],
+                  ["Identify high I/O writer: `sudo iotop -oPa` and apply ionice",
+                   "Throttle unit: `sudo systemctl set-property <unit> IOWeight=20 IOReadBandwidthMax=50M`",
+                   "Mount with `noatime` in `/etc/fstab` to eliminate inode update writes",
+                   "Upgrade volume provisioned IOPS or switch to NVMe storage"])
+
     devs.sort(key=lambda d: -d["util"])
     ca, cb = cur["cpu"], prev["cpu"]
     tot = max(ca.get("total", 1) - cb.get("total", 0), 1e-9)
     iowait = (ca.get("iowait", 0) - cb.get("iowait", 0)) / tot * 100
     p = psi("io")
+    blocked = cur["procs"][1].get("D", 0)
+    
     c.metrics = {"devices": devs, "worst_util": round(worst_util, 1),
                  "worst_await": round(worst_await, 1), "iowait": round(iowait, 1),
                  "psi10": p.get("some_avg10", 0.0),
-                 "blocked": cur["procs"][1].get("D", 0)}
+                 "blocked": blocked}
     c.value, c.unit = f"{worst_util:.0f}", f"% util ({worst_dev})"
     s1, st1 = score_from(worst_util, T["io_util_warn"], T["io_util_crit"])
     s2, st2 = score_from(worst_await, T["await_warn"], T["await_crit"])
@@ -763,52 +820,31 @@ def check_disk_io(cur, prev, dt, T):
     c.score, c.status = min(s1, s2, s3), LEVELS[max(RANK[st1], RANK[st2], RANK[st3])]
     c.pct = clamp(worst_util)
     c.summary = (f"iowait {iowait:.1f}% · worst await {worst_await:.1f}ms · "
-                 f"{devs[0]['iops'] if devs else 0:.0f} IOPS · D-state {c.metrics['blocked']}")
+                 f"{devs[0]['iops'] if devs else 0:.0f} IOPS · D-state {blocked}")
 
-    if worst_util >= T["io_util_warn"] or worst_await >= T["await_warn"] or iowait >= T["iowait_warn"]:
-        d0 = devs[0] if devs else {"dev": "?", "rotational": False}
-        sev = "crit" if (worst_util >= T["io_util_crit"] or worst_await >= T["await_crit"]
-                         or iowait >= T["iowait_crit"]) else "warn"
-        c.add(sev, f"Storage is the bottleneck on {d0['dev']}",
-              f"util {worst_util:.0f}% · await {worst_await:.1f}ms · iowait {iowait:.1f}% · "
-              f"{'HDD' if d0.get('rotational') else 'SSD/NVMe'}",
-              "When a device is ~100% busy or await climbs, every read/write queues. "
-              "Rule of thumb: >20ms await on SSD or >100ms on HDD = user-visible slowness; "
-              "processes pile up in D state and load average explodes.",
-              ["iostat -xz 2 5                 # %util, await, aqu-sz per device",
-               "sudo iotop -oPa                # which process does the I/O",
-               "pidstat -d 2 5",
-               "sudo biolatency 10 1           # bcc-tools: latency histogram",
-               "cat /proc/pressure/io",
-               f"sudo smartctl -a /dev/{d0['dev']} | egrep -i 'reallocat|pending|error|Wear'"],
-              ["Find & throttle the writer: `sudo ionice -c2 -n7 -p <PID>` "
-               "(or `systemctl set-property <unit> IOWeight=20 IOReadBandwidthMax=…`)",
-               "Move backups/rsync/log shipping off peak; add `--bwlimit`",
-               "Databases: add indexes for the slow queries, raise buffer pool so reads hit RAM, "
-               "check checkpoint/fsync storms (PG: `log_checkpoints=on`)",
-               "Scheduler: NVMe/SSD → `echo none > /sys/block/<dev>/queue/scheduler`; "
-               "HDD → `mq-deadline`",
-               "Filesystem: mount with `noatime` (fstab) to kill metadata writes",
-               "If cloud: you are probably at the volume IOPS/throughput cap → "
-               "upgrade gp2→gp3/io2, raise provisioned IOPS, or stripe volumes (RAID0/LVM)"])
+    if iowait >= T["iowait_warn"]:
+        sev = "crit" if iowait >= T["iowait_crit"] else "warn"
+        c.add(sev, f"High CPU I/O Wait ({iowait:.1f}%)",
+              f"{blocked} tasks waiting in uninterruptible D-state.",
+              "CPU cores are idling waiting for storage response.",
+              ["ps -eo pid,stat,wchan:25,cmd | awk '$2~/D/'", "cat /proc/pressure/io"],
+              ["Tune DB checkpoint intervals and disable synchronous logging where appropriate"])
+
     if p.get("full_avg10", 0) > 10:
         c.add("warn", f"I/O pressure stall (PSI full) {p['full_avg10']:.0f}%",
-              "All tasks were blocked on I/O for a measurable share of time.",
-              "PSI 'full' means the machine did nothing but wait for storage.",
-              ["cat /proc/pressure/io", "grep -r '' /sys/fs/cgroup/*/io.pressure 2>/dev/null | head"],
-              ["Apply io.max / IOWeight limits to the guilty cgroup", "Move the workload to faster storage"])
+              "All server tasks were blocked waiting for storage.",
+              "Indicates severe underlying storage saturation.",
+              ["cat /proc/pressure/io"],
+              ["Apply cgroup IOWeight limits to background workloads"])
+
     errs = [l.strip()[:160] for l in _kernel_errors()
             if re.search(r"(i/o error|ata\d+.*failed|medium error|ext4-fs error|xfs.*corrupt|"
                          r"nvme.*(timeout|reset)|blk_update_request)", l, re.I)]
     if errs:
-        c.add("crit", f"Kernel storage errors detected ({len(errs)})", " | ".join(errs[:2]),
-              "Hardware or transport level failures — data loss risk is immediate.",
-              ["dmesg -T --level=err,crit | tail -30",
-               "sudo smartctl --scan | awk '{print $1}' | xargs -I{} sudo smartctl -H {}",
-               "cat /proc/mdstat ; sudo nvme error-log /dev/nvme0"],
-              ["Back up NOW, then replace the failing device",
-               "Degraded RAID: `sudo mdadm --detail /dev/md0` and re-add/replace the member",
-               "Cloud: detach/reattach or restore the volume from snapshot"])
+        c.add("crit", f"Kernel hardware storage errors ({len(errs)})", " | ".join(errs[:2]),
+              "Low-level transport or hardware failure detected.",
+              ["dmesg -T --level=err,crit | tail -30", "sudo smartctl --scan"],
+              ["Back up all databases immediately and replace the failing hardware"])
     return c.finalize()
 
 
@@ -847,33 +883,21 @@ def check_inodes(cur, prev, dt, T):
         if r["pct"] >= T["inode_warn"]:
             c.add("crit" if r["pct"] >= T["inode_crit"] else "warn",
                   f"{r['mount']} inodes {r['pct']:.0f}% used ({r['free']:,} free)",
-                  "Millions of tiny files exhaust inodes long before bytes run out.",
-                  "With no free inodes you get 'No space left on device' while `df -h` shows "
-                  "free space — classic cause: session files, mail queue, cache dirs, "
-                  "unrotated per-request logs.",
+                  "Millions of tiny files exhaust inodes before disk bytes run out, throwing 'No space left on device'.",
+                  "Common causes: PHP session files, unrotated log fragments, mail queue buildup.",
                   [f"df -i {r['mount']}",
-                   f"sudo find {r['mount']} -xdev -type d -printf '%p\\n' 2>/dev/null | "
-                   f"while read d; do echo \"$(ls -U \"$d\" 2>/dev/null|wc -l) $d\"; done | sort -rn | head",
-                   "sudo find /var/lib/php/sessions /tmp /var/spool -xdev -type f | wc -l"],
-                  ["Purge old small files: `sudo find /tmp -xdev -type f -mtime +7 -delete`",
-                   "PHP sessions: `sudo find /var/lib/php/sessions -type f -mmin +180 -delete` "
-                   "and enable session.gc",
-                   "Mail queue: `sudo postsuper -d ALL deferred` (check first!)",
-                   "Delete faster in huge dirs: `find <dir> -type f -print0 | xargs -0 -P4 rm -f`",
-                   "Permanent: ext4 inode count is fixed at mkfs → recreate with "
-                   "`mkfs.ext4 -i 8192`, or migrate that path to XFS (dynamic inodes)"])
+                   f"sudo find {r['mount']} -xdev -type d -printf '%p\\n' 2>/dev/null | while read d; do echo \"$(ls -U \"$d\" 2>/dev/null|wc -l) $d\"; done | sort -rn | head -10"],
+                  ["Purge old PHP sessions: `sudo find /var/lib/php/sessions /tmp -type f -mmin +180 -delete`",
+                   "Clear mail queue: `sudo postsuper -d ALL deferred` (verify first)",
+                   "Format with dynamic inode allocation (XFS) for high-file-count workloads"])
     if fd_pct >= T["fd_warn"]:
         c.add("crit" if fd_pct >= T["fd_crit"] else "warn",
-              f"System-wide open files at {fd_pct:.0f}% ({fd_used:,}/{fd_max:,})",
-              "Hitting fs.file-max causes 'Too many open files' across all services.",
-              "Usually a descriptor leak (unclosed sockets/files) in an app.",
-              ["sudo lsof | awk '{print $2}' | sort | uniq -c | sort -rn | head",
-               "for p in /proc/[0-9]*; do echo \"$(ls $p/fd 2>/dev/null|wc -l) $(cat $p/comm)\"; done "
-               "| sort -rn | head",
+              f"System-wide open file descriptors at {fd_pct:.0f}% ({fd_used:,}/{fd_max:,})",
+              "Exhausting `fs.file-max` causes 'Too many open files' errors across all server daemons.",
+              ["sudo lsof | awk '{print $2}' | sort | uniq -c | sort -rn | head -10",
                "cat /proc/sys/fs/file-nr ; ulimit -n"],
-              ["Raise limits: `sudo sysctl -w fs.file-max=2097152` (persist in /etc/sysctl.d/)",
-               "Per-service: `systemctl set-property <unit> LimitNOFILE=65535`",
-               "Fix the leak — restart the top offender and watch its fd count trend"])
+              ["Raise file limits: `sudo sysctl -w fs.file-max=2097152` (persist in /etc/sysctl.d/)",
+               "Set per-unit limits: `LimitNOFILE=65535` in service unit file"])
     return c.finalize()
 
 
@@ -925,52 +949,32 @@ def check_network(cur, prev, dt, T):
     for i in ifaces:
         if i["err_s"] >= T["neterr_warn"]:
             c.add("crit" if i["err_s"] >= T["neterr_crit"] else "warn",
-                  f"{i['iface']}: {i['err_s']:.1f} errors+drops/s",
+                  f"Interface {i['iface']} experiencing {i['err_s']:.1f} errors+drops/s",
                   f"link {i['state']} · {i['speed'] or '?'} Mb/s",
-                  "Drops mean the NIC ring buffer or the socket queue overflowed, or the "
-                  "cable/switch port is flaky. TCP hides it as latency; UDP just loses data.",
-                  [f"ip -s link show {i['iface']}",
-                   f"ethtool -S {i['iface']} | egrep -i 'drop|err|miss|fifo|nobuf'",
-                   f"ethtool {i['iface']} | egrep -i 'speed|duplex|link'",
-                   "netstat -su | grep -i 'packet receive errors'"],
-                  [f"Grow ring buffers: `sudo ethtool -G {i['iface']} rx 4096 tx 4096`",
-                   "Grow socket buffers: `sudo sysctl -w net.core.rmem_max=16777216 "
-                   "net.core.netdev_max_backlog=5000`",
-                   "Check the physical layer: replace cable/SFP, verify switch port counters",
-                   "Fix duplex/speed mismatch (never leave one side hard-coded)"])
+                  "Drops indicate ring buffer exhaustion or switch port packet discards.",
+                  [f"ip -s link show {i['iface']}", f"ethtool -S {i['iface']} 2>/dev/null | grep -iE 'drop|err|fifo'"],
+                  [f"Increase ring buffer size: `sudo ethtool -G {i['iface']} rx 4096 tx 4096`",
+                   "Increase socket backlog: `sudo sysctl -w net.core.netdev_max_backlog=5000`"])
     if retrans >= T["retrans_warn"]:
         c.add("crit" if retrans >= T["retrans_crit"] else "warn",
-              f"TCP retransmits {retrans:.2f}% of segments",
-              f"{sa.get('Tcp.RetransSegs',0) - sb.get('Tcp.RetransSegs',0)} retransmitted in {dt:.0f}s",
-              "Above ~1% retransmission users feel stalls and timeouts. Cause is packet loss "
-              "on the path, an overloaded peer, or a saturated uplink.",
-              ["ss -ti | grep -E 'retrans|rto' | head",
-               "nstat -az | egrep 'TcpRetrans|TcpExtTCPLostRetransmit|TcpExtTCPTimeouts'",
-               "mtr -rwzc 100 <peer-ip>", "ping -c 100 -i .2 <peer-ip> | tail -3"],
-              ["Enable BBR + fq: `sudo sysctl -w net.ipv4.tcp_congestion_control=bbr "
-               "net.core.default_qdisc=fq`",
-               "Check if you saturate the uplink (`iftop`, cloud NIC bandwidth caps)",
-               "Escalate the loss segment found by mtr to the network/hosting provider"])
+              f"TCP retransmission rate high: {retrans:.2f}%",
+              f"Network packet loss or transit congestion on upstream routes.",
+              "Above 1.5% retransmission, clients experience connection stalls and timeouts.",
+              ["ss -ti | grep -E 'retrans|rto' | head -10", "ping -c 20 1.1.1.1"],
+              ["Enable BBR congestion control: `sudo sysctl -w net.ipv4.tcp_congestion_control=bbr`"])
     if overflow > 0 or listen_drops > 5:
         c.add("crit" if overflow > 0 else "warn",
-              f"Listen queue overflow ({overflow:.1f}/s, drops {listen_drops:.1f}/s)",
-              "New connections are being dropped before your app ever sees them.",
-              "The accept backlog is full: the app accepts too slowly or somaxconn is too small.",
-              ["ss -ltn      # Recv-Q vs Send-Q on listeners",
-               "nstat -az | grep -i listen", "sysctl net.core.somaxconn net.ipv4.tcp_max_syn_backlog"],
-              ["`sudo sysctl -w net.core.somaxconn=4096 net.ipv4.tcp_max_syn_backlog=8192`",
-               "Raise the app's backlog too (nginx `listen … backlog=4096`, gunicorn `--backlog`)",
-               "Add worker processes — overflow usually means the app is too slow to accept"])
+              f"Socket listen queue overflow: {overflow:.1f}/s (drops {listen_drops:.1f}/s)",
+              "Incoming connections are dropped before reaching application accept() loops.",
+              ["ss -ltn", "sysctl net.core.somaxconn net.ipv4.tcp_max_syn_backlog"],
+              ["Raise system backlog: `sudo sysctl -w net.core.somaxconn=4096 net.ipv4.tcp_max_syn_backlog=8192`",
+               "Increase application worker count (Nginx worker_connections, PHP-FPM pm.max_children)"])
     if ct_pct >= T["conntrack_warn"]:
         c.add("crit" if ct_pct >= T["conntrack_crit"] else "warn",
-              f"conntrack table {ct_pct:.0f}% full ({ct_cnt:,}/{ct_max:,})",
-              "When it fills, the firewall drops new connections: 'nf_conntrack: table full'.",
-              "Common on NAT gateways, busy proxies, or under SYN floods.",
-              ["conntrack -S ; dmesg -T | grep -i conntrack | tail",
-               "conntrack -L 2>/dev/null | awk '{print $4}' | sort | uniq -c | sort -rn | head"],
-              ["`sudo sysctl -w net.netfilter.nf_conntrack_max=524288`",
-               "Shorten timeouts: `net.netfilter.nf_conntrack_tcp_timeout_time_wait=30`",
-               "NOTRACK high-volume flows in iptables/nftables if state is not needed"])
+              f"Conntrack table {ct_pct:.0f}% full ({ct_cnt:,}/{ct_max:,})",
+              "When full, the netfilter firewall drops all new connections.",
+              ["cat /proc/sys/net/netfilter/nf_conntrack_count", "sysctl net.netfilter.nf_conntrack_max"],
+              ["`sudo sysctl -w net.netfilter.nf_conntrack_max=524288`"])
     return c.finalize()
 
 
@@ -986,13 +990,13 @@ def check_processes(cur, prev, dt, T):
     thr_max = read_int("/proc/sys/kernel/threads-max", 100000)
     pid_pct = total / max(pid_max, 1) * 100
     thr_pct = threads / max(thr_max, 1) * 100
-    zpids = [(pid, p["comm"]) for pid, p in procs.items() if p["state"] == "Z"][:6]
-    dpids = [(pid, p["comm"]) for pid, p in procs.items() if p["state"] == "D"][:6]
+    zpids = [(p["pid"], p["comm"], p["user"]) for p in procs.values() if p["state"] == "Z"][:6]
+    dpids = [(p["pid"], p["comm"], p["user"], p["stack"]) for p in procs.values() if p["state"] == "D"][:6]
     c.metrics = {"total": total, "threads": threads, "zombies": zombies, "dstate": dstate,
                  "pid_max": pid_max, "pid_pct": round(pid_pct, 1),
                  "threads_max": thr_max, "thread_pct": round(thr_pct, 1),
-                 "top_cpu": [{"cpu": u, "pid": p, "comm": n} for u, p, n in top_cpu(cur, prev, dt)],
-                 "top_mem": [{"rss": r, "pid": p, "comm": n} for r, p, n in top_mem(cur)],
+                 "top_cpu": [{"cpu": u, "pid": p, "comm": n, "user": usr, "cmd": cmd} for u, p, n, usr, cmd in top_cpu(cur, prev, dt, 8)],
+                 "top_mem": [{"rss": r, "pid": p, "comm": n, "user": usr, "cmd": cmd} for r, p, n, usr, cmd in top_mem(cur, 8)],
                  "zombie_pids": zpids, "dstate_pids": dpids}
     c.value, c.unit = f"{total:,}", "processes"
     scores = [score_from(pid_pct, T["pid_warn"], T["pid_crit"]),
@@ -1006,40 +1010,26 @@ def check_processes(cur, prev, dt, T):
 
     if zombies >= T["zombie_warn"]:
         c.add("crit" if zombies >= T["zombie_crit"] else "warn",
-              f"{zombies} zombie processes",
-              "e.g. " + ", ".join(f"{n}({p})" for p, n in zpids),
-              "Zombies keep PID slots and signal that a parent never calls wait(). "
-              "Thousands of them exhaust the PID space.",
-              ["ps -eo pid,ppid,state,comm | awk '$3==\"Z\"'",
-               "ps -o pid,cmd -p $(ps -eo ppid,state | awk '$2==\"Z\"{print $1}' | sort -u | tr '\\n' ',' | sed 's/,$//')"],
-              ["Fix/restart the PARENT (zombies cannot be killed): `sudo systemctl restart <parent-unit>`",
-               "In containers run an init that reaps: `docker run --init …` / Kubernetes shareProcessNamespace",
-               "In code: handle SIGCHLD or waitpid() after fork"])
+              f"{zombies} zombie processes detected",
+              "Zombies: " + ", ".join(f"{n}[{p}]" for p, n, _ in zpids),
+              "Parent processes terminated or failed to invoke waitpid(), holding PID slots.",
+              ["ps -eo pid,ppid,user,stat,comm | awk '$4~/Z/'",
+               "ps -o pid,user,cmd -p $(ps -eo ppid,stat | awk '$2~/Z/{print $1}' | sort -u | paste -sd, -)"],
+              ["Restart the parent service responsible for the orphan zombies",
+               "Use container init (`docker run --init` / tini) inside custom Docker containers"])
     if pid_pct >= T["pid_warn"] or thr_pct >= T["pid_warn"]:
         c.add("crit" if max(pid_pct, thr_pct) >= T["pid_crit"] else "warn",
-              f"Process/thread table {max(pid_pct, thr_pct):.0f}% used",
-              f"{total:,}/{pid_max:,} pids · {threads:,}/{thr_max:,} threads",
-              "Exhausting pids/threads gives 'fork: Resource temporarily unavailable' — "
-              "you cannot even log in to fix it.",
-              ["ps -eLf | wc -l",
-               "ps -eo comm --no-headers | sort | uniq -c | sort -rn | head",
-               "systemd-cgtop -m ; cat /sys/fs/cgroup/pids.max"],
-              ["Find the fork bomb / thread leak in the list above and restart it",
-               "Cap it: `systemctl set-property <unit> TasksMax=4096`",
-               "Raise the ceiling if legitimate: `sudo sysctl -w kernel.pid_max=131072`",
-               "Guard the system: /etc/security/limits.d/99-nproc.conf → `* soft nproc 8192`"])
+              f"Process table {max(pid_pct, thr_pct):.0f}% consumed ({total:,}/{pid_max:,} PIDs)",
+              "Fork bombs or unconstrained thread pools can lock administrators out of SSH login.",
+              ["ps -eLf | wc -l", "ps -eo user,comm | sort | uniq -c | sort -rn | head -15"],
+              ["Limit unit tasks: `sudo systemctl set-property <unit> TasksMax=2048`",
+               "Raise PID ceiling if legitimate: `sudo sysctl -w kernel.pid_max=131072`"])
     if dstate >= max(4, CORES):
-        c.add("warn", f"{dstate} processes stuck in uninterruptible sleep",
-              "e.g. " + ", ".join(f"{n}({p})" for p, n in dpids),
-              "D-state = blocked in the kernel, nearly always storage or NFS. They inflate "
-              "load average and cannot be killed with SIGKILL.",
-              ["ps -eo pid,stat,wchan:30,comm | awk '$2~/D/'",
-               "for p in $(ps -eo pid,stat | awk '$2~/D/{print $1}'); do "
-               "echo \"== $p\"; sudo cat /proc/$p/stack 2>/dev/null | head -5; done",
-               "mount | grep nfs ; dmesg -T | tail -30"],
-              ["If NFS: `sudo umount -f -l <mnt>` then remount with `soft,timeo=30,retrans=3`",
-               "If local disk: see the Disk I/O check — the device is saturated or failing",
-               "Only a reboot clears truly wedged D-state tasks"])
+        c.add("warn", f"{dstate} tasks stuck in uninterruptible sleep (D-state)",
+              "Blocked tasks: " + ", ".join(f"{n}[{p}] ({stk or 'kernel I/O'})" for p, n, _, stk in dpids),
+              "D-state tasks cannot be killed with SIGKILL and wait on hardware storage or hung NFS mounts.",
+              ["ps -eo pid,user,stat,wchan:25,cmd | awk '$3~/D/'"],
+              ["Inspect disk hardware health and unmount hanging network filesystems (`umount -f -l`)"])
     return c.finalize()
 
 
@@ -1076,60 +1066,40 @@ def check_services(cur, prev, dt, T):
 
     if failed:
         c.add("crit" if len(failed) > 1 else "warn",
-              f"{len(failed)} failed systemd unit(s)", ", ".join(failed[:8]),
-              "A failed unit means a service is not doing its job — and if Restart= is set "
-              "it may be crash-looping, burning CPU and filling logs.",
-              ["systemctl --failed",
-               f"systemctl status {failed[0]} -l --no-pager",
-               f"journalctl -u {failed[0]} -n 80 --no-pager",
-               f"systemd-analyze verify {failed[0]} 2>&1 | head"],
-              [f"Read the log above, fix config, then: `sudo systemctl reset-failed {failed[0]} && "
-               f"sudo systemctl restart {failed[0]}`",
-               "Config typo? validate first (`nginx -t`, `apachectl configtest`, `sshd -t`)",
-               "Crash loop? add `Restart=on-failure`, `RestartSec=5s`, `StartLimitIntervalSec=0`",
-               "Port conflict? `sudo ss -ltnp | grep <port>`"])
+              f"{len(failed)} systemd service unit(s) in failed state",
+              ", ".join(failed[:8]),
+              "Failed services disrupt applications and may continuously crash-loop.",
+              ["systemctl --failed", f"journalctl -u {failed[0]} -n 50 --no-pager"],
+              [f"Inspect logs, repair config, then: `sudo systemctl reset-failed {failed[0]} && sudo systemctl restart {failed[0]}`"])
     if state not in ("running", "unknown", "starting"):
-        c.add("warn", f"systemd reports '{state}'",
-              "The system is degraded or in maintenance mode.",
-              "Something failed at boot or a unit is masked/not started.",
-              ["systemctl status --no-pager | head -20", "systemctl list-units --state=failed,not-found"],
-              ["Resolve failed units then `sudo systemctl reset-failed`",
-               "Check boot: `systemd-analyze blame | head` and `journalctl -b -p err`"])
+        c.add("warn", f"System state reported as '{state}'",
+              "The systemd manager reported a degraded or maintenance state.",
+              "Check failed units and startup dependencies.",
+              ["systemctl status --no-pager | head -20"],
+              ["Resolve failing units and reset with `sudo systemctl reset-failed`"])
     if uptime < 900 and uptime > 0:
-        c.add("info", f"Server rebooted {fmt_dur(uptime)} ago",
-              "Recent boot — confirm it was planned and that everything came back up.",
-              "Unplanned reboots point to kernel panic, OOM, watchdog or host maintenance.",
-              ["last reboot | head -5", "journalctl --list-boots | tail -3",
-               "journalctl -b -1 -p err --no-pager | tail -30   # logs of the PREVIOUS boot"],
-              ["Verify all services are enabled: `systemctl list-unit-files --state=enabled`",
-               "Check for panic/watchdog evidence in the previous boot log",
-               "Cloud: check the provider's maintenance events feed"])
+        c.add("info", f"Server rebooted recently ({fmt_dur(uptime)} ago)",
+              "Confirm whether the reboot was scheduled.",
+              "Unplanned reboots indicate kernel panics, power faults, or OOM crashes.",
+              ["last reboot | head -5", "journalctl -b -1 -p err --no-pager | tail -30"],
+              ["Verify enabled services restarted properly: `systemctl list-unit-files --state=enabled`"])
     if synced is False:
-        c.add("warn", "Clock is not synchronised with NTP",
-              "Time drift breaks TLS handshakes, JWT/OAuth tokens, DB replication, "
-              "cron schedules and makes logs impossible to correlate.",
-              "chrony/systemd-timesyncd is stopped, blocked by firewall (UDP 123), or unconfigured.",
-              ["timedatectl status", "chronyc tracking 2>/dev/null || ntpq -p",
-               "systemctl status systemd-timesyncd chrony chronyd 2>/dev/null | head -20"],
-              ["`sudo timedatectl set-ntp true` (or `sudo systemctl enable --now chronyd`)",
-               "Force a step: `sudo chronyc makestep`",
-               "Allow UDP/123 egress in the firewall/security group"])
+        c.add("warn", "System clock is not synchronized with NTP",
+              "Clock drift causes TLS handshake errors, token verification failures, and broken cron timings.",
+              "timesyncd or chrony is stopped or firewall is blocking UDP port 123.",
+              ["timedatectl status", "chronyc tracking 2>/dev/null || true"],
+              ["`sudo timedatectl set-ntp true` (or `sudo systemctl enable --now chronyd`)"])
     if reboot_required:
-        c.add("warn", "Reboot required to apply updates", pkgs or "kernel/libc updated",
-              "Patched libraries/kernel are on disk but the running processes still use the "
-              "vulnerable versions in memory.",
-              ["cat /var/run/reboot-required.pkgs 2>/dev/null",
-               "sudo needs-restarting -r ; sudo needs-restarting -s",
-               "ls -l /boot/vmlinuz* ; uname -r"],
-              ["Schedule a maintenance window, drain traffic, then `sudo systemctl reboot`",
-               "Zero-downtime alternative for libs: `sudo needs-restarting -s | xargs -r "
-               "sudo systemctl restart`",
-               "Consider kexec/livepatch (Ubuntu Pro `canonical-livepatch`) for kernel CVEs"])
+        c.add("warn", "System reboot required for security updates", pkgs or "kernel / libc updated",
+              "Patched security libraries and kernel updates are pending a system reboot.",
+              ["cat /var/run/reboot-required.pkgs 2>/dev/null || true", "uname -r"],
+              ["Schedule a maintenance window and execute `sudo reboot`"])
     return c.finalize()
 
 
+# 10 ── LOGS, SECURITY & PHP-FPM SLOW LOGS ────────────────────────────────────
 def _scan_php_slowlogs():
-    """Scan Plesk & Linux PHP-FPM slow logs and pool configurations."""
+    """Scan Plesk & Linux PHP-FPM slow logs with memory-efficient tail reading."""
     results = {
         "slow_entries": [],
         "slow_count_1h": 0,
@@ -1177,11 +1147,9 @@ def _scan_php_slowlogs():
     seen_blocks = []
     for log_path in set(log_candidates):
         try:
-            content = read(log_path)
+            content = read_tail(log_path, max_bytes=262144)
             if not content:
                 continue
-            if len(content) > 300000:
-                content = content[-300000:]
             
             blocks = re.split(r'\n(?=\[\d{2}-[A-Za-z]{3}-\d{4}\s+\d{2}:\d{2}:\d{2}\])', content)
             for block in blocks:
@@ -1199,12 +1167,14 @@ def _scan_php_slowlogs():
                 top_trace = trace_lines[0] if trace_lines else ""
                 top_trace = re.sub(r'^\[0x[0-9a-fA-F]+\]\s*', '', top_trace)[:120]
                 
-                entry_age_hours = 0
-                try:
-                    dt_entry = datetime.strptime(ts_str, "%d-%b-%Y %H:%M:%S")
-                    entry_age_hours = (datetime.now() - dt_entry).total_seconds() / 3600.0
-                except Exception:
-                    pass
+                # Strict timestamp parsing
+                entry_age_hours = 9999.0
+                if ts_str:
+                    try:
+                        dt_entry = datetime.strptime(ts_str, "%d-%b-%Y %H:%M:%S")
+                        entry_age_hours = (datetime.now() - dt_entry).total_seconds() / 3600.0
+                    except Exception:
+                        pass
                 
                 if entry_age_hours <= 1.0:
                     results["slow_count_1h"] += 1
@@ -1260,7 +1230,7 @@ def _scan_php_slowlogs():
                     if f.endswith(".conf"):
                         results["active_php_pools"] += 1
                         conf_path = os.path.join(pdir, f)
-                        conf_txt = read(conf_path)
+                        conf_txt = read_tail(conf_path, max_bytes=65536)
                         if not re.search(r'^\s*request_slowlog_timeout\s*=\s*[1-9]', conf_txt, re.M):
                             results["unlogged_pools"].append(f.replace(".conf", ""))
             except Exception:
@@ -1269,7 +1239,6 @@ def _scan_php_slowlogs():
     return results
 
 
-# 10 ── LOGS & SECURITY ───────────────────────────────────────────────────────
 def check_logs(cur, prev, dt, T):
     c = Check("logs", "Logs & Security Signals", "shield", 1.0)
     rc, errs = sh(["journalctl", "--since", "-1h", "-p", "err", "--no-pager", "-q"], timeout=8, ttl=120)
@@ -1283,7 +1252,7 @@ def check_logs(cur, prev, dt, T):
 
     rc2, auth = sh(["journalctl", "--since", "-1h", "--no-pager", "-q", "-t", "sshd"], timeout=8, ttl=120)
     if rc2 != 0 or not auth.strip():
-        auth = "".join(read(p) for p in ("/var/log/auth.log", "/var/log/secure"))[-400000:]
+        auth = read_tail("/var/log/auth.log", 262144) + read_tail("/var/log/secure", 262144)
     fails = re.findall(r"Failed (?:password|publickey).* from ([\d.a-f:]+)", auth)
     ips = {}
     for ip in fails:
@@ -1308,7 +1277,7 @@ def check_logs(cur, prev, dt, T):
     scores = [score_from(nerr, T["logerr_warn"], T["logerr_crit"]),
               score_from(len(fails), T["authfail_warn"], T["authfail_crit"])]
     if php_data["slow_count_1h"] > 0:
-        s_php, st_php = score_from(php_data["slow_count_1h"], 5, 25)
+        s_php, st_php = score_from(php_data["slow_count_1h"], T.get("php_slow_warn", 3), T.get("php_slow_crit", 15))
         scores.append((s_php, st_php))
     c.score = min(s for s, _ in scores)
     c.status = LEVELS[max(RANK[st] for _, st in scores)]
@@ -1324,70 +1293,46 @@ def check_logs(cur, prev, dt, T):
         c.add("crit" if nerr >= T["logerr_crit"] else "warn",
               f"{nerr} error-level log entries in the last hour",
               " ⟶ ".join(f"[{n}×] {t}" for t, n in top[:2]),
-              "A rising error rate is the earliest sign of a failing dependency, a bad deploy "
-              "or a crash loop — long before users complain.",
-              ["journalctl -p err --since '-1h' --no-pager | tail -50",
-               "journalctl -p err --since '-1h' -o cat | sed 's/[0-9]\\+/#/g' | sort | uniq -c | sort -rn | head",
-               "journalctl -u <unit> -f"],
-              ["Fix the top repeating message first — it is usually 80% of the volume",
-               "Crash loop? `systemctl status <unit>` + add backoff (RestartSec/StartLimitBurst)",
-               "Cap log growth: SystemMaxUse=500M in /etc/systemd/journald.conf, then "
-               "`sudo systemctl restart systemd-journald`"])
+              "A rising log error rate is the earliest indicator of failing dependencies or crash loops.",
+              ["journalctl -p err --since '-1h' --no-pager | tail -40", "journalctl -u <unit> -f"],
+              ["Investigate repeating errors and apply required fixes to service configurations"])
     if len(fails) >= T["authfail_warn"]:
         c.add("crit" if len(fails) >= T["authfail_crit"] else "warn",
               f"{len(fails)} failed SSH logins in the last hour",
               "Top sources: " + ", ".join(f"{ip} ({n}×)" for ip, n in top_ips),
-              "An active brute-force / credential-stuffing attempt. Even if it fails it burns "
-              "CPU and may eventually succeed against a weak password.",
-              ["journalctl -t sshd --since '-1h' | grep -i 'failed' | tail -30",
-               "lastb | head -20 ; who ; last -20",
-               "sudo fail2ban-client status sshd 2>/dev/null"],
-              [f"Block the worst offender now: `sudo iptables -I INPUT -s {top_ips[0][0]} -j DROP`"
-               if top_ips else "Block offending IPs at the firewall",
-               "Install fail2ban: `sudo apt install fail2ban && sudo systemctl enable --now fail2ban`",
-               "Disable password auth: sshd_config → `PasswordAuthentication no`, `PermitRootLogin no`, "
-               "`KbdInteractiveAuthentication no` → `sudo sshd -t && sudo systemctl reload sshd`",
-               "Restrict SSH to a VPN/bastion CIDR in the security group, or move to WireGuard"])
+              "Active SSH brute-force attempt.",
+              ["journalctl -t sshd --since '-1h' | grep -i 'failed' | tail -20",
+               "sudo fail2ban-client status sshd 2>/dev/null || true"],
+              ["Install fail2ban: `sudo apt install fail2ban` or `sudo dnf install fail2ban`",
+               "Disable password auth: set `PasswordAuthentication no` in `/etc/ssh/sshd_config`"])
     if php_data["slow_count_1h"] > 0:
-        c.add("crit" if php_data["slow_count_1h"] >= 20 else "warn",
+        c.add("crit" if php_data["slow_count_1h"] >= T.get("php_slow_crit", 15) else "warn",
               f"{php_data['slow_count_1h']} PHP slow script execution(s) in the last hour",
               "Top: " + (" | ".join(f"{s['script']} ({s['pool']}, {s['duration']})" for s in php_data["top_slow_scripts"][:3]) or "see details"),
-              "Slow PHP scripts lock up worker processes in the FPM pool until pm.max_children "
-              "is exhausted, triggering 502 Bad Gateway and 504 Gateway Timeout errors.",
-              ["tail -f /var/log/plesk-php*-fpm/slow.log 2>/dev/null || tail -f /var/log/php*-fpm.slow.log",
-               "grep -rn 'script_filename' /var/log/plesk-php*-fpm/ /var/log/php*-fpm/ 2>/dev/null | tail -20",
-               "plesk bin php_handler --list 2>/dev/null || php -v"],
-              ["Inspect the backtrace function/plugin above to optimize slow DB queries or unbuffered external cURL calls",
-               "Enable Redis / Memcached object cache (e.g. `redis-server` + WP Redis plugin)",
-               "Tune PHP OPcache in php.ini: `opcache.enable=1 opcache.memory_consumption=256 opcache.max_accelerated_files=20000`",
-               "Raise FPM pool capacity: adjust `pm.max_children` in /opt/plesk/php/*/etc/php-fpm.d/<domain>.conf"])
+              "Slow PHP scripts lock up worker processes in the FPM pool until pm.max_children is exhausted, triggering 502/504 errors.",
+              ["tail -f /var/log/plesk-php*-fpm/slow.log 2>/dev/null || tail -f /var/log/php*-fpm-slow.log",
+               "grep -rn 'script_filename' /var/log/plesk-php*-fpm/ 2>/dev/null | tail -20"],
+              ["Optimize the slow database query or external API call identified in the backtrace",
+               "Enable Redis Object Cache for WordPress / web apps",
+               "Increase `pm.max_children` for the specific busy domain pool"])
     if php_data["active_php_pools"] > 0 and len(php_data["unlogged_pools"]) > 0:
         c.add("info" if php_data["slow_count_1h"] == 0 else "warn",
               f"PHP-FPM slow logging disabled on {len(php_data['unlogged_pools'])} pool(s)",
               "e.g. " + ", ".join(php_data["unlogged_pools"][:6]),
-              "When PHP requests freeze or exceed 5–10s, PHP slow logging records the exact script "
-              "filename, line number, and function backtrace (e.g. plugin xyz) for instant resolution.",
-              ["grep -rnE 'request_slowlog_timeout|slowlog' /opt/plesk/php/*/etc/php-fpm.d/ /etc/php/*/fpm/pool.d/ 2>/dev/null",
-               "ls -la /opt/plesk/php/*/etc/php-fpm.d/ 2>/dev/null"],
-              ["Run `sudo bash deploy/enable-plesk-php-slowlog.sh` to auto-configure all Plesk PHP pools",
-               "Plesk CLI per domain: `plesk bin site -u <domain> -php_handler_type fpm -additional-settings $'slowlog = /var/log/plesk-php82-fpm/slow.log\\nrequest_slowlog_timeout = 5s\\nrequest_slowlog_trace_depth = 20'`",
-               "Standard PHP-FPM: Add `request_slowlog_timeout = 5s` & `slowlog = /var/log/php-fpm/www-slow.log` to pool config, then reload"])
+              "Enabling PHP-FPM slow logging records the exact script filename, line number, and function backtrace when requests hang.",
+              ["grep -rnE 'request_slowlog_timeout|slowlog' /opt/plesk/php/*/etc/php-fpm.d/ /etc/php/*/fpm/pool.d/ 2>/dev/null"],
+              ["Run `sudo bash deploy/enable-plesk-php-slowlog.sh 5s 20` to configure all pools safely with automatic rollback"])
     if permit_root:
-        c.add("warn", "SSH allows direct root login",
+        c.add("warn", "SSH allows direct root login with password",
               "PermitRootLogin yes in /etc/ssh/sshd_config",
-              "Root login removes accountability and is the #1 brute-force target.",
+              "Exposing direct root password login poses high brute-force risk.",
               ["sudo sshd -T | egrep 'permitrootlogin|passwordauthentication'"],
-              ["Set `PermitRootLogin prohibit-password` (or `no`), keep a sudo user with a key",
-               "`sudo sshd -t && sudo systemctl reload sshd`"])
+              ["Set `PermitRootLogin prohibit-password` in `/etc/ssh/sshd_config` and reload sshd"])
     if segv:
         c.add("warn", f"{len(segv)} segfault(s) in kernel log", segv[-1][:160],
-              "A process crashed hard: memory corruption, bad RAM, or a buggy/mismatched library.",
-              ["journalctl -k --since '-24h' | grep -i segfault | tail",
-               "coredumpctl list | tail ; coredumpctl info <PID>",
-               "sudo memtester 1G 1   # or boot memtest86+ for real RAM validation"],
-              ["Update/downgrade the crashing package; rebuild against the current libc",
-               "Run a RAM test if crashes are random across different binaries",
-               "Enable core dumps and get a backtrace: `ulimit -c unlimited` + `coredumpctl gdb`"])
+              "Process crashed due to memory corruption, bad pointer or faulty library.",
+              ["journalctl -k --since '-24h' | grep -i segfault | tail -10"],
+              ["Check coredumps or run hardware memory diagnostics"])
     return c.finalize()
 
 
@@ -1396,7 +1341,121 @@ CHECKS = [check_cpu, check_load, check_memory, check_disk_space, check_disk_io,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  SCAN / SCORING
+#  INCIDENT RECORDER & EVIDENCE PRESERVATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+class IncidentRecorder:
+    """Captures and preserves full process cmdlines, users, and burst samples during high load."""
+
+    def __init__(self, cfg):
+        self.incidents_dir = cfg.get("incidents_dir", "/var/lib/health-sentinel/incidents")
+        self.max_history = int(cfg.get("incident_history", 50))
+        self.last_record_time = {}
+        self.recent_incidents = deque(maxlen=self.max_history)
+        self._load_existing()
+
+    def _load_existing(self):
+        try:
+            if not os.path.isdir(self.incidents_dir):
+                return
+            files = sorted(glob.glob(os.path.join(self.incidents_dir, "incident_*.json")), key=os.path.getmtime)
+            for f in files[-self.max_history:]:
+                try:
+                    with open(f) as fh:
+                        self.recent_incidents.append(json.load(fh))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def maybe_record(self, report, cur, prev, dt):
+        """Record detailed evidence packet if a threshold is crossed."""
+        bad_checks = [c for c in report["checks"] if c["status"] in ("warn", "crit")]
+        if not bad_checks:
+            return None
+        
+        now = time.time()
+        trigger_ids = [c["id"] for c in bad_checks]
+        trigger_key = "_".join(sorted(trigger_ids))
+        
+        # Cooldown of 60s per trigger group
+        if now - self.last_record_time.get(trigger_key, 0) < 60:
+            return None
+        self.last_record_time[trigger_key] = now
+        
+        # Capture rapid process evidence
+        procs_dict = cur["procs"][0]
+        top_cpu_list = []
+        top_mem_list = []
+        dstate_list = []
+        
+        for p in procs_dict.values():
+            if p["state"] == "D":
+                dstate_list.append({
+                    "pid": p["pid"], "user": p["user"], "comm": p["comm"],
+                    "cmd": p["cmdline"], "cgroup": p["cgroup"], "stack": p["stack"]
+                })
+        
+        for u, pid, comm, usr, cmd in top_cpu(cur, prev, dt, 15):
+            top_cpu_list.append({
+                "cpu": u, "pid": pid, "comm": comm, "user": usr, "cmd": cmd,
+                "cgroup": procs_dict.get(str(pid), {}).get("cgroup", "")
+            })
+            
+        for r, pid, comm, usr, cmd in top_mem(cur, 15):
+            top_mem_list.append({
+                "rss": r, "pid": pid, "comm": comm, "user": usr, "cmd": cmd,
+                "cgroup": procs_dict.get(str(pid), {}).get("cgroup", "")
+            })
+            
+        incident = {
+            "id": f"inc_{int(now)}_{trigger_key}",
+            "ts": int(now),
+            "time": report["time"],
+            "status": report["status"],
+            "score": report["score"],
+            "triggers": trigger_ids,
+            "summary": " · ".join(f"{c['name']}: {c['value']} {c['unit']}" for c in bad_checks),
+            "top_cpu": top_cpu_list,
+            "top_mem": top_mem_list,
+            "dstate_tasks": dstate_list[:10],
+            "findings": [f for c in bad_checks for f in c["findings"][:2]]
+        }
+        
+        self.recent_incidents.append(incident)
+        
+        # Save to disk asynchronously
+        threading.Thread(target=self._persist, args=(incident,), daemon=True).start()
+        return incident
+
+    def _persist(self, incident):
+        try:
+            target_dir = self.incidents_dir
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+            except OSError:
+                target_dir = "/tmp/health-sentinel-incidents"
+                os.makedirs(target_dir, exist_ok=True)
+                
+            path = os.path.join(target_dir, f"incident_{incident['ts']}_{incident['id']}.json")
+            tmp = path + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(incident, fh, indent=2)
+            os.replace(tmp, path)
+            
+            # Prune old incident files
+            files = sorted(glob.glob(os.path.join(target_dir, "incident_*.json")), key=os.path.getmtime)
+            while len(files) > self.max_history:
+                try:
+                    os.remove(files.pop(0))
+                except Exception:
+                    break
+        except Exception as e:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SCAN ENGINE WITH CONCURRENCY MUTEX & CACHING
 # ─────────────────────────────────────────────────────────────────────────────
 
 def grade(score):
@@ -1414,82 +1473,114 @@ class Engine:
         self.history = deque(maxlen=cfg["history_points"])
         self.report = None
         self.lock = threading.Lock()
+        self.scan_lock = threading.Lock()
+        self.last_scan_time = 0.0
+        self.cached_report = None
+        self.incidents = IncidentRecorder(cfg)
+        self.alert_state = {}
         self._load_state()
 
     def _load_state(self):
         try:
-            with open(self.cfg["state_file"]) as fh:
-                for pt in json.load(fh).get("history", []):
-                    self.history.append(pt)
+            if os.path.isfile(self.cfg["state_file"]):
+                with open(self.cfg["state_file"]) as fh:
+                    data = json.load(fh)
+                    for pt in data.get("history", []):
+                        self.history.append(pt)
+                    self.alert_state = data.get("alerts", {})
         except Exception:
             pass
 
     def _save_state(self):
         path = self.cfg["state_file"]
         try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+            except OSError:
+                path = "/tmp/health-sentinel-state.json"
+                os.makedirs(os.path.dirname(path), exist_ok=True)
             tmp = path + ".tmp"
             with open(tmp, "w") as fh:
-                json.dump({"history": list(self.history)[-self.cfg["history_points"]:]}, fh)
+                json.dump({
+                    "history": list(self.history)[-self.cfg["history_points"]:],
+                    "alerts": self.alert_state
+                }, fh)
             os.replace(tmp, path)
         except Exception:
             pass
 
-    def scan(self):
-        t0 = time.time()
-        cur, prev, dt = self.sampler.collect()
-        T = self.cfg["thresholds"]
-        checks = []
-        for fn in CHECKS:
-            try:
-                checks.append(fn(cur, prev, dt, T))
-            except Exception as e:  # never let one probe kill the scan
-                bad = Check(fn.__name__.replace("check_", ""), fn.__name__, "alert", 0.4)
-                bad.status, bad.score, bad.value = "warn", 60.0, "n/a"
-                bad.summary = f"probe error: {e}"
-                checks.append(bad.finalize())
+    def scan(self, force=False):
+        now = time.time()
+        # Fast cache check outside lock
+        if not force and self.cached_report and (now - self.last_scan_time < 2.0):
+            return self.cached_report
 
-        wsum = sum(c.weight for c in checks) or 1
-        overall = sum(c.score * c.weight for c in checks) / wsum
-        crits = [c for c in checks if c.status == "crit"]
-        warns = [c for c in checks if c.status == "warn"]
-        if crits:
-            overall = min(overall, 54)
-        elif warns:
-            overall = min(overall, 79)
-        g, label = grade(overall)
-        report = {
-            "version": VERSION,
-            "host": self.cfg["hostname"],
-            "fqdn": socket.getfqdn(),
-            "os": _os_pretty(),
-            "kernel": read("/proc/sys/kernel/osrelease", os.uname().release).strip(),
-            "arch": os.uname().machine,
-            "cores": CORES,
-            "uptime": fmt_dur(float(read("/proc/uptime", "0 0").split()[0])),
-            "ts": time.time(),
-            "time": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
-            "duration_ms": int((time.time() - t0) * 1000),
-            "score": round(overall, 1), "grade": g, "grade_label": label,
-            "status": "crit" if crits else ("warn" if warns else "ok"),
-            "counts": {"ok": len(checks) - len(crits) - len(warns),
-                       "warn": len(warns), "crit": len(crits), "total": len(checks)},
-            "checks": [asdict(c) for c in checks],
-        }
-        cm = {c["id"]: c for c in report["checks"]}
-        self.history.append({
-            "t": int(report["ts"]), "score": report["score"],
-            "cpu": cm["cpu"]["metrics"].get("busy", 0),
-            "mem": cm["memory"]["metrics"].get("used_pct", 0),
-            "load": cm["load"]["metrics"].get("per_core", 0),
-            "disk": cm["disk"]["metrics"].get("worst_pct", 0),
-            "io": cm["io"]["metrics"].get("worst_util", 0),
-            "net": cm["network"]["metrics"].get("retrans_pct", 0),
-        })
-        with self.lock:
-            self.report = report
-        self._save_state()
-        return report
+        with self.scan_lock:
+            now = time.time()
+            if not force and self.cached_report and (now - self.last_scan_time < 2.0):
+                return self.cached_report
+
+            t0 = time.time()
+            cur, prev, dt = self.sampler.collect()
+            T = self.cfg["thresholds"]
+            checks = []
+            for fn in CHECKS:
+                try:
+                    checks.append(fn(cur, prev, dt, T))
+                except Exception as e:
+                    bad = Check(fn.__name__.replace("check_", ""), fn.__name__, "alert", 0.4)
+                    bad.status, bad.score, bad.value = "warn", 60.0, "n/a"
+                    bad.summary = f"probe error: {e}"
+                    checks.append(bad.finalize())
+
+            wsum = sum(c.weight for c in checks) or 1
+            overall = sum(c.score * c.weight for c in checks) / wsum
+            crits = [c for c in checks if c.status == "crit"]
+            warns = [c for c in checks if c.status == "warn"]
+            if crits:
+                overall = min(overall, 54)
+            elif warns:
+                overall = min(overall, 79)
+            g, label = grade(overall)
+            report = {
+                "version": VERSION,
+                "host": self.cfg["hostname"],
+                "fqdn": socket.getfqdn(),
+                "os": _os_pretty(),
+                "kernel": read("/proc/sys/kernel/osrelease", os.uname().release).strip(),
+                "arch": os.uname().machine,
+                "cores": CORES,
+                "uptime": fmt_dur(float(read("/proc/uptime", "0 0").split()[0])),
+                "ts": time.time(),
+                "time": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+                "duration_ms": int((time.time() - t0) * 1000),
+                "score": round(overall, 1), "grade": g, "grade_label": label,
+                "status": "crit" if crits else ("warn" if warns else "ok"),
+                "counts": {"ok": len(checks) - len(crits) - len(warns),
+                           "warn": len(warns), "crit": len(crits), "total": len(checks)},
+                "checks": [asdict(c) for c in checks],
+            }
+            
+            # Record high-load incident packet if anomalous
+            self.incidents.maybe_record(report, cur, prev, dt)
+            
+            cm = {c["id"]: c for c in report["checks"]}
+            self.history.append({
+                "t": int(report["ts"]), "score": report["score"],
+                "cpu": cm["cpu"]["metrics"].get("busy", 0),
+                "mem": cm["memory"]["metrics"].get("used_pct", 0),
+                "load": cm["load"]["metrics"].get("per_core", 0),
+                "disk": cm["disk"]["metrics"].get("worst_pct", 0),
+                "io": cm["io"]["metrics"].get("worst_util", 0),
+                "net": cm["network"]["metrics"].get("retrans_pct", 0),
+            })
+            
+            self.cached_report = report
+            self.last_scan_time = time.time()
+            with self.lock:
+                self.report = report
+            self._save_state()
+            return report
 
 
 def _os_pretty():
@@ -1498,17 +1589,18 @@ def _os_pretty():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  ALERTING
+#  PERSISTENT & GUARANTEED ALERT ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 
 EMOJI = {"crit": "🔴", "warn": "🟠", "ok": "🟢", "info": "🔵"}
 
 
 class AlertManager:
-    def __init__(self, cfg):
-        self.cfg = cfg["alerts"]
-        self.host = cfg["hostname"]
-        self.state = {}
+    def __init__(self, engine):
+        self.engine = engine
+        self.cfg = engine.cfg["alerts"]
+        self.host = engine.cfg["hostname"]
+        self.state = engine.alert_state
 
     def process(self, report):
         if not self.cfg.get("enabled"):
@@ -1520,7 +1612,7 @@ class AlertManager:
         events = []
         for c in report["checks"]:
             st = self.state.setdefault(c["id"], {"status": "ok", "streak": 0,
-                                                 "notified": None, "last": 0.0})
+                                                 "notified": None, "last": 0.0, "fail_count": 0})
             st["streak"] = st["streak"] + 1 if c["status"] == st["status"] else 1
             st["status"] = c["status"]
             r = RANK[c["status"]]
@@ -1528,14 +1620,65 @@ class AlertManager:
                 escalated = st["notified"] is None or RANK[c["status"]] > RANK[st["notified"]]
                 if escalated or now - st["last"] > cooldown:
                     events.append({"type": "problem", "check": c})
-                    st["notified"], st["last"] = c["status"], now
             elif c["status"] == "ok" and st["notified"] and st["streak"] >= need:
                 if self.cfg.get("notify_recovery", True):
                     events.append({"type": "recovery", "check": c})
-                st["notified"], st["last"] = None, now
+
         if events:
-            self.dispatch(events, report)
+            # Dispatch asynchronously
+            threading.Thread(target=self._dispatch_guaranteed, args=(events, report), daemon=True).start()
         return events
+
+    def _dispatch_guaranteed(self, events, report):
+        results = self._dispatch_sync(events, report)
+        now = time.time()
+        any_success = any(v.get("ok") for v in results.values())
+        if any_success:
+            for e in events:
+                c = e["check"]
+                st = self.state.setdefault(c["id"], {})
+                if e["type"] == "problem":
+                    st["notified"], st["last"], st["fail_count"] = c["status"], now, 0
+                else:
+                    st["notified"], st["last"], st["fail_count"] = None, now, 0
+            self.engine._save_state()
+        else:
+            for e in events:
+                c = e["check"]
+                st = self.state.setdefault(c["id"], {})
+                st["fail_count"] = st.get("fail_count", 0) + 1
+            print(f"[sentinel] alert dispatch failed across all channels: {results}", file=sys.stderr)
+
+    def test_dispatch(self, report):
+        """Synchronous alert testing with full per-channel timeout verification."""
+        worst = max(report["checks"], key=lambda c: (RANK[c["status"]], -c["score"]))
+        events = [{"type": "problem", "check": worst}]
+        return self._dispatch_sync(events, report, is_test=True)
+
+    def _dispatch_sync(self, events, report, is_test=False):
+        subject = ("TEST: " if is_test else "") + self.subject(events, report)
+        text = self.text(events, report)
+        htmlbody = self.html(events, report)
+        results = {}
+        
+        channels = [
+            ("email", self._email),
+            ("slack", self._slack),
+            ("telegram", self._telegram),
+            ("ntfy", self._ntfy),
+            ("webhook", self._webhook),
+            ("desktop", self._desktop)
+        ]
+        
+        for name, fn in channels:
+            cfg = self.cfg.get(name, {})
+            if isinstance(cfg, dict) and cfg.get("enabled"):
+                try:
+                    res = fn(subject, text, htmlbody, report, events)
+                    results[name] = {"ok": True, "detail": res or "Delivered"}
+                except Exception as e:
+                    results[name] = {"ok": False, "detail": str(e)}
+        return results
 
     # ── rendering ──────────────────────────────────────────────────────────
     def subject(self, events, report):
@@ -1580,8 +1723,7 @@ class AlertManager:
             c, sev = e["check"], ("ok" if e["type"] == "recovery" else e["check"]["status"])
             fl = ""
             for f in c["findings"][:2]:
-                fixes = "".join(
-                    f'<li style="margin:4px 0">{_esc(x)}</li>' for x in f["fix"][:3])
+                fixes = "".join(f'<li style="margin:4px 0">{_esc(x)}</li>' for x in f["fix"][:3])
                 diags = "".join(
                     f'<div style="font-family:ui-monospace,Menlo,monospace;font-size:12px;'
                     f'background:#0e1220;color:#c9d4ff;padding:7px 10px;border-radius:6px;'
@@ -1631,23 +1773,8 @@ class AlertManager:
  </div></div></body></html>"""
 
     # ── channels ───────────────────────────────────────────────────────────
-    def dispatch(self, events, report):
-        subject, text, htmlbody = self.subject(events, report), self.text(events, report), self.html(events, report)
-        for fn in (self._email, self._slack, self._telegram, self._ntfy, self._webhook, self._desktop):
-            threading.Thread(target=self._safe, args=(fn, subject, text, htmlbody, report, events),
-                             daemon=True).start()
-
-    @staticmethod
-    def _safe(fn, *a):
-        try:
-            fn(*a)
-        except Exception as e:
-            print(f"[sentinel] notifier {fn.__name__} failed: {e}", file=sys.stderr)
-
     def _email(self, subject, text, htmlbody, report, events):
         cfg = self.cfg["email"]
-        if not cfg.get("enabled"):
-            return
         msg = EmailMessage()
         msg["Subject"], msg["From"] = subject, cfg["from"]
         msg["To"] = ", ".join(cfg["to"])
@@ -1657,12 +1784,12 @@ class AlertManager:
         msg.add_alternative(htmlbody, subtype="html")
         ctx = ssl.create_default_context()
         if cfg.get("ssl"):
-            with smtplib.SMTP_SSL(cfg["host"], cfg["port"], context=ctx, timeout=20) as s:
+            with smtplib.SMTP_SSL(cfg["host"], cfg["port"], context=ctx, timeout=15) as s:
                 if cfg.get("user"):
                     s.login(cfg["user"], cfg["password"])
                 s.send_message(msg)
         else:
-            with smtplib.SMTP(cfg["host"], cfg["port"], timeout=20) as s:
+            with smtplib.SMTP(cfg["host"], cfg["port"], timeout=15) as s:
                 s.ehlo()
                 if cfg.get("tls"):
                     s.starttls(context=ctx)
@@ -1670,6 +1797,7 @@ class AlertManager:
                 if cfg.get("user"):
                     s.login(cfg["user"], cfg["password"])
                 s.send_message(msg)
+        return f"Sent to {len(cfg['to'])} recipient(s)"
 
     def _post(self, url, payload, headers=None, form=False):
         data = urllib.parse.urlencode(payload).encode() if form else json.dumps(payload).encode()
@@ -1677,13 +1805,11 @@ class AlertManager:
              "User-Agent": f"health-sentinel/{VERSION}"}
         h.update(headers or {})
         req = urllib.request.Request(url, data=data, headers=h)
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with urllib.request.urlopen(req, timeout=12) as r:
             return r.status
 
     def _slack(self, subject, text, htmlbody, report, events):
         cfg = self.cfg["slack"]
-        if not cfg.get("enabled") or not cfg.get("webhook_url"):
-            return
         colour = {"crit": "#e5484d", "warn": "#f5a524", "ok": "#17c964"}.get(report["status"], "#17c964")
         blocks = [{"type": "header", "text": {"type": "plain_text", "text": subject[:150]}}]
         for e in events[:6]:
@@ -1693,21 +1819,19 @@ class AlertManager:
                           "text": f"*{EMOJI.get(c['status'] if e['type'] == 'problem' else 'ok', '🟢')} "
                                   f"{c['name']}* — `{c['value']} {c['unit']}`\n{c['summary']}\n"
                                   f"*Fix:*\n{fix}"}})
-        self._post(cfg["webhook_url"], {"text": subject,
-                                        "attachments": [{"color": colour, "blocks": blocks}]})
+        st = self._post(cfg["webhook_url"], {"text": subject,
+                                              "attachments": [{"color": colour, "blocks": blocks}]})
+        return f"Webhook HTTP {st}"
 
     def _telegram(self, subject, text, htmlbody, report, events):
         cfg = self.cfg["telegram"]
-        if not cfg.get("enabled") or not cfg.get("bot_token"):
-            return
-        self._post(f"https://api.telegram.org/bot{cfg['bot_token']}/sendMessage",
-                   {"chat_id": cfg["chat_id"], "text": f"<pre>{_esc(text[:3800])}</pre>",
-                    "parse_mode": "HTML", "disable_web_page_preview": "true"}, form=True)
+        st = self._post(f"https://api.telegram.org/bot{cfg['bot_token']}/sendMessage",
+                        {"chat_id": cfg["chat_id"], "text": f"<pre>{_esc(text[:3800])}</pre>",
+                         "parse_mode": "HTML", "disable_web_page_preview": "true"}, form=True)
+        return f"Telegram HTTP {st}"
 
     def _ntfy(self, subject, text, htmlbody, report, events):
         cfg = self.cfg["ntfy"]
-        if not cfg.get("enabled") or not cfg.get("topic"):
-            return
         priority = {"crit": "urgent", "warn": "high", "ok": "default"}.get(report["status"], "default")
         tag = {"crit": "rotating_light", "warn": "warning", "ok": "white_check_mark"}.get(report["status"], "white_check_mark")
         h = {"Title": subject[:200], "Content-Type": "text/plain",
@@ -1717,28 +1841,33 @@ class AlertManager:
             h["Authorization"] = "Bearer " + cfg["token"]
         req = urllib.request.Request(f"{cfg['server'].rstrip('/')}/{cfg['topic']}",
                                      data=text[:3800].encode(), headers=h)
-        urllib.request.urlopen(req, timeout=15)
+        with urllib.request.urlopen(req, timeout=12) as r:
+            return f"ntfy HTTP {r.status}"
 
     def _webhook(self, subject, text, htmlbody, report, events):
         cfg = self.cfg["webhook"]
-        if not cfg.get("enabled") or not cfg.get("url"):
-            return
-        self._post(cfg["url"], {"subject": subject, "text": text, "report": report,
-                                "events": events}, cfg.get("headers"))
+        st = self._post(cfg["url"], {"subject": subject, "text": text, "report": report,
+                                     "events": events}, cfg.get("headers"))
+        return f"Webhook HTTP {st}"
 
     def _desktop(self, subject, text, htmlbody, report, events):
-        if not self.cfg["desktop"].get("enabled"):
-            return
-        sh(["notify-send", "-u", "critical" if report["status"] == "crit" else "normal",
-            subject, text[:400]])
+        rc, out = sh(["notify-send", "-u", "critical" if report["status"] == "crit" else "normal",
+                      subject, text[:400]], timeout=4)
+        if rc != 0:
+            raise RuntimeError(f"notify-send failed with exit code {rc}")
+        return "Desktop notification sent"
 
 
 def _esc(s):
     return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
+def prom_esc(s):
+    return str(s).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-#  WEB UI  (single page, no external assets)
+#  WEB UI
 # ─────────────────────────────────────────────────────────────────────────────
 
 HTML_PAGE = r"""<!doctype html>
@@ -1966,6 +2095,7 @@ kbd{font-size:10.5px;padding:1px 5px;border-radius:5px;border:1px solid var(--st
   <button class="chip" data-f="crit" onclick="setF('crit',this)"><span class="dot" style="color:var(--crit);background:var(--crit)"></span>Critical <b id="c-crit">0</b></button>
   <button class="chip" data-f="warn" onclick="setF('warn',this)"><span class="dot" style="color:var(--warn);background:var(--warn)"></span>Warning <b id="c-warn">0</b></button>
   <button class="chip" data-f="ok" onclick="setF('ok',this)"><span class="dot" style="color:var(--ok);background:var(--ok)"></span>Healthy <b id="c-ok">0</b></button>
+  <button class="chip" data-f="incidents" onclick="showIncidents()">⚡ Culprits &amp; Incidents <b id="c-inc">0</b></button>
   <div class="spacer"></div>
   <button class="chip" onclick="allOpen(true)">Expand all</button>
   <button class="chip" onclick="allOpen(false)">Collapse</button>
@@ -2002,7 +2132,7 @@ const ICONS = {
  alert:'<path d="M12 3l9.5 17H2.5L12 3z"/><path d="M12 9v5M12 17h.01"/>'
 };
 const CLR={ok:'var(--ok)',warn:'var(--warn)',crit:'var(--crit)',info:'var(--acc)'};
-let REPORT=null, HIST=[], FILTER='all', AUTO=true, TIMER=null, OPEN=new Set();
+let REPORT=null, HIST=[], INCIDENTS=[], FILTER='all', AUTO=true, TIMER=null, OPEN=new Set();
 
 const $=s=>document.querySelector(s), esc=s=>String(s==null?'':s)
  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -2052,6 +2182,7 @@ function render(r){
   (r.counts.warn?`<span class="pill w">${r.counts.warn} warning</span>`:'')+
   `<span class="pill o">${r.counts.ok} healthy</span>`;
  ['all','crit','warn','ok'].forEach(k=>$('#c-'+k).textContent=k==='all'?r.counts.total:r.counts[k]);
+ $('#c-inc').textContent=INCIDENTS.length;
 
  // KPI tiles
  const m=id=>r.checks.find(c=>c.id===id)||{metrics:{},status:'ok'};
@@ -2112,8 +2243,8 @@ function tables(c){
  if(c.metrics.mounts) t.push(list(c.metrics.mounts,['mount','pct','free'],'Filesystems (%, free)'));
  if(c.metrics.devices) t.push(list(c.metrics.devices,['dev','util','await_ms','iops'],'Devices (util%, await ms, IOPS)'));
  if(c.metrics.ifaces) t.push(list(c.metrics.ifaces,['iface','rx_s','tx_s','err_s'],'Interfaces (rx/s, tx/s, err/s)'));
- if(c.metrics.top_cpu) t.push(list(c.metrics.top_cpu,['comm','pid','cpu'],'Top CPU (%)'));
- if(c.metrics.top_mem) t.push(list(c.metrics.top_mem,['comm','pid','rss'],'Top memory (RSS)'));
+ if(c.metrics.top_cpu) t.push(list(c.metrics.top_cpu,['comm','user','cpu','cmd'],'Top CPU (%)'));
+ if(c.metrics.top_mem) t.push(list(c.metrics.top_mem,['comm','user','rss','cmd'],'Top memory (RSS)'));
  if(c.metrics.top_errors) t.push(list(c.metrics.top_errors,['count','text'],'Most frequent log errors'));
  if(c.metrics.top_slow_scripts) t.push(list(c.metrics.top_slow_scripts,['pool','script','duration','trace'],'PHP-FPM Slow Script Executions'));
  if(c.metrics.failed_units&&c.metrics.failed_units.length)
@@ -2154,16 +2285,49 @@ function toggleAuto(){AUTO=!AUTO;$('#autoBtn').classList.toggle('on',AUTO);
  $('#autoTxt').textContent=AUTO?`Auto ${BOOT.interval}s`:'Auto off';
  clearInterval(TIMER);if(AUTO)TIMER=setInterval(load,BOOT.interval*1000)}
 async function scan(){const b=$('#scanBtn');b.disabled=true;$('#scanIco').classList.add('spin');
- try{const r=await api('/api/scan',{method:'POST'});HIST=r.history||HIST;render(r.report);
+ try{const r=await api('/api/scan',{method:'POST'});HIST=r.history||HIST;INCIDENTS=r.incidents||INCIDENTS;render(r.report);
   const bad=r.report.counts.crit+r.report.counts.warn;
   toast('Scan complete',bad?`${bad} issue(s) need attention`:'All ten checks healthy',bad?(r.report.counts.crit?'crit':'warn'):'ok')}
  catch(e){toast('Scan failed',e.message,'crit')}
  finally{b.disabled=false;$('#scanIco').classList.remove('spin')}}
-async function load(){try{const r=await api('/api/health');HIST=r.history||[];render(r.report)}catch(e){}}
+async function load(){try{const r=await api('/api/health');HIST=r.history||[];INCIDENTS=r.incidents||[];render(r.report)}catch(e){}}
 async function testAlert(b){b.disabled=true;
  try{const r=await api('/api/test-alert',{method:'POST'});
-  toast(r.ok?'Test alert sent':'No channel enabled',r.detail,r.ok?'ok':'warn',6000)}
+  const anyOk = Object.values(r.results||{}).some(v=>v.ok);
+  const summary = Object.entries(r.results||{}).map(([k,v])=>`${k}: ${v.ok?'✓':'✗'}`).join(' · ');
+  toast(anyOk?'Test Alert Delivered':'Alert Failed',summary||r.detail,anyOk?'ok':'crit',7000)}
  finally{b.disabled=false}}
+
+function showIncidents(){
+ if(!INCIDENTS.length){toast('No Incidents','No high-load spikes or warnings recorded yet.','ok');return;}
+ const modal = document.createElement('div');
+ modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:999;backdrop-filter:blur(8px);display:grid;place-items:center;padding:20px;';
+ modal.innerHTML = `<div class="glass" style="max-width:850px;width:100%;max-height:85vh;overflow-y:auto;padding:24px;background:var(--bg2);">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+   <h2 style="font-size:18px;">⚡ Preserved Incidents &amp; Culprits (${INCIDENTS.length})</h2>
+   <button class="btn" onclick="this.closest('div[style*=position]').remove()">Close</button>
+  </div>
+  ${INCIDENTS.map(inc=>`
+   <div style="margin-bottom:18px;padding:14px;border-radius:12px;background:var(--card);border:1px solid var(--stroke);">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+     <b style="color:${CLR[inc.status]||CLR.acc}">${esc(inc.time)} · ${esc(inc.summary)}</b>
+     <span class="badge" style="color:${CLR[inc.status]||CLR.acc};background:${CLR[inc.status]||CLR.acc}22;">Score ${inc.score}</span>
+    </div>
+    ${inc.top_cpu&&inc.top_cpu.length?`
+     <div style="margin-top:10px;"><b style="font-size:12px;color:var(--mut);">Top CPU Culprits at Spike Time:</b>
+      <table class="mtable" style="margin-top:4px;">
+       ${inc.top_cpu.slice(0,5).map(p=>`<tr><td>${esc(p.user)} · ${esc(p.comm)}[${p.pid}]</td><td style="font-family:monospace;font-size:11px;">${esc(p.cmd)}</td><td><b>${p.cpu}% CPU</b></td></tr>`).join('')}
+      </table></div>`:''}
+    ${inc.dstate_tasks&&inc.dstate_tasks.length?`
+     <div style="margin-top:10px;"><b style="font-size:12px;color:var(--warn);">Tasks Blocked on Storage / I/O:</b>
+      <table class="mtable" style="margin-top:4px;">
+       ${inc.dstate_tasks.map(p=>`<tr><td>${esc(p.user)} · ${esc(p.comm)}[${p.pid}]</td><td style="font-family:monospace;font-size:11px;color:var(--warn);">${esc(p.stack||p.cmd)}</td></tr>`).join('')}
+      </table></div>`:''}
+   </div>`).join('')}
+ </div>`;
+ document.body.appendChild(modal);
+}
+
 document.addEventListener('keydown',e=>{
  if(e.target.tagName==='INPUT')return;
  if(e.key==='r')scan(); if(e.key==='e')allOpen(!document.querySelector('.card.open'));
@@ -2222,7 +2386,11 @@ class Handler(BaseHTTPRequestHandler):
     def _payload(self):
         with self.engine.lock:
             rep = self.engine.report
-        return {"report": rep or self.engine.scan(), "history": list(self.engine.history)[-240:]}
+        return {
+            "report": rep or self.engine.scan(),
+            "history": list(self.engine.history)[-240:],
+            "incidents": list(self.engine.incidents.recent_incidents)[-20:]
+        }
 
     # ── routes ──
     def do_GET(self):
@@ -2243,7 +2411,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, self._payload())
         if path == "/api/history":
             return self._send(200, {"history": list(self.engine.history)})
-        if path == "/metrics":                       # Prometheus exposition
+        if path == "/api/incidents":
+            return self._send(200, {"incidents": list(self.engine.incidents.recent_incidents)})
+        if path == "/metrics":                       # Prometheus exposition with escaped labels
             return self._send(200, prometheus(self.engine), "text/plain; version=0.0.4")
         return self._send(404, {"error": "not found"})
 
@@ -2257,7 +2427,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
         if path == "/api/scan":
-            rep = self.engine.scan()
+            rep = self.engine.scan(force=True)
             if self.alerts:
                 self.alerts.process(rep)
             return self._send(200, self._payload())
@@ -2266,25 +2436,28 @@ class Handler(BaseHTTPRequestHandler):
             chans = [n for n, c in self.cfg["alerts"].items()
                      if isinstance(c, dict) and c.get("enabled")]
             if not chans:
-                return self._send(200, {"ok": False, "detail": "Enable a channel in config.json first"})
-            worst = max(rep["checks"], key=lambda c: (RANK[c["status"]], -c["score"]))
-            self.alerts.dispatch([{"type": "problem", "check": worst}], rep)
-            return self._send(200, {"ok": True, "detail": "Sent via " + ", ".join(chans)})
+                return self._send(200, {"ok": False, "detail": "Enable at least one alert channel in config.json first", "results": {}})
+            results = self.alerts.test_dispatch(rep)
+            any_ok = any(v.get("ok") for v in results.values())
+            return self._send(200, {"ok": any_ok, "results": results, "detail": ", ".join(f"{k}: {'ok' if v.get('ok') else 'err'}" for k, v in results.items())})
         return self._send(404, {"error": "not found"})
 
 
 def prometheus(engine):
     r = engine.report or engine.scan()
+    h = prom_esc(r["host"])
     L = ["# HELP sentinel_health_score Overall health score 0-100",
          "# TYPE sentinel_health_score gauge",
-         f'sentinel_health_score{{host="{r["host"]}"}} {r["score"]}']
+         f'sentinel_health_score{{host="{h}"}} {r["score"]}']
     L += ["# HELP sentinel_check_score Per-check score", "# TYPE sentinel_check_score gauge"]
     for c in r["checks"]:
-        L.append(f'sentinel_check_score{{host="{r["host"]}",check="{c["id"]}",'
-                 f'status="{c["status"]}"}} {c["score"]}')
+        cid = prom_esc(c["id"])
+        cst = prom_esc(c["status"])
+        L.append(f'sentinel_check_score{{host="{h}",check="{cid}",status="{cst}"}} {c["score"]}')
         for k, v in c["metrics"].items():
             if isinstance(v, (int, float)) and not isinstance(v, bool):
-                L.append(f'sentinel_metric{{host="{r["host"]}",check="{c["id"]}",metric="{k}"}} {v}')
+                mk = prom_esc(k)
+                L.append(f'sentinel_metric{{host="{h}",check="{cid}",metric="{mk}"}} {v}')
     return "\n".join(L) + "\n"
 
 
@@ -2363,11 +2536,9 @@ def background_loop(engine, alerts, interval, stop):
         try:
             rep = engine.scan()
             if alerts:
-                for e in alerts.process(rep):
-                    c = e["check"]
-                    print(f"[sentinel] {e['type']} · {c['name']} · {c['status']}", flush=True)
+                alerts.process(rep)
         except Exception as e:
-            print(f"[sentinel] scan error: {e}", file=sys.stderr, flush=True)
+            print(f"[sentinel] background scan error: {e}", file=sys.stderr, flush=True)
         stop.wait(interval)
 
 
@@ -2378,7 +2549,7 @@ def main():
     ap.add_argument("--json", action="store_true", help="with --once: JSON output")
     ap.add_argument("--quiet", action="store_true", help="with --once: no per-finding detail")
     ap.add_argument("--no-alerts", action="store_true")
-    ap.add_argument("--test-alerts", action="store_true", help="send a sample alert and exit")
+    ap.add_argument("--test-alerts", action="store_true", help="send a sample alert, report status, and exit")
     ap.add_argument("--bind"), ap.add_argument("--port", type=int)
     ap.add_argument("--interval", type=int)
     args = ap.parse_args()
@@ -2394,18 +2565,26 @@ def main():
         cfg["alerts"]["enabled"] = False
 
     engine = Engine(cfg)
-    alerts = AlertManager(cfg) if cfg["alerts"]["enabled"] else None
+    alerts = AlertManager(engine) if cfg["alerts"]["enabled"] else None
 
     if args.test_alerts:
+        if not alerts or not any(isinstance(c, dict) and c.get("enabled") for c in cfg["alerts"].values()):
+            print("[-] No alert channels are enabled in config.json.")
+            return 1
         rep = engine.scan()
-        worst = max(rep["checks"], key=lambda c: (RANK[c["status"]], -c["score"]))
-        AlertManager(cfg).dispatch([{"type": "problem", "check": worst}], rep)
-        print("Test alert dispatched (check your channels).")
-        time.sleep(4)
-        return 0
+        print(f"Testing alert delivery for {rep['host']}...")
+        results = alerts.test_dispatch(rep)
+        has_failure = False
+        for channel, res in results.items():
+            if res.get("ok"):
+                print(f"  \033[38;5;42m✓\033[0m {channel}: {res['detail']}")
+            else:
+                print(f"  \033[38;5;203m✗\033[0m {channel}: {res['detail']}")
+                has_failure = True
+        return 1 if has_failure else 0
 
     if args.once:
-        rep = engine.scan()
+        rep = engine.scan(force=True)
         if alerts:
             alerts.process(rep)
         print(json.dumps(rep, indent=2, default=str)) if args.json else cli_report(rep, not args.quiet)
@@ -2431,6 +2610,7 @@ def main():
         url += "?token=" + cfg["web"]["token"]
     print(f"\n  🛡  Linux Health Sentinel v{VERSION}\n  ▸ dashboard  {url}\n"
           f"  ▸ metrics    {url.split('?')[0]}/metrics\n"
+          f"  ▸ incidents  {url.split('?')[0]}/api/incidents\n"
           f"  ▸ scanning every {cfg['scan_interval']}s · alerts: "
           f"{', '.join(n for n, c in cfg['alerts'].items() if isinstance(c, dict) and c.get('enabled')) or 'none'}\n")
     try:

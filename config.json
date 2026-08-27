@@ -3,12 +3,14 @@
   "scan_interval": 30,
   "history_points": 720,
   "state_file": "/var/lib/health-sentinel/state.json",
+  "incidents_dir": "/var/lib/health-sentinel/incidents",
+  "incident_history": 50,
 
   "web": {
     "enabled": true,
-    "bind": "0.0.0.0",
+    "bind": "127.0.0.1",
     "port": 8686,
-    "token": "change-me-long-random"
+    "token": ""
   },
 
   "thresholds": {
@@ -47,7 +49,9 @@
     "logerr_warn": 25,
     "logerr_crit": 150,
     "authfail_warn": 30,
-    "authfail_crit": 250
+    "authfail_crit": 250,
+    "php_slow_warn": 3,
+    "php_slow_crit": 15
   },
 
   "alerts": {

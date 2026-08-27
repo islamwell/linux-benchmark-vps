@@ -1,14 +1,15 @@
 # 🛡️ Linux Health Sentinel
 
-A **zero-dependency** (pure Python 3 stdlib) Linux server health platform featuring:
+A **production-ready**, **zero-dependency** (pure Python 3 stdlib) Linux server health platform and forensics monitor featuring:
 
 * **Top-10 Core Linux Health Probes**: CPU utilization & steal time, normalized load average, memory & swap pressure (with PSI), disk space & read-only detection, disk I/O bottlenecks & await latencies, inode exhaustion & open file handles, network drops/errors/retransmits/conntrack, processes/threads/zombies/D-state, systemd failed services/uptime/reboot flags/NTP, and journal errors/SSH brute-force detection.
 * **0–100 Scoring Engine**: Linear threshold interpolation, severity caps (max 54 for critical, max 79 for warning), and letter grades (A+ through F).
-* **Actionable Remediation**: Every warning or critical finding includes *Why it matters*, exact **① Diagnose** commands, and copy-pasteable **② Fix** commands with specific values.
+* **High-Load Incident Preservation & Culprit Forensics**: When load spikes or thresholds breach, Sentinel immediately captures an immutable snapshot of top CPU/RSS processes with full command-line arguments (`cmdline`), usernames/UIDs, cgroups/systemd units, and D-state kernel stack traces, persisting evidence to disk so culprits cannot hide even if processes exit before inspection.
+* **Scan Concurrency & Mutex Protection**: Thread-safe scan engine with mutex locking, rate calculation safeguards, and smart caching to prevent corrupted delta samples from concurrent browser, API, or Prometheus requests.
+* **Guaranteed Alert Delivery**: State persistence across restarts and cron timer scans, per-channel delivery validation, anti-flap streak tracking, automatic recovery notifications, and reliable `--test-alerts` verification.
 * **Embedded Glassmorphic Web Dashboard**: Dark/Light aurora gradient themes, animated health ring gauge, live KPI sparkline charts, severity filtering, instant diagnostic expansion, and live auto-refresh.
 * **Plesk & PHP-FPM Slow Script Tracing**: Automatic detection of slow script executions with exact script filename, pool name, execution duration, and function backtrace frames.
-* **Multi-Channel Alerting**: Email (HTML & plain-text via SMTP/TLS/SSL), Slack, Telegram, ntfy, custom Webhooks, and Desktop notifications with anti-flap protection (2 consecutive scans default), per-check cooldowns, and automatic recovery notices.
-* **DevOps & Monitoring Ready**: Prometheus metrics exposition endpoint at `/metrics`, JSON API, and a beautiful CLI mode (`--once`) with Nagios-style exit codes (`0` = OK, `1` = WARNING, `2` = CRITICAL).
+* **Security First**: Default binding to `127.0.0.1` with automatic cryptographically secure 24-character token generation and SSH tunnel access recommendations.
 
 ---
 
@@ -16,42 +17,68 @@ A **zero-dependency** (pure Python 3 stdlib) Linux server health platform featur
 
 ```
 linux-health-sentinel/
-├── install.sh               # One-command automated installer and service manager
-├── sentinel.py              # Single-file daemon, web UI, checks, scoring & alerts
+├── install.sh               # Automated one-command installer and service manager
+├── sentinel.py              # Single-file daemon, web UI, checks, scoring, incidents & alerts
 ├── config.json              # Thresholds, intervals, and notification credentials
 ├── deploy/
 │   ├── sentinel.service     # Systemd daemon service (web UI + background alerts)
 │   ├── sentinel-cron.service# Systemd oneshot unit for scheduled/cron scans
 │   ├── sentinel-cron.timer  # Systemd 5-minute timer for periodic checks
-│   └── enable-plesk-php-slowlog.sh # Script to enable slow logging across all Plesk PHP pools
+│   └── enable-plesk-php-slowlog.sh # Safe script to configure slow logging across all PHP pools
 └── README.md                # Documentation and setup guide
 ```
 
 ---
 
-## 🚀 Automated Installation (Recommended)
+## 🚀 Quick Start (Automated Installation)
 
-Run the installer script to automatically check dependencies, copy binaries, configure systemd, and start the daemon:
+Run the installer on your server to verify Python 3, create directory structures, generate a random security token, and register the systemd daemon:
 
 ```bash
 # 1. Clone the repository
 git clone https://github.com/islamwell/linux-benchmark-vps.git /tmp/health-sentinel
 cd /tmp/health-sentinel
 
-# 2. Run the installer
+# 2. Run the automated installer
 sudo bash install.sh
 ```
 
 ### Custom Options:
 ```bash
-# Set a custom port and authentication token
-sudo bash install.sh --port 8686 --token "my-secret-password"
+# Bind to all interfaces with a custom port and password:
+sudo bash install.sh --bind 0.0.0.0 --port 8686 --token "my-secret-token"
 
-# Auto-enable PHP-FPM slow logging on all Plesk pools
+# Enable PHP-FPM slow logging across all active Plesk pools:
 sudo bash install.sh --enable-php-slowlog
 
-# Uninstall cleanly if ever needed
+# Enable 5-minute systemd timer unit:
+sudo bash install.sh --enable-timer
+
+# Uninstall cleanly:
 sudo bash install.sh --uninstall
+```
+
+---
+
+## 🔒 Recommended Secure Access
+
+By default, Sentinel binds to `127.0.0.1:8686` for security. To view the dashboard securely without exposing open ports to the internet:
+
+### Option A: Secure SSH Port Forwarding
+Run this on your local laptop:
+```bash
+ssh -L 8686:127.0.0.1:8686 root@<YOUR_SERVER_IP>
+```
+Then open: **`http://localhost:8686?token=YOUR_GENERATED_TOKEN`**
+
+### Option B: Nginx / Plesk Reverse Proxy
+Add a reverse proxy in your Nginx configuration with SSL:
+```nginx
+location /sentinel/ {
+    proxy_pass http://127.0.0.1:8686/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+}
 ```
 
 ---
@@ -62,14 +89,14 @@ When high CPU or load spikes occur, snapshots alone don't show which user reques
 
 * **Pinpoints the Exact Script**: e.g., `/var/www/vhosts/nurulquranlive.com/httpdocs/index.php`
 * **Execution Backtrace**: Identifies slow plugins, unindexed SQL queries, or remote cURL calls (e.g. `curl_exec() in /wp-content/plugins/xyz/api.php:142`).
-* **Automated Plesk Pool Configuration**: If slow logging is disabled, Sentinel warns you and provides a one-command setup:
+* **Safe Configuration Script**: Configure all pools safely with automatic configuration testing (`php-fpm -t`) and instant rollback on syntax failure:
   ```bash
   sudo bash deploy/enable-plesk-php-slowlog.sh 5s 20
   ```
 
 ---
 
-## 💻 Manual / CLI Execution
+## 💻 Manual & CLI Execution
 
 ### 1. Formatted CLI Report (Nagios exit codes 0/1/2)
 ```bash
@@ -81,11 +108,11 @@ sudo python3 sentinel.py --once
 sudo python3 sentinel.py --once --json
 ```
 
-### 3. Launch Web Dashboard directly
+### 3. Test Alert Notification Delivery
+Verify that your alert configurations are functioning correctly:
 ```bash
-sudo python3 sentinel.py --bind 0.0.0.0 --port 8686
+sudo python3 /opt/health-sentinel/sentinel.py -c /etc/health-sentinel/config.json --test-alerts
 ```
-Open `http://<server-ip>:8686` in your browser.
 
 ---
 
@@ -95,13 +122,16 @@ Open `http://<server-ip>:8686` in your browser.
 {
   "hostname": null,
   "scan_interval": 30,
+  "history_points": 720,
   "state_file": "/var/lib/health-sentinel/state.json",
+  "incidents_dir": "/var/lib/health-sentinel/incidents",
+  "incident_history": 50,
 
   "web": {
     "enabled": true,
-    "bind": "0.0.0.0",
+    "bind": "127.0.0.1",
     "port": 8686,
-    "token": "your-secure-auth-token"
+    "token": ""
   },
 
   "thresholds": {
@@ -115,7 +145,8 @@ Open `http://<server-ip>:8686` in your browser.
     "io_util_warn": 80, "io_util_crit": 95,
     "await_warn": 25, "await_crit": 120,
     "retrans_warn": 1.5, "retrans_crit": 6,
-    "authfail_warn": 30, "authfail_crit": 250
+    "authfail_warn": 30, "authfail_crit": 250,
+    "php_slow_warn": 3, "php_slow_crit": 15
   },
 
   "alerts": {
@@ -160,12 +191,6 @@ Open `http://<server-ip>:8686` in your browser.
 }
 ```
 
-### Test Alert Dispatch
-Verify that your alert configurations are functioning correctly:
-```bash
-sudo python3 /opt/health-sentinel/sentinel.py -c /etc/health-sentinel/config.json --test-alerts
-```
-
 ---
 
 ## 🔌 API & Prometheus Endpoints
@@ -174,11 +199,10 @@ When `web.enabled` is `true`:
 - `GET /` — Responsive web dashboard with dark/light themes and sparklines
 - `GET /api/health` — Full JSON diagnostic report with checks, scores, and findings
 - `GET /api/history` — Rolling history data points for graphs and trend analysis
-- `POST /api/scan` — Force an immediate re-scan and evaluation
+- `GET /api/incidents` — Preserved incident packets and top CPU/Memory culprits
+- `POST /api/scan` — Force an immediate re-scan and evaluation (thread-safe)
 - `POST /api/test-alert` — Trigger a test alert to verify notification dispatch
-- `GET /metrics` — Prometheus metrics format for Grafana / VictoriaMetrics / Prometheus scraping
-
-If a token is configured in `config.json` (`web.token`), pass it via query string `?token=...`, header `X-Auth-Token: ...`, or `Authorization: Bearer ...`.
+- `GET /metrics` — Prometheus metrics format with escaped labels
 
 ---
 
@@ -200,4 +224,4 @@ If a token is configured in `config.json` (`web.token`), pass it via query strin
 ---
 
 ## 📜 Versioning
-Current Version: **v1.4.2 (updated 2026-08-27 15:50)**
+Current Version: **v1.5.0 (updated 2026-08-27 16:05)**

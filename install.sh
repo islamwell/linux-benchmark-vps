@@ -1,32 +1,30 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Linux Health Sentinel — One-Command Automated Installer & Service Manager
-# Version: 1.4.2 (updated 2026-08-27 15:50)
-#
-# Automated installation for Linux servers & Plesk VPS instances.
-# Usage:
-#   sudo bash install.sh
-#   sudo bash install.sh --port 8686 --token my-secret-pass --enable-php-slowlog
-#   sudo bash install.sh --uninstall
+# Linux Health Sentinel — Automated Installer & Service Manager
+# Version: 1.5.0 (updated 2026-08-27 16:05)
 # ==============================================================================
 
 set -euo pipefail
 
-VERSION="1.4.2"
-UPDATED="2026-08-27 15:50"
+VERSION="1.5.0"
+UPDATED="2026-08-27 16:05"
 
 # Target installation paths
 INSTALL_DIR="/opt/health-sentinel"
 CONFIG_DIR="/etc/health-sentinel"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
 STATE_DIR="/var/lib/health-sentinel"
+INCIDENTS_DIR="/var/lib/health-sentinel/incidents"
 SERVICE_FILE="/etc/systemd/system/sentinel.service"
+CRON_SERVICE_FILE="/etc/systemd/system/sentinel-cron.service"
+CRON_TIMER_FILE="/etc/systemd/system/sentinel-cron.timer"
 
 # Defaults
-PORT=8686
-BIND="0.0.0.0"
+PORT=""
+BIND=""
 TOKEN=""
 ENABLE_SLOWLOG=false
+ENABLE_TIMER=false
 UNINSTALL=false
 
 # Colors
@@ -57,6 +55,10 @@ while [[ $# -gt 0 ]]; do
             ENABLE_SLOWLOG=true
             shift
             ;;
+        --enable-timer)
+            ENABLE_TIMER=true
+            shift
+            ;;
         --uninstall)
             UNINSTALL=true
             shift
@@ -68,9 +70,10 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --port <port>             Web dashboard port (default: 8686)"
-            echo "  --bind <ip>               Bind IP address (default: 0.0.0.0)"
-            echo "  --token <token>           Optional web authentication token"
-            echo "  --enable-php-slowlog      Automatically configure PHP-FPM / Plesk slow logging"
+            echo "  --bind <ip>               Bind IP address (default: 127.0.0.1 for security)"
+            echo "  --token <token>           Web authentication token (auto-generated if omitted)"
+            echo "  --enable-php-slowlog      Safely configure PHP-FPM / Plesk slow logging (5s threshold)"
+            echo "  --enable-timer            Also enable 5-minute systemd timer (sentinel-cron.timer)"
             echo "  --uninstall               Stop service and remove Sentinel from system"
             echo "  -h, --help                Show this help message"
             echo ""
@@ -100,11 +103,15 @@ if [ "$UNINSTALL" = true ]; then
         echo "    Disabling sentinel service..."
         systemctl disable sentinel || true
     fi
-    rm -f "${SERVICE_FILE}"
+    if systemctl is-active --quiet sentinel-cron.timer 2>/dev/null; then
+        systemctl stop sentinel-cron.timer || true
+        systemctl disable sentinel-cron.timer || true
+    fi
+    rm -f "${SERVICE_FILE}" "${CRON_SERVICE_FILE}" "${CRON_TIMER_FILE}"
     systemctl daemon-reload || true
     rm -rf "${INSTALL_DIR}"
     echo -e "${C_GREEN}[✓] Sentinel binaries and service removed.${C_RESET}"
-    echo -e "${C_DIM}Note: Configuration at ${CONFIG_DIR} and data at ${STATE_DIR} were kept. Remove manually if desired.${C_RESET}"
+    echo -e "${C_DIM}Note: Configuration at ${CONFIG_DIR} and state data at ${STATE_DIR} were preserved.${C_RESET}"
     exit 0
 fi
 
@@ -150,9 +157,11 @@ mkdir -p "${INSTALL_DIR}"
 mkdir -p "${INSTALL_DIR}/deploy"
 mkdir -p "${CONFIG_DIR}"
 mkdir -p "${STATE_DIR}"
+mkdir -p "${INCIDENTS_DIR}"
 chmod 750 "${INSTALL_DIR}"
 chmod 750 "${CONFIG_DIR}"
 chmod 750 "${STATE_DIR}"
+chmod 750 "${INCIDENTS_DIR}"
 
 # 4. Copy files
 echo -e "${C_BOLD}[3/6] Installing application files into ${INSTALL_DIR}...${C_RESET}"
@@ -163,7 +172,6 @@ if [ -f "${SOURCE_DIR}/deploy/enable-plesk-php-slowlog.sh" ]; then
     cp "${SOURCE_DIR}/deploy/enable-plesk-php-slowlog.sh" "${INSTALL_DIR}/deploy/"
     chmod 755 "${INSTALL_DIR}/deploy/enable-plesk-php-slowlog.sh"
 fi
-
 if [ -f "${SOURCE_DIR}/deploy/sentinel-cron.service" ]; then
     cp "${SOURCE_DIR}/deploy/sentinel-cron.service" "${INSTALL_DIR}/deploy/"
 fi
@@ -172,28 +180,60 @@ if [ -f "${SOURCE_DIR}/deploy/sentinel-cron.timer" ]; then
 fi
 
 # 5. Handle Configuration
-echo -e "${C_BOLD}[4/6] Configuring Sentinel thresholds and bindings...${C_RESET}"
+echo -e "${C_BOLD}[4/6] Configuring Sentinel security and thresholds...${C_RESET}"
 if [ ! -f "${CONFIG_FILE}" ]; then
     cp "${SOURCE_DIR}/config.json" "${CONFIG_FILE}"
     chmod 640 "${CONFIG_FILE}"
-    echo "    Created default config at ${CONFIG_FILE}"
-else
-    echo "    Existing config found at ${CONFIG_FILE} (preserved)"
+    echo "    Created base config at ${CONFIG_FILE}"
 fi
 
-# Apply CLI overrides to config.json if provided
-python3 -c "
+# Safely update config using Python with sys.argv
+python3 - "${CONFIG_FILE}" "${BIND}" "${PORT}" "${TOKEN}" <<'PYEOF'
+import sys
 import json
-cfg_path = '${CONFIG_FILE}'
+import secrets
+
+cfg_path = sys.argv[1]
+arg_bind = sys.argv[2]
+arg_port = sys.argv[3]
+arg_token = sys.argv[4]
+
 with open(cfg_path, 'r') as f:
     cfg = json.load(f)
-cfg['web']['bind'] = '${BIND}'
-cfg['web']['port'] = int('${PORT}')
-if '${TOKEN}':
-    cfg['web']['token'] = '${TOKEN}'
+
+# Ensure web dict exists
+if 'web' not in cfg:
+    cfg['web'] = {}
+
+# Set secure defaults if not configured
+if not cfg['web'].get('bind'):
+    cfg['web']['bind'] = '127.0.0.1'
+if not cfg['web'].get('port'):
+    cfg['web']['port'] = 8686
+
+# Generate a strong token if token is empty and none provided
+current_token = cfg['web'].get('token', '').strip()
+if not current_token and not arg_token:
+    cfg['web']['token'] = secrets.token_urlsafe(24)
+elif arg_token:
+    cfg['web']['token'] = arg_token
+
+# Apply explicit overrides if provided on CLI
+if arg_bind:
+    cfg['web']['bind'] = arg_bind
+if arg_port:
+    cfg['web']['port'] = int(arg_port)
+
 with open(cfg_path, 'w') as f:
     json.dump(cfg, f, indent=2)
-"
+PYEOF
+
+chmod 640 "${CONFIG_FILE}"
+
+# Retrieve active settings for display
+FINAL_BIND=$(python3 -c "import json; print(json.load(open('${CONFIG_FILE}'))['web'].get('bind', '127.0.0.1'))")
+FINAL_PORT=$(python3 -c "import json; print(json.load(open('${CONFIG_FILE}'))['web'].get('port', 8686))")
+FINAL_TOKEN=$(python3 -c "import json; print(json.load(open('${CONFIG_FILE}'))['web'].get('token', ''))")
 
 # 6. Install and enable Systemd service
 echo -e "${C_BOLD}[5/6] Registering and starting systemd service (sentinel.service)...${C_RESET}"
@@ -225,23 +265,28 @@ systemctl daemon-reload
 systemctl enable --now sentinel
 sleep 1.5
 
-# 7. Optional Plesk PHP-FPM slow log activation
-echo -e "${C_BOLD}[6/6] Checking for Plesk / PHP-FPM slow logging...${C_RESET}"
-IS_PLESK=false
-if [ -d "/usr/local/psa" ] || [ -d "/opt/plesk/php" ]; then
-    IS_PLESK=true
+# Optional Cron Timer Setup
+if [ "$ENABLE_TIMER" = true ]; then
+    echo "    Enabling scheduled timer (sentinel-cron.timer)..."
+    cp "${INSTALL_DIR}/deploy/sentinel-cron.service" "${CRON_SERVICE_FILE}"
+    cp "${INSTALL_DIR}/deploy/sentinel-cron.timer" "${CRON_TIMER_FILE}"
+    systemctl daemon-reload
+    systemctl enable --now sentinel-cron.timer
 fi
 
-if [ "$ENABLE_SLOWLOG" = true ] || [ "$IS_PLESK" = true ]; then
+# 7. Optional PHP-FPM Slowlog Setup
+echo -e "${C_BOLD}[6/6] Checking PHP-FPM slow logging setup...${C_RESET}"
+if [ "$ENABLE_SLOWLOG" = true ]; then
     if [ -f "${INSTALL_DIR}/deploy/enable-plesk-php-slowlog.sh" ]; then
-        echo "    Configuring PHP-FPM slow logging on active pools (5s timeout)..."
-        bash "${INSTALL_DIR}/deploy/enable-plesk-php-slowlog.sh" "5s" "20" || true
+        echo "    Executing safe PHP-FPM slow logging configuration..."
+        bash "${INSTALL_DIR}/deploy/enable-plesk-php-slowlog.sh" "5s" "20" || echo "    [!] Notice: PHP slowlog setup skipped or partially configured."
     fi
 else
-    echo "    Skipped (run 'sudo bash /opt/health-sentinel/deploy/enable-plesk-php-slowlog.sh' anytime)"
+    echo -e "    ${C_DIM}PHP slowlog auto-config skipped (opt-in). Run anytime with:${C_RESET}"
+    echo -e "    ${C_BLUE}sudo bash ${INSTALL_DIR}/deploy/enable-plesk-php-slowlog.sh 5s 20${C_RESET}"
 fi
 
-# Detect Server IP
+# Server IP detection
 SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
 [ -z "$SERVER_IP" ] && SERVER_IP="127.0.0.1"
 
@@ -251,15 +296,24 @@ echo -e "${C_GREEN}╔═══════════════════�
 echo -e "${C_GREEN}║  ${C_BOLD}✓  INSTALLATION SUCCESSFUL · LINUX HEALTH SENTINEL v${VERSION}${C_RESET}${C_GREEN}                 ║${C_RESET}"
 echo -e "${C_GREEN}╚════════════════════════════════════════════════════════════════════════════╝${C_RESET}"
 echo ""
-echo -e "  ${C_BOLD}Dashboard URL:${C_RESET}      ${C_GREEN}http://${SERVER_IP}:${PORT}${TOKEN:+?token=$TOKEN}${C_RESET}"
-echo -e "  ${C_BOLD}Localhost URL:${C_RESET}      ${C_GREEN}http://127.0.0.1:${PORT}${TOKEN:+?token=$TOKEN}${C_RESET}"
-echo -e "  ${C_BOLD}Prometheus Metrics:${C_RESET} ${C_BLUE}http://127.0.0.1:${PORT}/metrics${C_RESET}"
+echo -e "  ${C_BOLD}Dashboard Security:${C_RESET} Bound to ${C_GREEN}${FINAL_BIND}:${FINAL_PORT}${C_RESET}"
+if [ -n "$FINAL_TOKEN" ]; then
+    echo -e "  ${C_BOLD}Generated Token:${C_RESET}    ${C_WARN}${FINAL_TOKEN}${C_RESET}"
+    echo -e "  ${C_BOLD}Dashboard URL:${C_RESET}      ${C_GREEN}http://${FINAL_BIND}:${FINAL_PORT}?token=${FINAL_TOKEN}${C_RESET}"
+else
+    echo -e "  ${C_BOLD}Dashboard URL:${C_RESET}      ${C_GREEN}http://${FINAL_BIND}:${FINAL_PORT}${C_RESET}"
+fi
+echo -e "  ${C_BOLD}Prometheus Metrics:${C_RESET} ${C_BLUE}http://127.0.0.1:${FINAL_PORT}/metrics${C_RESET}"
 echo -e "  ${C_BOLD}Config File:${C_RESET}        ${C_DIM}${CONFIG_FILE}${C_RESET}"
 echo -e "  ${C_BOLD}Service Status:${C_RESET}     ${C_DIM}systemctl status sentinel${C_RESET}"
-echo -e "  ${C_BOLD}Live Logs:${C_RESET}          ${C_DIM}journalctl -u sentinel -f${C_RESET}"
 echo ""
-echo -e "  ${C_BOLD}Next Steps:${C_RESET}"
-echo -e "  1. View instant CLI report:   ${C_BLUE}sudo python3 ${INSTALL_DIR}/sentinel.py --once${C_RESET}"
-echo -e "  2. Configure Telegram/Slack:  ${C_BLUE}sudo nano ${CONFIG_FILE}${C_RESET}"
-echo -e "  3. Test alert dispatch:       ${C_BLUE}sudo python3 ${INSTALL_DIR}/sentinel.py -c ${CONFIG_FILE} --test-alerts${C_RESET}"
+echo -e "  ${C_BOLD}🔒 Recommended Secure Access:${C_RESET}"
+echo -e "  Since Sentinel is securely bound to ${FINAL_BIND}, access it from your laptop via SSH tunnel:"
+echo -e "  ${C_BLUE}ssh -L ${FINAL_PORT}:127.0.0.1:${FINAL_PORT} root@${SERVER_IP}${C_RESET}"
+echo -e "  Then open: ${C_GREEN}http://localhost:${FINAL_PORT}${FINAL_TOKEN:+?token=$FINAL_TOKEN}${C_RESET}"
+echo ""
+echo -e "  ${C_BOLD}Helpful Commands:${C_RESET}"
+echo -e "  • Instant CLI report:   ${C_BLUE}sudo python3 ${INSTALL_DIR}/sentinel.py --once${C_RESET}"
+echo -e "  • Configure alerts:     ${C_BLUE}sudo nano ${CONFIG_FILE}${C_RESET}"
+echo -e "  • Test alert channels:  ${C_BLUE}sudo python3 ${INSTALL_DIR}/sentinel.py -c ${CONFIG_FILE} --test-alerts${C_RESET}"
 echo ""
