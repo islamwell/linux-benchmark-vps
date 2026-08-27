@@ -1,0 +1,95 @@
+{
+  "hostname": null,
+  "scan_interval": 30,
+  "history_points": 720,
+  "state_file": "/var/lib/health-sentinel/state.json",
+
+  "web": {
+    "enabled": true,
+    "bind": "0.0.0.0",
+    "port": 8686,
+    "token": "change-me-long-random"
+  },
+
+  "thresholds": {
+    "cpu_warn": 85,
+    "cpu_crit": 95,
+    "steal_warn": 5,
+    "steal_crit": 12,
+    "load_warn": 1.0,
+    "load_crit": 2.0,
+    "mem_warn": 85,
+    "mem_crit": 94,
+    "swap_warn": 35,
+    "swap_crit": 75,
+    "disk_warn": 80,
+    "disk_crit": 92,
+    "inode_warn": 80,
+    "inode_crit": 92,
+    "io_util_warn": 80,
+    "io_util_crit": 95,
+    "await_warn": 25,
+    "await_crit": 120,
+    "iowait_warn": 12,
+    "iowait_crit": 30,
+    "neterr_warn": 1,
+    "neterr_crit": 25,
+    "retrans_warn": 1.5,
+    "retrans_crit": 6,
+    "conntrack_warn": 75,
+    "conntrack_crit": 90,
+    "fd_warn": 70,
+    "fd_crit": 88,
+    "pid_warn": 70,
+    "pid_crit": 88,
+    "zombie_warn": 15,
+    "zombie_crit": 60,
+    "logerr_warn": 25,
+    "logerr_crit": 150,
+    "authfail_warn": 30,
+    "authfail_crit": 250
+  },
+
+  "alerts": {
+    "enabled": true,
+    "min_severity": "warn",
+    "consecutive": 2,
+    "cooldown_minutes": 60,
+    "notify_recovery": true,
+
+    "email": {
+      "enabled": false,
+      "host": "smtp.gmail.com",
+      "port": 587,
+      "tls": true,
+      "ssl": false,
+      "user": "alerts@example.com",
+      "password": "app-specific-password",
+      "from": "Health Sentinel <alerts@example.com>",
+      "to": ["ops@example.com", "oncall@example.com"]
+    },
+    "slack": {
+      "enabled": false,
+      "webhook_url": "https://hooks.slack.com/services/XXX/YYY/ZZZ"
+    },
+    "telegram": {
+      "enabled": false,
+      "bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+      "chat_id": "-1001234567890"
+    },
+    "ntfy": {
+      "enabled": false,
+      "server": "https://ntfy.sh",
+      "topic": "my-servers",
+      "token": ""
+    },
+    "webhook": {
+      "enabled": false,
+      "url": "https://example.com/hook",
+      "headers": { "X-Key": "s3cret" }
+    },
+    "desktop": {
+      "enabled": false
+    }
+  }
+}

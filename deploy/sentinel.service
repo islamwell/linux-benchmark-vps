@@ -1,0 +1,21 @@
+[Unit]
+Description=Linux Health Sentinel (dashboard + alerts)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/health-sentinel/sentinel.py -c /etc/health-sentinel/config.json
+Restart=always
+RestartSec=5
+# needs root for dmesg/smartctl/lsof detail; drop privileges if you accept reduced depth:
+User=root
+StateDirectory=health-sentinel
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=200M
+CPUQuota=25%
+NoNewPrivileges=yes
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+[Unit]
+Description=Health Sentinel one-shot scan
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/health-sentinel/sentinel.py --once --quiet
+SuccessExitStatus=0 1 2

@@ -1,0 +1,10 @@
+[Unit]
+Description=Health Sentinel scheduled scan
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=45
+
+[Install]
+WantedBy=timers.target
