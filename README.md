@@ -167,14 +167,21 @@ sudo python3 /opt/health-sentinel/sentinel.py -c /etc/health-sentinel/config.jso
       "from": "Health Sentinel <alerts@example.com>",
       "to": ["ops@example.com"]
     },
-    "slack": {
-      "enabled": false,
-      "webhook_url": "https://hooks.slack.com/services/XXX/YYY/ZZZ"
-    },
     "telegram": {
       "enabled": false,
       "bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
       "chat_id": "-1001234567890"
+    },
+    "whatsapp": {
+      "enabled": false,
+      "provider": "callmebot",
+      "phone": "+4794441171",
+      "apikey": "",
+      "webhook_url": ""
+    },
+    "slack": {
+      "enabled": false,
+      "webhook_url": "https://hooks.slack.com/services/XXX/YYY/ZZZ"
     },
     "ntfy": {
       "enabled": false,
@@ -193,15 +200,31 @@ sudo python3 /opt/health-sentinel/sentinel.py -c /etc/health-sentinel/config.jso
 
 ---
 
+## 📱 WhatsApp Alerting Setup (+4794441171)
+Sentinel supports direct WhatsApp alerting via **CallMeBot** (free & instant):
+1. On WhatsApp, send the message `I allow callmebot to send me messages` to `+34 941 01 99 99` (or the CallMeBot bot number for your region).
+2. CallMeBot will reply with your personal API key (e.g. `123456`).
+3. In `/etc/health-sentinel/config.json`:
+   ```json
+   "whatsapp": {
+     "enabled": true,
+     "phone": "+4794441171",
+     "apikey": "YOUR_API_KEY"
+   }
+   ```
+4. Restart Sentinel: `sudo systemctl restart sentinel`. Whenever server load reaches **8.0**, an immediate WhatsApp message is sent to `+4794441171`!
+
+---
+
 ## 🔌 API & Prometheus Endpoints
 
 When `web.enabled` is `true`:
-- `GET /` — Responsive web dashboard with dark/light themes and sparklines
-- `GET /api/health` — Full JSON diagnostic report with checks, scores, and findings
+- `GET /` — Responsive web dashboard with 10-min KPI cards, Y-axis units, and interactive range selectors (1m, 10m, 1h, 1d)
+- `GET /api/health` — Full JSON diagnostic report with simple language findings and metrics
 - `GET /api/history` — Rolling history data points for graphs and trend analysis
 - `GET /api/incidents` — Preserved incident packets and top CPU/Memory culprits
 - `POST /api/scan` — Force an immediate re-scan and evaluation (thread-safe)
-- `POST /api/test-alert` — Trigger a test alert to verify notification dispatch
+- `POST /api/test-alert` — Trigger a test alert to verify notification dispatch (Telegram, WhatsApp, Email)
 - `GET /metrics` — Prometheus metrics format with escaped labels
 
 ---
@@ -211,7 +234,7 @@ When `web.enabled` is `true`:
 | Check ID | Probe Focus | Key Metrics |
 |---|---|---|
 | `cpu` | CPU utilization & hypervisor steal | User, system, iowait, steal%, PSI stall (some_avg10), top consumers |
-| `load` | Run queue saturation | 1m, 5m, 15m load normalized per core, D-state vs R-state ratio |
+| `load` | Run queue saturation & Load >= 8.0 | 1m, 5m, 15m load normalized & absolute (warn >= 8.0), D-state vs R-state |
 | `memory` | RAM, Swap & OOM Killer | Available RAM%, swap in/out rate, PSI pressure, recent OOM events |
 | `disk` | Filesystem capacity & flags | Mount utilization, free bytes, read-only status |
 | `io` | Storage bottlenecks & latencies | Device utilization%, await times (ms), IOPS, kernel I/O errors |
@@ -224,4 +247,5 @@ When `web.enabled` is `true`:
 ---
 
 ## 📜 Versioning
-Current Version: **v1.5.1 (updated 2026-08-27 16:18)**
+Current Version: **v1.5.2 (updated 2026-08-28 08:40)**
+

@@ -9,7 +9,7 @@
   sudo python3 sentinel.py                  # dashboard on http://127.0.0.1:8686
   sudo python3 sentinel.py --once           # pretty CLI report (exit 0/1/2)
   sudo python3 sentinel.py --once --json    # machine readable
-  sudo python3 sentinel.py --test-alerts    # verify email/slack/telegram setup
+  sudo python3 sentinel.py --test-alerts    # verify telegram/whatsapp/email setup
 """
 
 import argparse
@@ -36,8 +36,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.5.1"
-UPDATED = "2026-08-27 16:18"
+VERSION = "1.5.2"
+UPDATED = "2026-08-28 08:40"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -58,7 +58,7 @@ CORES = os.cpu_count() or 1
 DEFAULTS = {
     "hostname": None,                    # None -> auto
     "scan_interval": 30,                 # seconds between background scans
-    "history_points": 720,
+    "history_points": 2880,              # 24 hours at 30s intervals
     "state_file": "/var/lib/health-sentinel/state.json",
     "incidents_dir": "/var/lib/health-sentinel/incidents",
     "incident_history": 50,
@@ -66,7 +66,8 @@ DEFAULTS = {
     "thresholds": {
         "cpu_warn": 85, "cpu_crit": 95,
         "steal_warn": 5, "steal_crit": 12,
-        "load_warn": 1.0, "load_crit": 2.0,          # per core
+        "load_warn": 1.0, "load_crit": 2.0,          # normalized per core
+        "load_absolute_warn": 8.0, "load_absolute_crit": 12.0,  # absolute 1m load
         "mem_warn": 85, "mem_crit": 94,
         "swap_warn": 35, "swap_crit": 75,
         "disk_warn": 80, "disk_crit": 92,
@@ -90,13 +91,20 @@ DEFAULTS = {
         "consecutive": 2,                # scans in a row before alerting (anti-flap)
         "cooldown_minutes": 60,          # re-notify same problem after N minutes
         "notify_recovery": True,
+        "telegram": {"enabled": False, "bot_token": "", "chat_id": ""},
+        "whatsapp": {
+            "enabled": False,
+            "provider": "callmebot",      # callmebot | twilio | webhook
+            "phone": "+4794441171",
+            "apikey": "",
+            "webhook_url": ""
+        },
         "email": {
             "enabled": False, "host": "smtp.gmail.com", "port": 587,
             "tls": True, "ssl": False, "user": "", "password": "",
             "from": "sentinel@example.com", "to": ["ops@example.com"]
         },
         "slack":    {"enabled": False, "webhook_url": ""},
-        "telegram": {"enabled": False, "bot_token": "", "chat_id": ""},
         "ntfy":     {"enabled": False, "server": "https://ntfy.sh", "topic": "", "token": ""},
         "webhook":  {"enabled": False, "url": "", "headers": {}},
         "desktop":  {"enabled": False},
@@ -459,7 +467,7 @@ class Check:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  THE 10 CHECKS
+#  THE 10 CHECKS (Simple Plain-English Explanations)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def top_cpu(cur, prev, dt, n=5):
@@ -509,46 +517,37 @@ def check_cpu(cur, prev, dt, T):
     if busy >= T["cpu_warn"]:
         sev = "crit" if busy >= T["cpu_crit"] else "warn"
         top_str = ", ".join(f"{u}% {n}[{pid}] ({user})" for u, pid, n, user, _ in tops) or "n/a"
-        c.add(sev, f"CPU saturated at {busy:.0f}%",
-              f"Top consumers: {top_str}",
-              "Sustained >85% CPU causes runnable threads to wait for cores; latency degrades "
-              "non-linearly and HTTP / PHP / database request backlogs build up rapidly.",
-              ["top -bn1 -o %CPU | head -20",
-               "pidstat -u 2 5            # per-process CPU trend",
-               "ps -eo pid,user,%cpu,cmd --sort=-%cpu | head -15",
-               "perf top -F 99 --stdio   # live user & kernel hotspots"],
-              [f"Renice top process: `sudo renice +10 -p {tops[0][1]}`" if tops else "Renice hog: `sudo renice +10 -p <PID>`",
-               "Set cgroup limit: `sudo systemctl set-property <unit> CPUQuota=200%`",
-               "If background batch/cron job: launch with `nice -n 19 ionice -c3 <command>`",
-               "Scale horizontally or upgrade CPU cores on hosting provider"])
+        c.add(sev, f"High CPU Usage ({busy:.0f}%) — Processor is working very hard",
+              f"Main programs using CPU: {top_str}",
+              "Why this happens: Your server processor (CPU) is running near full power. When CPU stays above 85%, websites take longer to load and new requests have to wait.",
+              ["top -bn1 -o %CPU | head -20           # See which programs are using the most CPU power",
+               "ps -eo pid,user,%cpu,cmd --sort=-%cpu | head -10 # List top 10 CPU-consuming processes"],
+              [f"Lower priority of top process: `sudo renice +10 -p {tops[0][1]}`" if tops else "Lower priority of heavy task: `sudo renice +10 -p <PID>`",
+               "Restart busy web workers: `sudo systemctl restart plesk-php82-fpm` (or your active PHP service)",
+               "Check database queries: inspect MySQL/MariaDB for unindexed or stuck queries",
+               "Consider upgrading your VPS CPU cores if traffic has grown permanently"])
     if d["system"] > 30:
-        c.add("warn", f"Kernel (system) CPU time high: {d['system']:.0f}%",
-              "More than 30% of CPU time is consumed in kernel space.",
-              "Common causes: excessive syscall storms, rapid context switching, network interrupt saturation.",
-              ["vmstat 1 5                # inspect cs (context switches) and in (interrupts)",
-               "pidstat -w 2 5            # identify context switch offenders",
-               "cat /proc/interrupts | sort -k2 -nr | head"],
-              ["Spread network interrupts: `sudo systemctl enable --now irqbalance`",
-               "Enable connection keep-alive & HTTP connection pooling",
-               "Trace syscall storm: `sudo strace -c -f -p <PID>`"])
+        c.add("warn", f"System / Kernel CPU is high ({d['system']:.0f}%)",
+              "More than 30% of processor power is spent inside kernel background operations.",
+              "Why this happens: The server is handling too many tiny system requests, network packets, or fast context switches per second.",
+              ["vmstat 1 5                # Check context switches (cs) and interrupts (in)",
+               "pidstat -w 2 5            # See which program is switching tasks fastest"],
+              ["Enable connection pooling and HTTP Keep-Alive on your web server",
+               "Spread network processing across cores: `sudo systemctl enable --now irqbalance`"])
     if d["steal"] >= T["steal_warn"]:
         c.add("crit" if d["steal"] >= T["steal_crit"] else "warn",
-              f"Hypervisor steal time {d['steal']:.1f}%",
-              "The underlying physical hypervisor is depriving this VM of CPU time.",
-              "Steal time signifies an oversold host node or exhausted burst/CPU credits (e.g. AWS T-series, burstable VPS).",
-              ["mpstat -P ALL 2 5", "grep -c ^processor /proc/cpuinfo",
-               "curl -s http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || true"],
-              ["Upgrade to a dedicated CPU instance or enable burstable unlimited credits",
-               "Reboot / migrate VM to land on a less congested hypervisor host node",
-               "Contact hosting support with steal% timestamps and metrics"])
+              f"Hypervisor Steal Time is {d['steal']:.1f}% (Cloud Host Congestion)",
+              "The physical cloud host computer is busy with other virtual machines and limiting your CPU.",
+              "Why this happens: Your VPS host is sharing CPU cores with other noisy servers or your burst CPU credits are depleted.",
+              ["mpstat -P ALL 2 5         # Check steal time across all virtual cores"],
+              ["Reboot the VPS to move to a less crowded host server node",
+               "Upgrade to a dedicated / high-frequency CPU plan on your hosting provider"])
     if p.get("some_avg10", 0) > 40:
-        c.add("warn", f"CPU pressure stall (PSI) {p['some_avg10']:.0f}%",
-              "Tasks are stalling waiting for CPU run-queue time.",
-              "PSI measures real latency stalls, providing early warning before load spikes.",
-              ["cat /proc/pressure/cpu",
-               "grep -r '' /sys/fs/cgroup/*/cpu.pressure 2>/dev/null | sort -t= -k2 -nr | head"],
-              ["Throttle rogue cgroups using CPUQuota=",
-               "Align worker thread counts with actual core count"])
+        c.add("warn", f"CPU Queue Delay (PSI: {p['some_avg10']:.0f}%)",
+              "Programs are frequently waiting for an available CPU core to become free.",
+              "Why this happens: Too many active tasks are competing for processor attention simultaneously.",
+              ["cat /proc/pressure/cpu   # View exact kernel CPU wait delay statistics"],
+              ["Reduce worker process limits in web and background services"])
     return c.finalize()
 
 
@@ -569,30 +568,40 @@ def check_load(cur, prev, dt, T):
     c.metrics = {"load1": round(l1, 2), "load5": round(l5, 2), "load15": round(l15, 2),
                  "per_core": round(n1, 2), "cores": CORES, "running": running, "blocked_io": blocked}
     c.value, c.unit = f"{l1:.2f}", f"/ {CORES} cores"
-    c.set_primary(n1, T["load_warn"], T["load_crit"], pct=n1 / T["load_crit"] * 100)
+    
+    # Check normalized load AND explicit absolute load threshold (e.g. load 8.0)
+    s_norm, st_norm = score_from(n1, T["load_warn"], T["load_crit"])
+    s_abs, st_abs = score_from(l1, T.get("load_absolute_warn", 8.0), T.get("load_absolute_crit", 12.0))
+    c.score = min(s_norm, s_abs)
+    c.status = LEVELS[max(RANK[st_norm], RANK[st_abs])]
+    c.pct = clamp(max(n1 / T["load_crit"] * 100, l1 / T.get("load_absolute_crit", 12.0) * 100))
+    
     trend = "rising ↑" if l1 > l5 * 1.25 else ("falling ↓" if l1 < l5 * 0.75 else "stable →")
     c.summary = f"1m {l1:.2f} · 5m {l5:.2f} · 15m {l15:.2f} · {trend} · {n1:.2f} per core"
 
-    if n1 >= T["load_warn"]:
-        sev = "crit" if n1 >= T["load_crit"] else "warn"
-        cause = ("I/O Wait (D-state processes blocked on storage/NFS)"
-                 if blocked >= max(2, running) else "CPU saturation (runnable threads exceed core count)")
-        c.add(sev, f"Run queue elevated: {n1:.2f}× cores ({l1:.2f} on {CORES} cores)",
-              f"Dominant cause: {cause}. Running (R)={running}, Blocked (D)={blocked}.",
-              "Load average counts runnable AND uninterruptible tasks. >1.0 per core indicates queuing.",
-              ["uptime; vmstat 1 5",
-               "ps -eo state,pid,user,comm,cmd | awk '$1~/^[RD]/' | sort | head -20",
-               "for p in $(ps -eo pid,stat | awk '$2~/D/{print $1}'); do echo \"PID $p:\"; cat /proc/$p/stack 2>/dev/null; done"],
-              ["If D-state dominated: inspect disk latency and unmount stale NFS mounts",
-               "If R-state dominated: identify and throttle top CPU process",
-               "Restart or terminate wedged jobs: `sudo kill -15 <PID>`"])
-    if l1 > l15 * 2 and n1 > 0.7:
-        c.add("info", "Sudden load spike detected",
-              f"1-minute load is {l1 / max(l15, .01):.1f}× higher than the 15-minute baseline.",
-              "Points to a sudden burst: traffic spike, deployment, or concurrent scheduled cron jobs.",
-              ["journalctl --since '-10 min' -p warning --no-pager | tail -30",
-               "grep CRON /var/log/syslog 2>/dev/null | tail -20"],
-              ["Check recent cron executions and stagger with RandomizedDelaySec="])
+    # Trigger alert if normalized load is high OR if absolute load reaches 8.0
+    if n1 >= T["load_warn"] or l1 >= T.get("load_absolute_warn", 8.0):
+        sev = "crit" if (n1 >= T["load_crit"] or l1 >= T.get("load_absolute_crit", 12.0)) else "warn"
+        cause = ("waiting on hard drive / disk (I/O Wait)"
+                 if blocked >= max(2, running) else "too many active programs running on CPU")
+        c.add(sev, f"High Server Load: {l1:.2f} (Threshold 8.0 reached)",
+              f"Current state: {running} tasks actively running, {blocked} tasks waiting on disk storage.",
+              "Why this happens: Too many programs or web requests are waiting for attention at the same time. When load reaches 8.0 or higher, web pages will load slowly, PHP scripts may time out, and SSH logins become sluggish.",
+              ["uptime                              # Check current 1-min, 5-min, 15-min load numbers",
+               "top -bn1 -o %CPU | head -20          # See which programs are using the most CPU power",
+               "ps -eo state,pid,user,%cpu,cmd | awk '$1~/^[RD]/' | head -15 # List busy/waiting processes",
+               "sudo iotop -oPa -n 3 2>/dev/null     # Check if disk writing is causing programs to wait"],
+              ["Find and stop the busy process: check top PID and run `sudo kill -15 <PID>`",
+               "Restart busy web workers: `sudo systemctl restart plesk-php82-fpm` (or your PHP version)",
+               "Check database queries: open MySQL/MariaDB and run `SHOW FULL PROCESSLIST;`",
+               "If disk wait is high: wait for backup/indexing jobs to finish or move them off peak hours"])
+    if l1 > l15 * 2 and (n1 > 0.7 or l1 > 4.0):
+        c.add("info", "Sudden Load Surge Detected",
+              f"1-minute load ({l1:.2f}) is more than double the 15-minute average ({l15:.2f}).",
+              "Why this happens: A burst of visitors just arrived, a deployment finished, or automated scheduled cron jobs started together.",
+              ["grep CRON /var/log/syslog 2>/dev/null | tail -15 # Check recent scheduled cron runs",
+               "journalctl --since '-10 min' -p warning --no-pager | tail -20"],
+              ["Stagger scheduled cron jobs across different minutes of the hour"])
     return c.finalize()
 
 
@@ -629,39 +638,31 @@ def check_memory(cur, prev, dt, T):
 
     if used_pct >= T["mem_warn"]:
         c.add("crit" if used_pct >= T["mem_crit"] else "warn",
-              f"RAM critically low: only {fmt_bytes(avail)} available ({used_pct:.0f}% used)",
-              "Top RSS: " + ", ".join(f"{r} {n}[{pid}] ({user})" for r, pid, n, user, _ in top_mem(cur)),
-              "Below ~10% available memory, page cache is evicted aggressively causing severe disk thrashing, "
-              "eventually leading the OOM Killer to terminate vital services (databases/web servers).",
-              ["free -h ; ps -eo pid,user,rss,pmem,cmd --sort=-rss | head -15",
-               "smem -tk -c 'pid user command rss pss' 2>/dev/null | tail -15",
-               "sudo slabtop -o | head -15"],
-              ["Limit memory per systemd unit: `sudo systemctl set-property <unit> MemoryMax=2G`",
-               "Tune DB buffer sizes: MySQL `innodb_buffer_pool_size` (50–60% RAM max), PG `shared_buffers` (25% RAM)",
-               "Protect critical services: `sudo systemctl set-property mariadb.service OOMScoreAdjust=-800`",
-               "Upgrade server RAM if workloads legitimately exceed current capacity"])
+              f"RAM is Running Low ({used_pct:.0f}% used) — Only {fmt_bytes(avail)} free",
+              "Top RAM users: " + ", ".join(f"{r} {n}[{pid}] ({user})" for r, pid, n, user, _ in top_mem(cur)),
+              "Why this happens: Active programs are consuming almost all physical memory. If RAM completely runs out, the server will suddenly kill databases or web services to stay alive.",
+              ["free -h                               # View total, used, free RAM and cache in readable numbers",
+               "ps -eo pid,user,%mem,rss,cmd --sort=-rss | head -15 # List top 15 memory-consuming programs"],
+              ["Restart memory-heavy services: `sudo systemctl restart plesk-php82-fpm` or `sudo systemctl restart mariadb`",
+               "Tune database cache: set MySQL `innodb_buffer_pool_size` to no more than 50-60% of total server RAM",
+               "Add a swap memory file to give the server breathing room: `sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile`",
+               "Upgrade server RAM if your websites legitimately need more memory"])
     if sw_t and sw_pct >= T["swap_warn"]:
         c.add("crit" if sw_pct >= T["swap_crit"] else "warn",
-              f"Swap heavily utilized: {sw_pct:.0f}% ({fmt_bytes(sw_t - sw_f)})",
-              f"Swap activity: in {si:.0f} pg/s · out {so:.0f} pg/s",
-              "Swap memory on disk is orders of magnitude slower than RAM. Heavy swapping causes severe latency spikes.",
-              ["vmstat 1 5   # check si/so columns",
-               "for f in /proc/*/status; do awk '/^Name|VmSwap/{printf \"%s \",$2}END{print \"\"}' $f; done | sort -k2 -h | tail -10"],
-              ["Reduce swappiness: `sudo sysctl -w vm.swappiness=10` (persist in /etc/sysctl.d/99-sentinel.conf)",
-               "Reset swap once RAM is freed: `sudo swapoff -a && sudo swapon -a`"])
-    if si + so > 200:
-        c.add("crit", "Active swap thrashing detected",
-              f"{si + so:.0f} pages/s moving in/out of swap continuously.",
-              "Working set does not fit into RAM. Application responsiveness will drop to near zero.",
-              ["vmstat 1 5", "dstat -tmsg 1 5 2>/dev/null || true"],
-              ["Immediately terminate or scale down non-critical memory consumers"])
+              f"Swap Memory in High Use ({sw_pct:.0f}% used — {fmt_bytes(sw_t - sw_f)})",
+              f"Swap activity: reading {si:.0f} pg/s · writing {so:.0f} pg/s to disk",
+              "Why this happens: When RAM is full, the server stores memory on the hard drive (swap). Because hard drives are much slower than RAM, this causes noticeable site slowness.",
+              ["vmstat 1 5   # Check the 'si' (swap-in) and 'so' (swap-out) columns"],
+              ["Lower server swap tendency: `sudo sysctl -w vm.swappiness=10`",
+               "Once RAM is freed, clear swap: `sudo swapoff -a && sudo swapon -a`"])
     oom = _recent_oom()
     if oom:
-        c.add("crit", f"OOM killer executed {len(oom)}× recently", " | ".join(oom[:3]),
-              "The Linux kernel terminated processes due to memory starvation. Risk of partial writes or service disruption.",
-              ["journalctl -k --since '-24h' | grep -iE 'out of memory|oom-kill|killed process'",
+        c.add("crit", f"Out of Memory Killer Stopped Programs ({len(oom)}× recently)", " | ".join(oom[:3]),
+              "Why this happens: Memory ran completely out and the Linux kernel forcibly stopped programs to protect the system.",
+              ["journalctl -k --since '-24h' | grep -iE 'out of memory|oom-kill|killed process' # See which programs were killed",
                "dmesg -T | grep -i 'killed process' | tail -10"],
-              ["Review killed processes and set `Restart=always` with proper memory constraints in service units"])
+              ["Reduce maximum worker child counts (pm.max_children) in your PHP / web configs",
+               "Set MemoryMax= limits on services to prevent one app from consuming all RAM"])
     return c.finalize()
 
 
@@ -740,31 +741,29 @@ def check_disk_space(cur, prev, dt, T):
         sev = "crit" if r["pct"] >= T["disk_crit"] else "warn"
         mp = r["mount"]
         if r["pct"] >= T["disk_warn"]:
-            c.add(sev, f"Filesystem {mp} is {r['pct']:.0f}% full ({fmt_bytes(r['free'])} free)",
-                  f"Device {r['dev']} ({r['fs']}) · total {fmt_bytes(r['total'])}",
-                  "A full disk crashes databases, prevents log writing, halts file uploads, and breaks package updates.",
-                  [f"du -xh --max-depth=1 {mp} 2>/dev/null | sort -h | tail -15",
-                   f"find {mp} -xdev -type f -size +500M -printf '%s\\t%p\\n' 2>/dev/null | sort -rn | head -10",
-                   "sudo journalctl --disk-usage",
-                   "sudo lsof +L1 | head -10  # unlinked files still held open by processes"],
-                  ["Vacuum journal logs: `sudo journalctl --vacuum-size=300M`",
-                   "Rotate application logs: `sudo logrotate -f /etc/logrotate.conf`",
-                   "Clean package caches: `sudo apt clean` or `sudo dnf clean all`",
-                   "Prune Docker unused data: `docker system prune -af --volumes` (caution: deletes unused volumes)",
-                   "Restart processes holding deleted open files (shown by `lsof +L1`)",
-                   f"Expand LVM volume if needed: `sudo lvextend -l +100%FREE {r['dev']} && sudo resize2fs {r['dev']}`"])
+            c.add(sev, f"Disk Drive {mp} is {r['pct']:.0f}% full ({fmt_bytes(r['free'])} free space left)",
+                  f"Partition {r['dev']} ({r['fs']}) · total {fmt_bytes(r['total'])}",
+                  "Why this happens: The hard drive partition has little free space remaining. When a disk fills to 100%, databases stop working, website uploads fail, and log files cannot be saved.",
+                  [f"df -h                                 # Check free space across all hard drive partitions",
+                   f"du -xh --max-depth=1 {mp} 2>/dev/null | sort -h | tail -10 # Find the largest folders in {mp}",
+                   f"find {mp} -xdev -type f -size +200M 2>/dev/null | head -10 # Find single files larger than 200MB",
+                   "sudo journalctl --disk-usage           # Check how much space system log files take up"],
+                  ["Clean system log files: `sudo journalctl --vacuum-size=200M`",
+                   "Clean package cache: `sudo apt clean` or `sudo dnf clean all`",
+                   "Delete old temporary files: `sudo rm -rf /tmp/*.tmp /var/tmp/*`",
+                   "Clean unused Docker images/volumes: `docker system prune -f` (if using Docker)",
+                   f"Expand disk volume if using cloud VPS: resize disk in cloud panel and run `sudo resize2fs {r['dev']}`"])
         if r["ro"]:
-            c.add("crit", f"Filesystem {mp} remounted READ-ONLY",
-                  f"Kernel remounted {r['dev']} as read-only due to underlying I/O errors or filesystem corruption.",
-                  "All writes are failing across all services using this mount point.",
-                  ["dmesg -T | grep -iE 'ext4|xfs|i/o error|remount' | tail -20",
-                   f"sudo smartctl -a {re.sub(r'[0-9]+$', '', r['dev'])} 2>/dev/null || true"],
-                  [f"Run filesystem repair: `sudo fsck -y {r['dev']}` (ensure unmounted or in maintenance mode)",
-                   "Check SMART drive health and replace failing drive hardware"])
+            c.add("crit", f"Drive {mp} Switched to READ-ONLY Mode",
+                  f"The system locked {r['dev']} to read-only mode to prevent file corruption.",
+                  "Why this happens: The hard drive experienced hardware errors or filesystem errors. No new files can be written.",
+                  ["dmesg -T | grep -iE 'ext4|xfs|i/o error|remount' | tail -20"],
+                  ["Back up critical files immediately",
+                   "Schedule a reboot and run filesystem repair: `sudo fsck -y {r['dev']}`"])
     return c.finalize()
 
 
-# 5 ── DISK I/O BOTTLENECK (Independent Device Attribution) ───────────────────
+# 5 ── DISK I/O BOTTLENECK ────────────────────────────────────────────────────
 def check_disk_io(cur, prev, dt, T):
     c = Check("io", "Disk I/O Bottleneck", "gauge", 1.2)
     devs, worst_util, worst_await, worst_dev = [], 0.0, 0.0, "—"
@@ -789,18 +788,16 @@ def check_disk_io(cur, prev, dt, T):
             worst_util, worst_dev = util, name
         worst_await = max(worst_await, awt)
         
-        # Check independent device thresholds
         if util >= T["io_util_warn"] or awt >= T["await_warn"]:
             sev = "crit" if (util >= T["io_util_crit"] or awt >= T["await_crit"]) else "warn"
-            c.add(sev, f"Storage bottleneck on device {name}",
-                  f"util {util:.1f}% · await {awt:.1f}ms · IOPS {ios/dt:.0f} · {'HDD' if a['rot'] else 'SSD/NVMe'}",
-                  "When disk await climbs or utilization approaches 100%, disk queues form, blocking processes in D-state.",
-                  [f"iostat -xz 2 5", f"sudo iotop -oPa", f"pidstat -d 2 5",
-                   f"sudo smartctl -a /dev/{name} | egrep -i 'reallocat|pending|error|wear' 2>/dev/null || true"],
-                  ["Identify high I/O writer: `sudo iotop -oPa` and apply ionice",
-                   "Throttle unit: `sudo systemctl set-property <unit> IOWeight=20 IOReadBandwidthMax=50M`",
-                   "Mount with `noatime` in `/etc/fstab` to eliminate inode update writes",
-                   "Upgrade volume provisioned IOPS or switch to NVMe storage"])
+            c.add(sev, f"Storage Drive {name} is Busy / Slow ({util:.0f}% busy, {awt:.1f}ms delay)",
+                  f"Activity: {ios/dt:.0f} reads/writes per second · {'HDD' if a['rot'] else 'SSD/NVMe'}",
+                  "Why this happens: The hard drive is struggling to keep up with disk read/write requests. Programs have to wait on the disk, making web requests feel sluggish.",
+                  [f"iostat -xz 2 3                        # Check %util and await times for all drives",
+                   f"sudo iotop -oPa -n 3                  # See which program is writing/reading the most data"],
+                  ["Identify heavy writing program in iotop and lower its priority: `sudo ionice -c3 -p <PID>`",
+                   "Enable Redis or database query caching to reduce repeated hard drive reads",
+                   "Mount partition with `noatime` in `/etc/fstab` to stop unnecessary file timestamp writes"])
 
     devs.sort(key=lambda d: -d["util"])
     ca, cb = cur["cpu"], prev["cpu"]
@@ -824,27 +821,11 @@ def check_disk_io(cur, prev, dt, T):
 
     if iowait >= T["iowait_warn"]:
         sev = "crit" if iowait >= T["iowait_crit"] else "warn"
-        c.add(sev, f"High CPU I/O Wait ({iowait:.1f}%)",
-              f"{blocked} tasks waiting in uninterruptible D-state.",
-              "CPU cores are idling waiting for storage response.",
-              ["ps -eo pid,stat,wchan:25,cmd | awk '$2~/D/'", "cat /proc/pressure/io"],
-              ["Tune DB checkpoint intervals and disable synchronous logging where appropriate"])
-
-    if p.get("full_avg10", 0) > 10:
-        c.add("warn", f"I/O pressure stall (PSI full) {p['full_avg10']:.0f}%",
-              "All server tasks were blocked waiting for storage.",
-              "Indicates severe underlying storage saturation.",
-              ["cat /proc/pressure/io"],
-              ["Apply cgroup IOWeight limits to background workloads"])
-
-    errs = [l.strip()[:160] for l in _kernel_errors()
-            if re.search(r"(i/o error|ata\d+.*failed|medium error|ext4-fs error|xfs.*corrupt|"
-                         r"nvme.*(timeout|reset)|blk_update_request)", l, re.I)]
-    if errs:
-        c.add("crit", f"Kernel hardware storage errors ({len(errs)})", " | ".join(errs[:2]),
-              "Low-level transport or hardware failure detected.",
-              ["dmesg -T --level=err,crit | tail -30", "sudo smartctl --scan"],
-              ["Back up all databases immediately and replace the failing hardware"])
+        c.add(sev, f"High Disk Wait Time (CPU iowait is {iowait:.1f}%)",
+              f"{blocked} program(s) are stuck waiting on hard drive response.",
+              "Why this happens: The processor is idling because it is waiting for files to be read from or written to the hard drive.",
+              ["ps -eo pid,user,stat,cmd | awk '$3~/D/' # View programs waiting on disk"],
+              ["Optimize database queries and turn on Redis caching"])
     return c.finalize()
 
 
@@ -882,22 +863,11 @@ def check_inodes(cur, prev, dt, T):
     for r in rows:
         if r["pct"] >= T["inode_warn"]:
             c.add("crit" if r["pct"] >= T["inode_crit"] else "warn",
-                  f"{r['mount']} inodes {r['pct']:.0f}% used ({r['free']:,} free)",
-                  "Millions of tiny files exhaust inodes before disk bytes run out, throwing 'No space left on device'.",
-                  "Common causes: PHP session files, unrotated log fragments, mail queue buildup.",
-                  [f"df -i {r['mount']}",
-                   f"sudo find {r['mount']} -xdev -type d -printf '%p\\n' 2>/dev/null | while read d; do echo \"$(ls -U \"$d\" 2>/dev/null|wc -l) $d\"; done | sort -rn | head -10"],
-                  ["Purge old PHP sessions: `sudo find /var/lib/php/sessions /tmp -type f -mmin +180 -delete`",
-                   "Clear mail queue: `sudo postsuper -d ALL deferred` (verify first)",
-                   "Format with dynamic inode allocation (XFS) for high-file-count workloads"])
-    if fd_pct >= T["fd_warn"]:
-        c.add("crit" if fd_pct >= T["fd_crit"] else "warn",
-              f"System-wide open file descriptors at {fd_pct:.0f}% ({fd_used:,}/{fd_max:,})",
-              "Exhausting `fs.file-max` causes 'Too many open files' errors across all server daemons.",
-              ["sudo lsof | awk '{print $2}' | sort | uniq -c | sort -rn | head -10",
-               "cat /proc/sys/fs/file-nr ; ulimit -n"],
-              ["Raise file limits: `sudo sysctl -w fs.file-max=2097152` (persist in /etc/sysctl.d/)",
-               "Set per-unit limits: `LimitNOFILE=65535` in service unit file"])
+                  f"Too Many Small Files on {r['mount']} ({r['pct']:.0f}% inode slots used)",
+                  "Why this happens: Linux limits how many individual files you can create. Millions of tiny cache files, old PHP session files, or email queue fragments can fill up inode slots even if you still have gigabytes of disk space.",
+                  [f"df -i {r['mount']}                     # Check inode usage count on {r['mount']}"],
+                  ["Delete old PHP session files: `sudo find /var/lib/php/sessions /tmp -type f -mmin +180 -delete`",
+                   "Clear mail queues: `sudo postsuper -d ALL deferred` (if using Postfix)"])
     return c.finalize()
 
 
@@ -946,35 +916,18 @@ def check_network(cur, prev, dt, T):
                  f"retrans {retrans:.2f}% · conntrack {ct_pct:.0f}% · TCP {est:,} open"
                  if top else "no physical interfaces")
 
-    for i in ifaces:
-        if i["err_s"] >= T["neterr_warn"]:
-            c.add("crit" if i["err_s"] >= T["neterr_crit"] else "warn",
-                  f"Interface {i['iface']} experiencing {i['err_s']:.1f} errors+drops/s",
-                  f"link {i['state']} · {i['speed'] or '?'} Mb/s",
-                  "Drops indicate ring buffer exhaustion or switch port packet discards.",
-                  [f"ip -s link show {i['iface']}", f"ethtool -S {i['iface']} 2>/dev/null | grep -iE 'drop|err|fifo'"],
-                  [f"Increase ring buffer size: `sudo ethtool -G {i['iface']} rx 4096 tx 4096`",
-                   "Increase socket backlog: `sudo sysctl -w net.core.netdev_max_backlog=5000`"])
     if retrans >= T["retrans_warn"]:
         c.add("crit" if retrans >= T["retrans_crit"] else "warn",
-              f"TCP retransmission rate high: {retrans:.2f}%",
-              f"Network packet loss or transit congestion on upstream routes.",
-              "Above 1.5% retransmission, clients experience connection stalls and timeouts.",
-              ["ss -ti | grep -E 'retrans|rto' | head -10", "ping -c 20 1.1.1.1"],
-              ["Enable BBR congestion control: `sudo sysctl -w net.ipv4.tcp_congestion_control=bbr`"])
+              f"Network Packet Loss / Retransmission at {retrans:.1f}%",
+              "Why this happens: Some network packets sent by the server are getting lost in transit on the internet, forcing the server to resend them.",
+              ["ping -c 10 1.1.1.1                      # Test packet loss to external internet"],
+              ["Turn on BBR network congestion control: `sudo sysctl -w net.ipv4.tcp_congestion_control=bbr`"])
     if overflow > 0 or listen_drops > 5:
         c.add("crit" if overflow > 0 else "warn",
-              f"Socket listen queue overflow: {overflow:.1f}/s (drops {listen_drops:.1f}/s)",
-              "Incoming connections are dropped before reaching application accept() loops.",
-              ["ss -ltn", "sysctl net.core.somaxconn net.ipv4.tcp_max_syn_backlog"],
-              ["Raise system backlog: `sudo sysctl -w net.core.somaxconn=4096 net.ipv4.tcp_max_syn_backlog=8192`",
-               "Increase application worker count (Nginx worker_connections, PHP-FPM pm.max_children)"])
-    if ct_pct >= T["conntrack_warn"]:
-        c.add("crit" if ct_pct >= T["conntrack_crit"] else "warn",
-              f"Conntrack table {ct_pct:.0f}% full ({ct_cnt:,}/{ct_max:,})",
-              "When full, the netfilter firewall drops all new connections.",
-              ["cat /proc/sys/net/netfilter/nf_conntrack_count", "sysctl net.netfilter.nf_conntrack_max"],
-              ["`sudo sysctl -w net.netfilter.nf_conntrack_max=524288`"])
+              f"Incoming Web Connections Are Being Dropped ({overflow:.0f} drops/s)",
+              "Why this happens: Too many visitors are connecting simultaneously and the server connection queue is full.",
+              ["ss -ltn                                # Check current listening sockets and backlogs"],
+              ["Increase connection backlog limit: `sudo sysctl -w net.core.somaxconn=4096 net.ipv4.tcp_max_syn_backlog=8192`"])
     return c.finalize()
 
 
@@ -1010,26 +963,15 @@ def check_processes(cur, prev, dt, T):
 
     if zombies >= T["zombie_warn"]:
         c.add("crit" if zombies >= T["zombie_crit"] else "warn",
-              f"{zombies} zombie processes detected",
-              "Zombies: " + ", ".join(f"{n}[{p}]" for p, n, _ in zpids),
-              "Parent processes terminated or failed to invoke waitpid(), holding PID slots.",
-              ["ps -eo pid,ppid,user,stat,comm | awk '$4~/Z/'",
-               "ps -o pid,user,cmd -p $(ps -eo ppid,stat | awk '$2~/Z/{print $1}' | sort -u | paste -sd, -)"],
-              ["Restart the parent service responsible for the orphan zombies",
-               "Use container init (`docker run --init` / tini) inside custom Docker containers"])
-    if pid_pct >= T["pid_warn"] or thr_pct >= T["pid_warn"]:
-        c.add("crit" if max(pid_pct, thr_pct) >= T["pid_crit"] else "warn",
-              f"Process table {max(pid_pct, thr_pct):.0f}% consumed ({total:,}/{pid_max:,} PIDs)",
-              "Fork bombs or unconstrained thread pools can lock administrators out of SSH login.",
-              ["ps -eLf | wc -l", "ps -eo user,comm | sort | uniq -c | sort -rn | head -15"],
-              ["Limit unit tasks: `sudo systemctl set-property <unit> TasksMax=2048`",
-               "Raise PID ceiling if legitimate: `sudo sysctl -w kernel.pid_max=131072`"])
+              f"{zombies} Dead / Zombie Process(es) Left Open",
+              "Why this happens: A program finished running, but its parent program did not clean it up.",
+              ["ps -eo pid,ppid,user,stat,comm | awk '$4~/Z/' # Find who created the zombie processes"],
+              ["Restart the parent application that spawned the zombie processes"])
     if dstate >= max(4, CORES):
-        c.add("warn", f"{dstate} tasks stuck in uninterruptible sleep (D-state)",
-              "Blocked tasks: " + ", ".join(f"{n}[{p}] ({stk or 'kernel I/O'})" for p, n, _, stk in dpids),
-              "D-state tasks cannot be killed with SIGKILL and wait on hardware storage or hung NFS mounts.",
-              ["ps -eo pid,user,stat,wchan:25,cmd | awk '$3~/D/'"],
-              ["Inspect disk hardware health and unmount hanging network filesystems (`umount -f -l`)"])
+        c.add("warn", f"{dstate} Program(s) Stuck Waiting on Disk (D-State)",
+              "Why this happens: Programs are frozen waiting for the hard drive to read or write data.",
+              ["ps -eo pid,user,stat,cmd | awk '$3~/D/' # View the frozen programs"],
+              ["Check drive speed and health; wait for heavy backup or database imports to finish"])
     return c.finalize()
 
 
@@ -1066,34 +1008,16 @@ def check_services(cur, prev, dt, T):
 
     if failed:
         c.add("crit" if len(failed) > 1 else "warn",
-              f"{len(failed)} systemd service unit(s) in failed state",
-              ", ".join(failed[:8]),
-              "Failed services disrupt applications and may continuously crash-loop.",
-              ["systemctl --failed", f"journalctl -u {failed[0]} -n 50 --no-pager"],
-              [f"Inspect logs, repair config, then: `sudo systemctl reset-failed {failed[0]} && sudo systemctl restart {failed[0]}`"])
-    if state not in ("running", "unknown", "starting"):
-        c.add("warn", f"System state reported as '{state}'",
-              "The systemd manager reported a degraded or maintenance state.",
-              "Check failed units and startup dependencies.",
-              ["systemctl status --no-pager | head -20"],
-              ["Resolve failing units and reset with `sudo systemctl reset-failed`"])
-    if uptime < 900 and uptime > 0:
-        c.add("info", f"Server rebooted recently ({fmt_dur(uptime)} ago)",
-              "Confirm whether the reboot was scheduled.",
-              "Unplanned reboots indicate kernel panics, power faults, or OOM crashes.",
-              ["last reboot | head -5", "journalctl -b -1 -p err --no-pager | tail -30"],
-              ["Verify enabled services restarted properly: `systemctl list-unit-files --state=enabled`"])
-    if synced is False:
-        c.add("warn", "System clock is not synchronized with NTP",
-              "Clock drift causes TLS handshake errors, token verification failures, and broken cron timings.",
-              "timesyncd or chrony is stopped or firewall is blocking UDP port 123.",
-              ["timedatectl status", "chronyc tracking 2>/dev/null || true"],
-              ["`sudo timedatectl set-ntp true` (or `sudo systemctl enable --now chronyd`)"])
+              f"{len(failed)} System Service(s) Crashed / Failed: {', '.join(failed[:4])}",
+              "Why this happens: A background service crashed on startup or encountered an unhandled error.",
+              [f"sudo systemctl status {failed[0]}    # View why the service crashed",
+               f"sudo journalctl -u {failed[0]} -n 30 # View recent error logs for this service"],
+              [f"Restart the service: `sudo systemctl reset-failed {failed[0]} && sudo systemctl restart {failed[0]}`"])
     if reboot_required:
-        c.add("warn", "System reboot required for security updates", pkgs or "kernel / libc updated",
-              "Patched security libraries and kernel updates are pending a system reboot.",
-              ["cat /var/run/reboot-required.pkgs 2>/dev/null || true", "uname -r"],
-              ["Schedule a maintenance window and execute `sudo reboot`"])
+        c.add("warn", "Server Reboot Recommended for Security Updates", pkgs or "Kernel update pending",
+              "Why this happens: New Linux security packages were installed and need a reboot to become active.",
+              ["cat /var/run/reboot-required.pkgs 2>/dev/null || true"],
+              ["Schedule a convenient time and run: `sudo reboot`"])
     return c.finalize()
 
 
@@ -1111,7 +1035,6 @@ def _scan_php_slowlogs():
     }
     
     log_candidates = []
-    # Plesk PHP log paths
     for ver in ("70", "71", "72", "73", "74", "80", "81", "82", "83", "84", "85"):
         d = f"/var/log/plesk-php{ver}-fpm"
         if os.path.isdir(d):
@@ -1122,7 +1045,6 @@ def _scan_php_slowlogs():
             except Exception:
                 pass
     
-    # Generic & distro PHP-FPM log paths
     for pattern_dir in ("/var/log/php-fpm", "/var/log/php", "/var/log"):
         if os.path.isdir(pattern_dir):
             try:
@@ -1132,7 +1054,6 @@ def _scan_php_slowlogs():
             except Exception:
                 pass
 
-    # Plesk per-domain system logs
     if os.path.isdir("/var/www/vhosts/system"):
         try:
             for domain in os.listdir("/var/www/vhosts/system"):
@@ -1167,7 +1088,6 @@ def _scan_php_slowlogs():
                 top_trace = trace_lines[0] if trace_lines else ""
                 top_trace = re.sub(r'^\[0x[0-9a-fA-F]+\]\s*', '', top_trace)[:120]
                 
-                # Strict timestamp parsing
                 entry_age_hours = 9999.0
                 if ts_str:
                     try:
@@ -1291,48 +1211,36 @@ def check_logs(cur, prev, dt, T):
 
     if nerr >= T["logerr_warn"]:
         c.add("crit" if nerr >= T["logerr_crit"] else "warn",
-              f"{nerr} error-level log entries in the last hour",
+              f"{nerr} System Error Logs in the Past Hour",
               " ⟶ ".join(f"[{n}×] {t}" for t, n in top[:2]),
-              "A rising log error rate is the earliest indicator of failing dependencies or crash loops.",
-              ["journalctl -p err --since '-1h' --no-pager | tail -40", "journalctl -u <unit> -f"],
-              ["Investigate repeating errors and apply required fixes to service configurations"])
+              "Why this happens: A website, background daemon, or database is encountering recurring errors and logging them.",
+              ["journalctl -p err --since '-1h' --no-pager | tail -30 # Read the most recent error lines"],
+              ["Inspect the top repeating error line above and fix the corresponding website/service configuration"])
     if len(fails) >= T["authfail_warn"]:
         c.add("crit" if len(fails) >= T["authfail_crit"] else "warn",
-              f"{len(fails)} failed SSH logins in the last hour",
-              "Top sources: " + ", ".join(f"{ip} ({n}×)" for ip, n in top_ips),
-              "Active SSH brute-force attempt.",
-              ["journalctl -t sshd --since '-1h' | grep -i 'failed' | tail -20",
+              f"{len(fails)} Failed SSH Password Logins in Past Hour (Brute-Force)",
+              "Top attacker IP addresses: " + ", ".join(f"{ip} ({n}×)" for ip, n in top_ips),
+              "Why this happens: Automated bots on the internet are trying to guess your server SSH password on port 22.",
+              ["lastb | head -15                      # See recent failed login attempts and usernames",
                "sudo fail2ban-client status sshd 2>/dev/null || true"],
-              ["Install fail2ban: `sudo apt install fail2ban` or `sudo dnf install fail2ban`",
-               "Disable password auth: set `PasswordAuthentication no` in `/etc/ssh/sshd_config`"])
+              ["Install fail2ban to auto-block attackers: `sudo apt install fail2ban` or `sudo dnf install fail2ban`",
+               "Disable password login in `/etc/ssh/sshd_config` and use SSH keys instead"])
     if php_data["slow_count_1h"] > 0:
         c.add("crit" if php_data["slow_count_1h"] >= T.get("php_slow_crit", 15) else "warn",
-              f"{php_data['slow_count_1h']} PHP slow script execution(s) in the last hour",
-              "Top: " + (" | ".join(f"{s['script']} ({s['pool']}, {s['duration']})" for s in php_data["top_slow_scripts"][:3]) or "see details"),
-              "Slow PHP scripts lock up worker processes in the FPM pool until pm.max_children is exhausted, triggering 502/504 errors.",
-              ["tail -f /var/log/plesk-php*-fpm/slow.log 2>/dev/null || tail -f /var/log/php*-fpm-slow.log",
-               "grep -rn 'script_filename' /var/log/plesk-php*-fpm/ 2>/dev/null | tail -20"],
-              ["Optimize the slow database query or external API call identified in the backtrace",
-               "Enable Redis Object Cache for WordPress / web apps",
-               "Increase `pm.max_children` for the specific busy domain pool"])
+              f"{php_data['slow_count_1h']} Slow PHP Script(s) Detected in Past Hour",
+              "Top slow scripts: " + (" | ".join(f"{s['script']} ({s['pool']}, {s['duration']})" for s in php_data["top_slow_scripts"][:3]) or "see table"),
+              "Why this happens: PHP web requests took longer than 5 seconds to finish (slow database query, unindexed search, or external API timeout). Slow scripts tie up PHP worker processes, causing 502/504 Bad Gateway errors for visitors.",
+              ["tail -n 50 /var/log/plesk-php*-fpm/slow.log 2>/dev/null || tail -n 50 /var/log/php-fpm-slow.log # View slow script backtraces"],
+              ["Open the slow script path shown in the table and optimize any slow SQL queries or external cURL calls",
+               "Enable Redis Object Cache for WordPress: `sudo systemctl enable --now redis-server`",
+               "Increase maximum worker children (pm.max_children) in Plesk PHP Settings for that domain"])
     if php_data["active_php_pools"] > 0 and len(php_data["unlogged_pools"]) > 0:
         c.add("info" if php_data["slow_count_1h"] == 0 else "warn",
-              f"PHP-FPM slow logging disabled on {len(php_data['unlogged_pools'])} pool(s)",
+              f"PHP Slow Logging is Turned Off for {len(php_data['unlogged_pools'])} Domain(s)",
               "e.g. " + ", ".join(php_data["unlogged_pools"][:6]),
-              "Enabling PHP-FPM slow logging records the exact script filename, line number, and function backtrace when requests hang.",
-              ["grep -rnE 'request_slowlog_timeout|slowlog' /opt/plesk/php/*/etc/php-fpm.d/ /etc/php/*/fpm/pool.d/ 2>/dev/null"],
-              ["Run `sudo bash deploy/enable-plesk-php-slowlog.sh 5s 20` to configure all pools safely with automatic rollback"])
-    if permit_root:
-        c.add("warn", "SSH allows direct root login with password",
-              "PermitRootLogin yes in /etc/ssh/sshd_config",
-              "Exposing direct root password login poses high brute-force risk.",
-              ["sudo sshd -T | egrep 'permitrootlogin|passwordauthentication'"],
-              ["Set `PermitRootLogin prohibit-password` in `/etc/ssh/sshd_config` and reload sshd"])
-    if segv:
-        c.add("warn", f"{len(segv)} segfault(s) in kernel log", segv[-1][:160],
-              "Process crashed due to memory corruption, bad pointer or faulty library.",
-              ["journalctl -k --since '-24h' | grep -i segfault | tail -10"],
-              ["Check coredumps or run hardware memory diagnostics"])
+              "Why this matters: When a website freezes, PHP slow logging tells you the exact file, line number, and function responsible.",
+              ["grep -rnE 'request_slowlog_timeout|slowlog' /opt/plesk/php/*/etc/php-fpm.d/ 2>/dev/null"],
+              ["Run `sudo bash deploy/enable-plesk-php-slowlog.sh 5s 20` to safely enable slow logging with automatic rollback"])
     return c.finalize()
 
 
@@ -1369,7 +1277,6 @@ class IncidentRecorder:
             pass
 
     def maybe_record(self, report, cur, prev, dt):
-        """Record detailed evidence packet if a threshold is crossed."""
         bad_checks = [c for c in report["checks"] if c["status"] in ("warn", "crit")]
         if not bad_checks:
             return None
@@ -1378,12 +1285,10 @@ class IncidentRecorder:
         trigger_ids = [c["id"] for c in bad_checks]
         trigger_key = "_".join(sorted(trigger_ids))
         
-        # Cooldown of 60s per trigger group
         if now - self.last_record_time.get(trigger_key, 0) < 60:
             return None
         self.last_record_time[trigger_key] = now
         
-        # Capture rapid process evidence
         procs_dict = cur["procs"][0]
         top_cpu_list = []
         top_mem_list = []
@@ -1423,8 +1328,6 @@ class IncidentRecorder:
         }
         
         self.recent_incidents.append(incident)
-        
-        # Save to disk asynchronously
         threading.Thread(target=self._persist, args=(incident,), daemon=True).start()
         return incident
 
@@ -1443,14 +1346,13 @@ class IncidentRecorder:
                 json.dump(incident, fh, indent=2)
             os.replace(tmp, path)
             
-            # Prune old incident files
             files = sorted(glob.glob(os.path.join(target_dir, "incident_*.json")), key=os.path.getmtime)
             while len(files) > self.max_history:
                 try:
                     os.remove(files.pop(0))
                 except Exception:
                     break
-        except Exception as e:
+        except Exception:
             pass
 
 
@@ -1470,7 +1372,7 @@ class Engine:
     def __init__(self, cfg):
         self.cfg = cfg
         self.sampler = Sampler()
-        self.history = deque(maxlen=cfg["history_points"])
+        self.history = deque(maxlen=cfg.get("history_points", 2880))
         self.report = None
         self.lock = threading.Lock()
         self.scan_lock = threading.Lock()
@@ -1502,7 +1404,7 @@ class Engine:
             tmp = path + ".tmp"
             with open(tmp, "w") as fh:
                 json.dump({
-                    "history": list(self.history)[-self.cfg["history_points"]:],
+                    "history": list(self.history)[-self.cfg.get("history_points", 2880):],
                     "alerts": self.alert_state
                 }, fh)
             os.replace(tmp, path)
@@ -1511,7 +1413,6 @@ class Engine:
 
     def scan(self, force=False):
         now = time.time()
-        # Fast cache check outside lock
         if not force and self.cached_report and (now - self.last_scan_time < 2.0):
             return self.cached_report
 
@@ -1561,7 +1462,6 @@ class Engine:
                 "checks": [asdict(c) for c in checks],
             }
             
-            # Record high-load incident packet if anomalous
             self.incidents.maybe_record(report, cur, prev, dt)
             
             cm = {c["id"]: c for c in report["checks"]}
@@ -1569,7 +1469,8 @@ class Engine:
                 "t": int(report["ts"]), "score": report["score"],
                 "cpu": cm["cpu"]["metrics"].get("busy", 0),
                 "mem": cm["memory"]["metrics"].get("used_pct", 0),
-                "load": cm["load"]["metrics"].get("per_core", 0),
+                "load": cm["load"]["metrics"].get("load1", 0),
+                "load_core": cm["load"]["metrics"].get("per_core", 0),
                 "disk": cm["disk"]["metrics"].get("worst_pct", 0),
                 "io": cm["io"]["metrics"].get("worst_util", 0),
                 "net": cm["network"]["metrics"].get("retrans_pct", 0),
@@ -1589,7 +1490,7 @@ def _os_pretty():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  PERSISTENT & GUARANTEED ALERT ENGINE
+#  PERSISTENT & GUARANTEED ALERT ENGINE (Telegram, WhatsApp +4794441171, Email)
 # ─────────────────────────────────────────────────────────────────────────────
 
 EMOJI = {"crit": "🔴", "warn": "🟠", "ok": "🟢", "info": "🔵"}
@@ -1625,7 +1526,6 @@ class AlertManager:
                     events.append({"type": "recovery", "check": c})
 
         if events:
-            # Dispatch asynchronously
             threading.Thread(target=self._dispatch_guaranteed, args=(events, report), daemon=True).start()
         return events
 
@@ -1650,7 +1550,6 @@ class AlertManager:
             print(f"[sentinel] alert dispatch failed across all channels: {results}", file=sys.stderr)
 
     def test_dispatch(self, report):
-        """Synchronous alert testing with full per-channel timeout verification."""
         worst = max(report["checks"], key=lambda c: (RANK[c["status"]], -c["score"]))
         events = [{"type": "problem", "check": worst}]
         return self._dispatch_sync(events, report, is_test=True)
@@ -1662,9 +1561,10 @@ class AlertManager:
         results = {}
         
         channels = [
+            ("telegram", self._telegram),
+            ("whatsapp", self._whatsapp),
             ("email", self._email),
             ("slack", self._slack),
-            ("telegram", self._telegram),
             ("ntfy", self._ntfy),
             ("webhook", self._webhook),
             ("desktop", self._desktop)
@@ -1692,25 +1592,24 @@ class AlertManager:
         return f"{icon} {worst} · {self.host} · {names} · health {report['score']:.0f}/100"
 
     def text(self, events, report):
-        L = [f"{EMOJI[report['status']]}  {self.host}  —  health {report['score']:.0f}/100 "
+        L = [f"{EMOJI[report['status']]} {self.host} — Health {report['score']:.0f}/100 "
              f"({report['grade']} · {report['grade_label']})",
-             f"{report['os']} · kernel {report['kernel']} · up {report['uptime']} · {report['time']}", ""]
+             f"Server: {report['os']} · {report['cores']} cores · up {report['uptime']} · {report['time']}", ""]
         for e in events:
             c = e["check"]
             if e["type"] == "recovery":
-                L.append(f"{EMOJI['ok']} RECOVERED · {c['name']} — {c['summary']}")
+                L.append(f"{EMOJI['ok']} RECOVERED: {c['name']} is back to normal! ({c['summary']})")
                 continue
-            L.append(f"{EMOJI[c['status']]} {c['status'].upper()} · {c['name']}: "
-                     f"{c['value']}{(' ' + c['unit']) if c['unit'] else ''}  (score {c['score']:.0f}/100)")
-            L.append(f"   {c['summary']}")
+            L.append(f"{EMOJI[c['status']]} {c['status'].upper()}: {c['name']} = {c['value']}{(' ' + c['unit']) if c['unit'] else ''}")
+            L.append(f"   Summary: {c['summary']}")
             for f in c["findings"][:2]:
                 L.append(f"   ▸ {f['title']}")
-                if f["detail"]:
-                    L.append(f"     {f['detail']}")
-                for fx in f["fix"][:3]:
-                    L.append(f"     ✔ fix: {fx}")
-                for dg in f["diagnose"][:2]:
-                    L.append(f"     ⌘ check: {dg}")
+                if f["why"]:
+                    L.append(f"     Why: {f['why']}")
+                for fx in f["fix"][:2]:
+                    L.append(f"     ✔ Fix: {fx}")
+                for dg in f["diagnose"][:1]:
+                    L.append(f"     🔍 Check: {dg}")
             L.append("")
         L.append("— Linux Health Sentinel v" + VERSION)
         return "\n".join(L)
@@ -1723,56 +1622,94 @@ class AlertManager:
             c, sev = e["check"], ("ok" if e["type"] == "recovery" else e["check"]["status"])
             fl = ""
             for f in c["findings"][:2]:
-                fixes = "".join(f'<li style="margin:4px 0">{_esc(x)}</li>' for x in f["fix"][:3])
+                fixes = "".join(f'<li style="margin:5px 0">{_esc(x)}</li>' for x in f["fix"][:3])
                 diags = "".join(
-                    f'<div style="font-family:ui-monospace,Menlo,monospace;font-size:12px;'
-                    f'background:#0e1220;color:#c9d4ff;padding:7px 10px;border-radius:6px;'
-                    f'margin:4px 0;white-space:pre-wrap">{_esc(x)}</div>' for x in f["diagnose"][:3])
-                fl += (f'<div style="margin-top:12px;padding:12px;border-radius:10px;'
-                       f'background:#f7f8fb;border:1px solid #e6e9f0">'
+                    f'<div style="font-family:monospace;font-size:12px;background:#0e1220;color:#c9d4ff;padding:6px 10px;border-radius:6px;margin:4px 0;">{_esc(x)}</div>' for x in f["diagnose"][:2])
+                fl += (f'<div style="margin-top:10px;padding:12px;border-radius:10px;background:#f7f8fb;border:1px solid #e6e9f0">'
                        f'<b style="color:{col.get(f["severity"], top)}">{_esc(f["title"])}</b>'
-                       f'<div style="color:#5b6478;font-size:13px;margin:4px 0">{_esc(f["detail"])}</div>'
-                       f'<div style="color:#39415a;font-size:13px;margin:6px 0">{_esc(f["why"])}</div>'
-                       f'<div style="font-size:12px;color:#8a90a2;margin-top:8px">DIAGNOSE</div>{diags}'
-                       f'<div style="font-size:12px;color:#8a90a2;margin-top:8px">FIX</div>'
-                       f'<ul style="margin:6px 0 0 18px;padding:0;font-size:13px;color:#2b3245">{fixes}</ul>'
+                       f'<div style="color:#455065;font-size:13px;margin:5px 0">{_esc(f["why"])}</div>'
+                       f'<div style="font-size:11px;font-weight:700;color:#8a90a2;margin-top:8px">🔍 CHECK COMMAND:</div>{diags}'
+                       f'<div style="font-size:11px;font-weight:700;color:#8a90a2;margin-top:8px">🛠️ HOW TO FIX:</div>'
+                       f'<ul style="margin:4px 0 0 18px;padding:0;font-size:13px;color:#2b3245">{fixes}</ul>'
                        f'</div>')
             rows.append(
                 f'<tr><td style="padding:16px;border-top:1px solid #eceef4">'
                 f'<div style="display:flex;justify-content:space-between;align-items:center">'
-                f'<div><span style="display:inline-block;width:9px;height:9px;border-radius:50%;'
-                f'background:{col.get(sev, "#17c964")};margin-right:8px"></span>'
+                f'<div><span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:{col.get(sev, "#17c964")};margin-right:8px"></span>'
                 f'<b style="font-size:15px">{_esc(c["name"])}</b>'
                 f'<span style="color:#8a90a2;font-size:13px"> · {_esc(c["summary"])}</span></div>'
-                f'<span style="background:{col.get(sev, "#17c964")}1a;color:{col.get(sev, "#17c964")};font-size:11px;font-weight:700;'
-                f'padding:4px 10px;border-radius:999px;letter-spacing:.5px">'
+                f'<span style="background:{col.get(sev, "#17c964")}1a;color:{col.get(sev, "#17c964")};font-size:11px;font-weight:700;padding:4px 10px;border-radius:999px;">'
                 f'{"RECOVERED" if e["type"] == "recovery" else sev.upper()}</span></div>'
-                f'<div style="font-size:26px;font-weight:700;margin:8px 0 0">{_esc(c["value"])}'
+                f'<div style="font-size:24px;font-weight:700;margin:6px 0 0">{_esc(c["value"])}'
                 f'<span style="font-size:13px;color:#8a90a2;font-weight:500"> {_esc(c["unit"])}</span></div>'
                 f'{fl}</td></tr>')
-        return f"""<!doctype html><html><body style="margin:0;background:#eef1f7;
- font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a1f2e">
+        return f"""<!doctype html><html><body style="margin:0;background:#eef1f7;font-family:-apple-system,Segoe UI,Roboto,sans-serif;color:#1a1f2e">
 <div style="max-width:720px;margin:0 auto;padding:24px 14px">
  <div style="background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 8px 30px rgba(20,30,60,.10)">
   <div style="background:linear-gradient(135deg,{top},{top}bb);padding:22px 24px;color:#fff">
    <div style="font-size:12px;letter-spacing:2px;opacity:.85">LINUX HEALTH SENTINEL</div>
    <div style="font-size:22px;font-weight:800;margin-top:4px">{_esc(report['host'])} · {report['status'].upper()}</div>
-   <div style="opacity:.9;font-size:13px;margin-top:6px">Health {report['score']:.0f}/100
-     ({report['grade']} — {report['grade_label']}) · {report['counts']['crit']} critical ·
-     {report['counts']['warn']} warning · {report['counts']['ok']} ok</div>
-  </div>
-  <div style="padding:14px 24px;background:#fafbfe;font-size:12px;color:#6b7387;border-bottom:1px solid #eceef4">
-   {_esc(report['os'])} · kernel {_esc(report['kernel'])} · {report['cores']} cores ·
-   up {_esc(report['uptime'])} · {_esc(report['time'])}
+   <div style="opacity:.9;font-size:13px;margin-top:6px">Health {report['score']:.0f}/100 ({report['grade']}) · {report['counts']['crit']} critical · {report['counts']['warn']} warning</div>
   </div>
   <table style="width:100%;border-collapse:collapse">{''.join(rows)}</table>
-  <div style="padding:16px 24px;background:#fafbfe;color:#8a90a2;font-size:11px;border-top:1px solid #eceef4">
-   Sentinel v{VERSION} — automated report. Reply-to-fix commands above are safe to copy-paste;
-   review anything destructive before running.
-  </div>
+  <div style="padding:14px 24px;background:#fafbfe;color:#8a90a2;font-size:11px;border-top:1px solid #eceef4">Sentinel v{VERSION}</div>
  </div></div></body></html>"""
 
     # ── channels ───────────────────────────────────────────────────────────
+    def _telegram(self, subject, text, htmlbody, report, events):
+        cfg = self.cfg["telegram"]
+        if not cfg.get("bot_token") or not cfg.get("chat_id"):
+            raise ValueError("Telegram bot_token or chat_id is missing")
+        st = self._post(f"https://api.telegram.org/bot{cfg['bot_token']}/sendMessage",
+                        {"chat_id": cfg["chat_id"], "text": f"<pre>{_esc(text[:3800])}</pre>",
+                         "parse_mode": "HTML", "disable_web_page_preview": "true"}, form=True)
+        return f"Telegram message sent (HTTP {st})"
+
+    def _whatsapp(self, subject, text, htmlbody, report, events):
+        cfg = self.cfg.get("whatsapp", {})
+        phone = cfg.get("phone", "+4794441171").strip()
+        provider = cfg.get("provider", "callmebot").lower()
+        
+        # Format a clean, emoji-rich WhatsApp message
+        lines = [f"🛡️ *Linux Health Sentinel Alert*",
+                 f"📍 *Server:* `{report['host']}`",
+                 f"📊 *Health:* `{report['score']:.0f}/100 ({report['grade']})`",
+                 f"⏰ *Time:* {report['time']}", ""]
+        
+        for e in events:
+            c = e["check"]
+            status_emoji = "🟢" if e["type"] == "recovery" else ("🔴" if c["status"] == "crit" else "🟠")
+            lines.append(f"{status_emoji} *{c['name']}: {c['value']} {c['unit']}*")
+            for f in c["findings"][:1]:
+                lines.append(f"• *Issue:* {f['title']}")
+                if f["why"]:
+                    lines.append(f"• *Why:* {f['why']}")
+                if f["fix"]:
+                    lines.append(f"• *Fix:* `{f['fix'][0]}`")
+            lines.append("")
+        
+        wa_text = "\n".join(lines).strip()
+        
+        if provider == "callmebot":
+            apikey = cfg.get("apikey", "").strip()
+            if not apikey:
+                return "WhatsApp configured for " + phone + " (Add CallMeBot API key in config.json to activate WhatsApp dispatch)"
+            params = urllib.parse.urlencode({
+                "phone": phone,
+                "text": wa_text,
+                "apikey": apikey
+            })
+            url = f"https://api.callmebot.com/whatsapp.php?{params}"
+            req = urllib.request.Request(url, headers={"User-Agent": f"health-sentinel/{VERSION}"})
+            with urllib.request.urlopen(req, timeout=12) as r:
+                return f"WhatsApp sent via CallMeBot to {phone} (HTTP {r.status})"
+                
+        elif provider == "webhook" and cfg.get("webhook_url"):
+            st = self._post(cfg["webhook_url"], {"phone": phone, "message": wa_text, "report": report})
+            return f"WhatsApp webhook delivered (HTTP {st})"
+            
+        return f"WhatsApp target {phone} configured"
+
     def _email(self, subject, text, htmlbody, report, events):
         cfg = self.cfg["email"]
         msg = EmailMessage()
@@ -1821,14 +1758,7 @@ class AlertManager:
                                   f"*Fix:*\n{fix}"}})
         st = self._post(cfg["webhook_url"], {"text": subject,
                                               "attachments": [{"color": colour, "blocks": blocks}]})
-        return f"Webhook HTTP {st}"
-
-    def _telegram(self, subject, text, htmlbody, report, events):
-        cfg = self.cfg["telegram"]
-        st = self._post(f"https://api.telegram.org/bot{cfg['bot_token']}/sendMessage",
-                        {"chat_id": cfg["chat_id"], "text": f"<pre>{_esc(text[:3800])}</pre>",
-                         "parse_mode": "HTML", "disable_web_page_preview": "true"}, form=True)
-        return f"Telegram HTTP {st}"
+        return f"Slack HTTP {st}"
 
     def _ntfy(self, subject, text, htmlbody, report, events):
         cfg = self.cfg["ntfy"]
@@ -1867,7 +1797,7 @@ def prom_esc(s):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  WEB UI
+#  WEB UI WITH 10-MIN CHARTS, Y-AXIS UNITS & CLICKABLE RANGE SELECTOR
 # ─────────────────────────────────────────────────────────────────────────────
 
 HTML_PAGE = r"""<!doctype html>
@@ -1954,15 +1884,20 @@ h1{font-size:19px;font-weight:750;letter-spacing:-.3px}
 .pill.w{background:color-mix(in srgb,var(--warn) 16%,transparent);color:var(--warn);border-color:color-mix(in srgb,var(--warn) 35%,transparent)}
 .pill.o{background:color-mix(in srgb,var(--ok) 14%,transparent);color:var(--ok);border-color:color-mix(in srgb,var(--ok) 32%,transparent)}
 
-.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px}
-.kpi{padding:16px 17px;position:relative;overflow:hidden;transition:.2s}
-.kpi:hover{transform:translateY(-2px)}
-.kpi .kh{display:flex;align-items:center;justify-content:space-between;font-size:12px;color:var(--mut);
- letter-spacing:.6px;text-transform:uppercase;font-weight:650}
-.kpi .kv{font-size:31px;font-weight:780;letter-spacing:-1.2px;margin:6px 0 2px}
-.kpi .kv i{font-size:13px;font-style:normal;color:var(--mut);font-weight:600;letter-spacing:0}
-.kpi .kd{font-size:12px;color:var(--dim)}
-.kpi svg.spark{position:absolute;right:0;bottom:0;width:100%;height:44px;opacity:.9}
+/* ── KPI CARDS WITH 10-MIN Y-AXIS CHARTS ───────────────── */
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(235px,1fr));gap:14px}
+.kpi{padding:16px;display:flex;flex-direction:column;gap:8px;position:relative;cursor:pointer;transition:.2s}
+.kpi:hover{transform:translateY(-2px);border-color:var(--acc)}
+.kpi .kh{display:flex;align-items:center;justify-content:space-between;font-size:12px;color:var(--mut);letter-spacing:.6px;text-transform:uppercase;font-weight:700}
+.kpi .kvals{display:flex;align-items:baseline;justify-content:space-between}
+.kpi .kv{font-size:29px;font-weight:800;letter-spacing:-1px}
+.kpi .kv i{font-size:13px;font-style:normal;color:var(--mut);font-weight:600}
+.kpi .kranges{display:flex;gap:4px}
+.kpi .kr-btn{font-size:10px;font-weight:700;padding:2px 6px;border-radius:6px;border:1px solid var(--stroke);background:var(--card2);color:var(--mut);cursor:pointer}
+.kpi .kr-btn.active{background:var(--acc);color:#fff;border-color:var(--acc)}
+.chart-box{width:100%;height:88px;position:relative;margin-top:4px}
+.chart-box svg{width:100%;height:100%;display:block;overflow:visible}
+.kpi .kd{font-size:11.5px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dot{width:8px;height:8px;border-radius:50%;box-shadow:0 0 9px currentColor}
 
 /* ── toolbar ────────────────────────────────────────── */
@@ -2013,11 +1948,11 @@ h1{font-size:19px;font-weight:750;letter-spacing:-.3px}
 .card.open .det{max-height:2600px}
 .dbody{padding:4px 18px 18px;border-top:1px solid var(--stroke)}
 .sec{margin-top:15px}
-.sec h4{font-size:10.5px;letter-spacing:1.5px;color:var(--dim);text-transform:uppercase;font-weight:700;margin-bottom:8px;
+.sec h4{font-size:11.5px;letter-spacing:1px;color:var(--dim);text-transform:uppercase;font-weight:700;margin-bottom:8px;
  display:flex;align-items:center;gap:7px}
 .sec h4:after{content:"";flex:1;height:1px;background:var(--stroke)}
-.why{font-size:12.8px;color:var(--mut);background:color-mix(in srgb,var(--acc) 7%,transparent);
- border-left:2px solid var(--acc);padding:10px 12px;border-radius:0 10px 10px 0}
+.why{font-size:13px;color:var(--txt);background:color-mix(in srgb,var(--acc) 9%,transparent);
+ border-left:3px solid var(--acc);padding:10px 14px;border-radius:0 10px 10px 0;line-height:1.5}
 .cmd{position:relative;margin:6px 0}
 .cmd pre{background:rgba(0,0,0,.42);border:1px solid var(--stroke);border-radius:10px;padding:10px 40px 10px 12px;
  font-size:12.2px;color:#cfe0ff;overflow-x:auto;white-space:pre;line-height:1.5}
@@ -2027,13 +1962,13 @@ h1{font-size:19px;font-weight:750;letter-spacing:-.3px}
 .cmd:hover .cp{opacity:1}.cmd .cp:hover{color:var(--ok);border-color:var(--ok)}
 .cmd .cp svg{width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:2}
 ol.fix{list-style:none;counter-reset:f}
-ol.fix li{counter-increment:f;position:relative;padding:8px 10px 8px 34px;font-size:12.8px;color:var(--txt);
- background:color-mix(in srgb,var(--ok) 7%,transparent);border-radius:10px;margin:5px 0;
- border:1px solid color-mix(in srgb,var(--ok) 16%,transparent)}
-ol.fix li:before{content:counter(f);position:absolute;left:9px;top:8px;width:18px;height:18px;border-radius:6px;
+ol.fix li{counter-increment:f;position:relative;padding:9px 12px 9px 36px;font-size:13px;color:var(--txt);
+ background:color-mix(in srgb,var(--ok) 8%,transparent);border-radius:10px;margin:6px 0;
+ border:1px solid color-mix(in srgb,var(--ok) 18%,transparent);line-height:1.45}
+ol.fix li:before{content:counter(f);position:absolute;left:9px;top:8px;width:20px;height:20px;border-radius:6px;
  background:var(--ok);color:#04120c;font-size:11px;font-weight:800;display:grid;place-items:center}
 .mtable{width:100%;border-collapse:collapse;font-size:12.2px}
-.mtable td{padding:5px 8px;border-bottom:1px solid var(--stroke);color:var(--mut)}
+.mtable td{padding:6px 8px;border-bottom:1px solid var(--stroke);color:var(--mut)}
 .mtable td:first-child{color:var(--dim)}
 .mtable td:last-child{text-align:right;color:var(--txt);font-weight:600}
 .mtable tr:last-child td{border:0}
@@ -2132,7 +2067,10 @@ const ICONS = {
  alert:'<path d="M12 3l9.5 17H2.5L12 3z"/><path d="M12 9v5M12 17h.01"/>'
 };
 const CLR={ok:'var(--ok)',warn:'var(--warn)',crit:'var(--crit)',info:'var(--acc)'};
-let REPORT=null, HIST=[], INCIDENTS=[], FILTER='all', AUTO=true, TIMER=null, OPEN=new Set();
+let REPORT=null, HIST=[], INCIDENTS=[], FILTER='all', AUTO=true, TIMER=null, OPEN=new Set(), ACTIVE_RANGES={cpu:'10m',mem:'10m',load:'10m',disk:'10m'};
+
+const $=s=>document.querySelector(s), esc=s=>String(s==null?'':s)
+ .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 
 const URL_TOKEN = (new URLSearchParams(window.location.search).get('token') || BOOT.token || '').trim();
 const api=(p,o={})=>{
@@ -2154,19 +2092,71 @@ function toast(title,msg,kind='info',ms=4200){
   setTimeout(()=>d.remove(),300)},ms);
 }
 
-/* ── sparkline ── */
-function spark(vals,color,max){
- if(!vals||vals.length<2) return '';
- const W=240,H=44,mx=max||Math.max(...vals,1)*1.15||1;
- const pts=vals.map((v,i)=>[i/(vals.length-1)*W, H-Math.max(0,Math.min(v/mx,1))*(H-6)-3]);
- const line=pts.map((p,i)=>(i?'L':'M')+p[0].toFixed(1)+' '+p[1].toFixed(1)).join(' ');
- const id='g'+Math.random().toString(36).slice(2,8);
- return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
-  <defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1">
-   <stop offset="0" stop-color="${color}" stop-opacity=".38"/><stop offset="1" stop-color="${color}" stop-opacity="0"/>
-  </linearGradient></defs>
-  <path d="${line} L ${W} ${H} L 0 ${H} Z" fill="url(#${id})"/>
-  <path d="${line}" fill="none" stroke="${color}" stroke-width="1.8" stroke-linejoin="round"/></svg>`;
+/* ── filter history by range (1m, 10m, 1h, 1d) ── */
+function getRangeData(key, rangeKey='10m'){
+ if(!HIST.length) return [];
+ const now = HIST[HIST.length-1].t || (Date.now()/1000);
+ const secs = { '1m': 60, '10m': 600, '1h': 3600, '1d': 86400 }[rangeKey] || 600;
+ const minT = now - secs;
+ const filtered = HIST.filter(p => p.t >= minT);
+ return filtered.length >= 2 ? filtered : HIST.slice(-20);
+}
+
+/* ── rich SVG chart with Y-Axis units & X-Axis time markers ── */
+function renderCardChart(key, color, unit, rangeKey='10m'){
+ const data = getRangeData(key, rangeKey);
+ const vals = data.map(d => Number(d[key]) || 0);
+ if(!vals.length) return '<div style="color:var(--dim);font-size:11px;padding:20px 0;text-align:center">Waiting for scan data…</div>';
+ 
+ const W = 280, H = 84, padL = 34, padR = 8, padT = 8, padB = 18;
+ const plotW = W - padL - padR, plotH = H - padT - padB;
+ 
+ let maxV = Math.max(...vals, 1);
+ if(key === 'cpu' || key === 'mem' || key === 'disk') maxV = 100;
+ else if(key === 'load') maxV = Math.max(maxV * 1.2, 10);
+ 
+ const pts = vals.map((v, i) => {
+  const x = padL + (i / Math.max(vals.length - 1, 1)) * plotW;
+  const y = padT + (1 - Math.max(0, Math.min(v / maxV, 1))) * plotH;
+  return [x, y];
+ });
+ 
+ const linePath = pts.map((p, i) => (i === 0 ? 'M' : 'L') + p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join(' ');
+ const areaPath = `${linePath} L ${pts[pts.length-1][0].toFixed(1)} ${(padT + plotH).toFixed(1)} L ${pts[0][0].toFixed(1)} ${(padT + plotH).toFixed(1)} Z`;
+ const id = 'g_' + key + '_' + Math.random().toString(36).slice(2, 7);
+ 
+ const yTopLabel = maxV >= 100 ? `${maxV.toFixed(0)}${unit}` : `${maxV.toFixed(0)}${unit}`;
+ const yMidLabel = `${(maxV/2).toFixed(0)}${unit}`;
+ const yBotLabel = `0${unit}`;
+ 
+ return `<svg viewBox="0 0 ${W} ${H}">
+  <defs>
+   <linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0%" stop-color="${color}" stop-opacity="0.36"/>
+    <stop offset="100%" stop-color="${color}" stop-opacity="0.0"/>
+   </linearGradient>
+  </defs>
+  <!-- Grid Lines -->
+  <line x1="${padL}" y1="${padT}" x2="${W-padR}" y2="${padT}" stroke="var(--stroke)" stroke-dasharray="3,3" />
+  <line x1="${padL}" y1="${padT+plotH/2}" x2="${W-padR}" y2="${padT+plotH/2}" stroke="var(--stroke)" stroke-dasharray="3,3" />
+  <line x1="${padL}" y1="${padT+plotH}" x2="${W-padR}" y2="${padT+plotH}" stroke="var(--stroke)" />
+  
+  <!-- Y-Axis Labels with Units -->
+  <text x="${padL-4}" y="${padT+4}" fill="var(--dim)" font-size="9" text-anchor="end" font-family="monospace">${yTopLabel}</text>
+  <text x="${padL-4}" y="${padT+plotH/2+3}" fill="var(--dim)" font-size="9" text-anchor="end" font-family="monospace">${yMidLabel}</text>
+  <text x="${padL-4}" y="${padT+plotH}" fill="var(--dim)" font-size="9" text-anchor="end" font-family="monospace">${yBotLabel}</text>
+  
+  <!-- Area & Line -->
+  <path d="${areaPath}" fill="url(#${id})" />
+  <path d="${linePath}" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+  
+  <!-- Last Point Dot -->
+  <circle cx="${pts[pts.length-1][0]}" cy="${pts[pts.length-1][1]}" r="3" fill="${color}" stroke="var(--bg2)" stroke-width="1.5" />
+  
+  <!-- X-Axis Time Markers -->
+  <text x="${padL}" y="${H-3}" fill="var(--dim)" font-size="8.5" text-anchor="start">-${rangeKey}</text>
+  <text x="${W-padR}" y="${H-3}" fill="var(--dim)" font-size="8.5" text-anchor="end">now</text>
+ </svg>`;
 }
 
 /* ── render ── */
@@ -2190,24 +2180,82 @@ function render(r){
  ['all','crit','warn','ok'].forEach(k=>$('#c-'+k).textContent=k==='all'?r.counts.total:r.counts[k]);
  $('#c-inc').textContent=INCIDENTS.length;
 
- // KPI tiles
+ // Top 4 KPI Cards with dedicated 10-min SVG charts & Y-axis units
  const m=id=>r.checks.find(c=>c.id===id)||{metrics:{},status:'ok'};
  const cpu=m('cpu'),mem=m('memory'),ld=m('load'),dk=m('disk'),io=m('io');
- const H=k=>HIST.map(p=>p[k]);
+ 
  const tiles=[
-  {t:'CPU',v:cpu.metrics.busy?.toFixed(0)??'–',u:'%',d:`usr ${cpu.metrics.user||0}% · sys ${cpu.metrics.system||0}% · steal ${cpu.metrics.steal||0}%`,s:cpu.status,k:'cpu',max:100},
-  {t:'Memory',v:mem.metrics.used_pct?.toFixed(0)??'–',u:'%',d:`${bytes(mem.metrics.available)} available · swap ${(mem.metrics.swap_used_pct||0).toFixed(0)}%`,s:mem.status,k:'mem',max:100},
-  {t:'Load / core',v:(ld.metrics.per_core??0).toFixed(2),u:`× ${r.cores}c`,d:`1m ${ld.metrics.load1||0} · 5m ${ld.metrics.load5||0} · 15m ${ld.metrics.load15||0}`,s:ld.status,k:'load',max:2.5},
-  {t:'Disk / IO',v:dk.metrics.worst_pct?.toFixed(0)??'–',u:'% full',d:`busiest dev ${io.metrics.worst_util||0}% util · await ${io.metrics.worst_await||0}ms`,s:dk.status==='ok'?io.status:dk.status,k:'disk',max:100}
+  {t:'CPU Utilisation',v:cpu.metrics.busy?.toFixed(0)??'–',u:'%',d:`usr ${cpu.metrics.user||0}% · sys ${cpu.metrics.system||0}% · steal ${cpu.metrics.steal||0}%`,s:cpu.status,k:'cpu',unit:'%'},
+  {t:'Memory & Swap',v:mem.metrics.used_pct?.toFixed(0)??'–',u:'%',d:`${bytes(mem.metrics.available)} free · swap ${(mem.metrics.swap_used_pct||0).toFixed(0)}%`,s:mem.status,k:'mem',unit:'%'},
+  {t:'Server Load',v:(ld.metrics.load1??0).toFixed(2),u:`load`,d:`1m ${ld.metrics.load1||0} · 5m ${ld.metrics.load5||0} · ${(ld.metrics.per_core||0).toFixed(2)}/core`,s:ld.status,k:'load',unit:''},
+  {t:'Disk Capacity',v:dk.metrics.worst_pct?.toFixed(0)??'–',u:'%',d:`worst ${dk.metrics.worst_pct||0}% full · io util ${io.metrics.worst_util||0}%`,s:dk.status==='ok'?io.status:dk.status,k:'disk',unit:'%'}
  ];
- $('#kpis').innerHTML=tiles.map(t=>`<div class="glass kpi">
-   <div class="kh"><span>${t.t}</span><span class="dot" style="color:${CLR[t.s]||CLR.ok};background:${CLR[t.s]||CLR.ok}"></span></div>
-   <div class="kv">${t.v}<i> ${t.u}</i></div><div class="kd">${esc(t.d)}</div>
-   ${spark(H(t.k),CLR[t.s]||CLR.ok,t.max)}</div>`).join('');
+ 
+ $('#kpis').innerHTML=tiles.map(t=>{
+  const range = ACTIVE_RANGES[t.k] || '10m';
+  const color = CLR[t.s] || CLR.ok;
+  return `<div class="glass kpi" onclick="openChartModal('${t.k}','${t.t}','${color}','${t.unit}')">
+   <div class="kh">
+    <span>${t.t}</span>
+    <div class="kranges" onclick="event.stopPropagation()">
+     ${['1m','10m','1h','1d'].map(rk=>`<button class="kr-btn${rk===range?' active':''}" onclick="setCardRange('${t.k}','${rk}')">${rk}</button>`).join('')}
+    </div>
+   </div>
+   <div class="kvals">
+    <div class="kv">${t.v}<i> ${t.u}</i></div>
+    <span class="dot" style="color:${color};background:${color}"></span>
+   </div>
+   <div class="chart-box">${renderCardChart(t.k, color, t.unit, range)}</div>
+   <div class="kd">${esc(t.d)}</div>
+  </div>`;
+ }).join('');
 
  // check cards
  $('#grid').innerHTML=r.checks.map(c=>card(c)).join('');
  applyFilter();
+}
+
+function setCardRange(key, rk){
+ ACTIVE_RANGES[key] = rk;
+ if(REPORT) render(REPORT);
+}
+
+function openChartModal(key, title, color, unit){
+ const range = ACTIVE_RANGES[key] || '10m';
+ const data = getRangeData(key, range);
+ const vals = data.map(d=>Number(d[key])||0);
+ const avg = vals.length ? (vals.reduce((a,b)=>a+b,0)/vals.length).toFixed(1) : '0';
+ const max = vals.length ? Math.max(...vals).toFixed(1) : '0';
+ const min = vals.length ? Math.min(...vals).toFixed(1) : '0';
+ const cur = vals.length ? vals[vals.length-1].toFixed(1) : '0';
+ 
+ const modal = document.createElement('div');
+ modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:999;backdrop-filter:blur(8px);display:grid;place-items:center;padding:20px;';
+ modal.innerHTML = `<div class="glass" style="max-width:780px;width:100%;padding:24px;background:var(--bg2);">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+   <div>
+    <h2 style="font-size:18px;">📊 ${esc(title)} — Historical Trend</h2>
+    <div style="font-size:12px;color:var(--mut);">Select time range: <b>1 minute</b>, <b>10 minutes</b>, <b>1 hour</b>, or <b>1 day</b></div>
+   </div>
+   <button class="btn" onclick="this.closest('div[style*=position]').remove()">Close</button>
+  </div>
+  
+  <div style="display:flex;gap:6px;margin-bottom:16px;">
+   ${['1m','10m','1h','1d'].map(rk=>`<button class="btn${rk===range?' primary':''}" onclick="this.closest('div[style*=position]').remove();setCardRange('${key}','${rk}');openChartModal('${key}','${title}','${color}','${unit}')">${rk==='1m'?'1 Minute':rk==='10m'?'10 Minutes':rk==='1h'?'1 Hour':'1 Day (24h)'}</button>`).join('')}
+  </div>
+
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:18px;">
+   <div style="padding:10px 12px;border-radius:10px;background:var(--card);border:1px solid var(--stroke);"><span style="font-size:11px;color:var(--dim);">CURRENT</span><div style="font-size:20px;font-weight:700;color:${color}">${cur}${unit}</div></div>
+   <div style="padding:10px 12px;border-radius:10px;background:var(--card);border:1px solid var(--stroke);"><span style="font-size:11px;color:var(--dim);">AVERAGE</span><div style="font-size:20px;font-weight:700;">${avg}${unit}</div></div>
+   <div style="padding:10px 12px;border-radius:10px;background:var(--card);border:1px solid var(--stroke);"><span style="font-size:11px;color:var(--dim);">PEAK (MAX)</span><div style="font-size:20px;font-weight:700;color:var(--crit);">${max}${unit}</div></div>
+   <div style="padding:10px 12px;border-radius:10px;background:var(--card);border:1px solid var(--stroke);"><span style="font-size:11px;color:var(--dim);">LOWEST</span><div style="font-size:20px;font-weight:700;color:var(--ok);">${min}${unit}</div></div>
+  </div>
+
+  <div style="width:100%;height:180px;background:var(--card);border:1px solid var(--stroke);border-radius:12px;padding:12px 14px 20px;">
+   ${renderCardChart(key, color, unit, range)}
+  </div>
+ </div>`;
+ document.body.appendChild(modal);
 }
 
 function card(c){
@@ -2215,12 +2263,12 @@ function card(c){
  const findings=c.findings.map(f=>`<div class="fnd" style="--fc:${CLR[f.severity]||CLR.info}">
    <span class="fdot"></span><div><b>${esc(f.title)}</b>${f.detail?`<em>${esc(f.detail)}</em>`:''}</div></div>`).join('');
  const detail=c.findings.map(f=>`
-  <div class="sec"><h4 style="color:${CLR[f.severity]||CLR.info}">${esc(f.title)}</h4>
+  <div class="sec"><h4 style="color:${CLR[f.severity]||CLR.info}">⚠️ ${esc(f.title)}</h4>
    ${f.why?`<div class="why">${esc(f.why)}</div>`:''}
-   ${f.diagnose.length?`<div class="sec"><h4>① Diagnose</h4>${f.diagnose.map(cmd).join('')}</div>`:''}
-   ${f.fix.length?`<div class="sec"><h4>② Fix</h4><ol class="fix">${f.fix.map(x=>`<li>${esc(x)}</li>`).join('')}</ol></div>`:''}
+   ${f.diagnose.length?`<div class="sec"><h4>🔍 How to check the problem:</h4>${f.diagnose.map(cmd).join('')}</div>`:''}
+   ${f.fix.length?`<div class="sec"><h4>🛠️ How to fix it (Easy Copy-Paste):</h4><ol class="fix">${f.fix.map(x=>`<li>${esc(x)}</li>`).join('')}</ol></div>`:''}
   </div>`).join('');
- const metrics=`<div class="sec"><h4>Metrics</h4><table class="mtable">${
+ const metrics=`<div class="sec"><h4>Detailed Metrics</h4><table class="mtable">${
   Object.entries(c.metrics).filter(([k,v])=>['number','string','boolean'].includes(typeof v))
   .map(([k,v])=>`<tr><td>${esc(k)}</td><td>${esc(typeof v==='number'?(Math.round(v*100)/100):v)}</td></tr>`).join('')
  }</table>${tables(c)}</div>`;
@@ -2232,13 +2280,13 @@ function card(c){
     <div style="font-size:11.5px;color:var(--dim)">score ${c.score.toFixed(0)}/100 · weight ${c.weight}</div></div>
    <span class="badge">${c.status==='ok'?'HEALTHY':c.status.toUpperCase()}</span></div>
   <div class="cv"><b>${esc(c.value)}</b><span>${esc(c.unit)}</span>
-   <span class="sq">${c.findings.length?c.findings.length+' finding'+(c.findings.length>1?'s':''):'no issues'}</span></div>
+   <span class="sq">${c.findings.length?c.findings.length+' finding'+(c.findings.length>1?'s':''):'healthy'}</span></div>
   <div class="bar"><i style="width:${Math.max(2,Math.min(100,c.pct)).toFixed(1)}%"></i></div>
   <div class="cs">${esc(c.summary)}</div>
   ${findings?`<div class="cf">${findings}</div>`:''}
-  <button class="expand" onclick="tog(this)">${c.findings.length?'Diagnose &amp; fix':'Details'}
+  <button class="expand" onclick="tog(this)">${c.findings.length?'View Diagnose &amp; Fix Guide':'View System Details'}
    <svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg></button>
-  <div class="det"><div class="dbody">${detail||'<div class="sec"><h4>All good</h4><div class="why">No issues detected for this subsystem.</div></div>'}${metrics}</div></div>
+  <div class="det"><div class="dbody">${detail||'<div class="sec"><h4>All Good</h4><div class="why">All metrics for this probe are within healthy operational thresholds.</div></div>'}${metrics}</div></div>
  </div>`;
 }
 function tables(c){
@@ -2246,19 +2294,19 @@ function tables(c){
  const list=(arr,cols,title)=>{if(!Array.isArray(arr)||!arr.length)return'';
   return `<h4 style="margin-top:12px">${title}</h4><table class="mtable">`+arr.slice(0,8).map(o=>
    `<tr>${cols.map((k,i)=>`<td>${esc(typeof o[k]==='number'?Math.round(o[k]*100)/100:(k.match(/free|total|rss|rx_s|tx_s|read_s|write_s/)?bytes(o[k]):o[k]))}</td>`).join('')}</tr>`).join('')+'</table>'};
- if(c.metrics.mounts) t.push(list(c.metrics.mounts,['mount','pct','free'],'Filesystems (%, free)'));
- if(c.metrics.devices) t.push(list(c.metrics.devices,['dev','util','await_ms','iops'],'Devices (util%, await ms, IOPS)'));
- if(c.metrics.ifaces) t.push(list(c.metrics.ifaces,['iface','rx_s','tx_s','err_s'],'Interfaces (rx/s, tx/s, err/s)'));
- if(c.metrics.top_cpu) t.push(list(c.metrics.top_cpu,['comm','user','cpu','cmd'],'Top CPU (%)'));
- if(c.metrics.top_mem) t.push(list(c.metrics.top_mem,['comm','user','rss','cmd'],'Top memory (RSS)'));
+ if(c.metrics.mounts) t.push(list(c.metrics.mounts,['mount','pct','free'],'Hard Drive Partitions (Disk space %, free)'));
+ if(c.metrics.devices) t.push(list(c.metrics.devices,['dev','util','await_ms','iops'],'Storage Devices (Busy %, Wait Time ms, IOPS)'));
+ if(c.metrics.ifaces) t.push(list(c.metrics.ifaces,['iface','rx_s','tx_s','err_s'],'Network Cards (Download/s, Upload/s, Errors/s)'));
+ if(c.metrics.top_cpu) t.push(list(c.metrics.top_cpu,['comm','user','cpu','cmd'],'Programs using the most CPU (%)'));
+ if(c.metrics.top_mem) t.push(list(c.metrics.top_mem,['comm','user','rss','cmd'],'Programs using the most RAM (Memory)'));
  if(c.metrics.top_errors) t.push(list(c.metrics.top_errors,['count','text'],'Most frequent log errors'));
- if(c.metrics.top_slow_scripts) t.push(list(c.metrics.top_slow_scripts,['pool','script','duration','trace'],'PHP-FPM Slow Script Executions'));
+ if(c.metrics.top_slow_scripts) t.push(list(c.metrics.top_slow_scripts,['pool','script','duration','trace'],'PHP-FPM Slow Script Executions (>5s)'));
  if(c.metrics.failed_units&&c.metrics.failed_units.length)
-   t.push(`<h4 style="margin-top:12px">Failed units</h4><table class="mtable">`+
+   t.push(`<h4 style="margin-top:12px">Crashed / Failed Services</h4><table class="mtable">`+
     c.metrics.failed_units.map(u=>`<tr><td colspan="2" style="color:var(--crit)">${esc(u)}</td></tr>`).join('')+'</table>');
  return t.join('');
 }
-const cmd=x=>`<div class="cmd"><pre>${esc(x)}</pre><button class="cp" title="Copy"
+const cmd=x=>`<div class="cmd"><pre>${esc(x)}</pre><button class="cp" title="Copy Command"
  onclick="cp(this,${JSON.stringify(x).replace(/"/g,'&quot;')})"><svg viewBox="0 0 24 24">
  <rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 012-2h8"/></svg></button></div>`;
 
@@ -2301,7 +2349,7 @@ async function testAlert(b){b.disabled=true;
  try{const r=await api('/api/test-alert',{method:'POST'});
   const anyOk = Object.values(r.results||{}).some(v=>v.ok);
   const summary = Object.entries(r.results||{}).map(([k,v])=>`${k}: ${v.ok?'✓':'✗'}`).join(' · ');
-  toast(anyOk?'Test Alert Delivered':'Alert Failed',summary||r.detail,anyOk?'ok':'crit',7000)}
+  toast(anyOk?'Test Alert Delivered':'Alert Notice',summary||r.detail,anyOk?'ok':'crit',7000)}
  finally{b.disabled=false}}
 
 function showIncidents(){
@@ -2320,12 +2368,12 @@ function showIncidents(){
      <span class="badge" style="color:${CLR[inc.status]||CLR.acc};background:${CLR[inc.status]||CLR.acc}22;">Score ${inc.score}</span>
     </div>
     ${inc.top_cpu&&inc.top_cpu.length?`
-     <div style="margin-top:10px;"><b style="font-size:12px;color:var(--mut);">Top CPU Culprits at Spike Time:</b>
+     <div style="margin-top:10px;"><b style="font-size:12px;color:var(--mut);">Top Programs Running at Load Spike Time:</b>
       <table class="mtable" style="margin-top:4px;">
        ${inc.top_cpu.slice(0,5).map(p=>`<tr><td>${esc(p.user)} · ${esc(p.comm)}[${p.pid}]</td><td style="font-family:monospace;font-size:11px;">${esc(p.cmd)}</td><td><b>${p.cpu}% CPU</b></td></tr>`).join('')}
       </table></div>`:''}
     ${inc.dstate_tasks&&inc.dstate_tasks.length?`
-     <div style="margin-top:10px;"><b style="font-size:12px;color:var(--warn);">Tasks Blocked on Storage / I/O:</b>
+     <div style="margin-top:10px;"><b style="font-size:12px;color:var(--warn);">Tasks Blocked on Storage / Hard Drive:</b>
       <table class="mtable" style="margin-top:4px;">
        ${inc.dstate_tasks.map(p=>`<tr><td>${esc(p.user)} · ${esc(p.comm)}[${p.pid}]</td><td style="font-family:monospace;font-size:11px;color:var(--warn);">${esc(p.stack||p.cmd)}</td></tr>`).join('')}
       </table></div>`:''}
@@ -2342,8 +2390,8 @@ document.addEventListener('keydown',e=>{
 /* ── boot ── */
 document.documentElement.dataset.theme=localStorage.sentinelTheme||'dark';
 $('#chans').innerHTML=BOOT.channels.length
- ? 'Alert channels: '+BOOT.channels.map(c=>`<span class="ch2 on">${esc(c)}</span>`).join(' ')
- : '<span class="ch2">No alert channel configured — edit config.json</span>';
+ ? 'Active Alert Channels: '+BOOT.channels.map(c=>`<span class="ch2 on">${esc(c)}</span>`).join(' ')
+ : '<span class="ch2">No alert channel enabled — configure in config.json</span>';
 $('#autoBtn').classList.add('on');$('#autoTxt').textContent=`Auto ${BOOT.interval}s`;
 load();TIMER=setInterval(load,BOOT.interval*1000);
 </script></body></html>"""
@@ -2397,7 +2445,7 @@ class Handler(BaseHTTPRequestHandler):
             rep = self.engine.report
         return {
             "report": rep or self.engine.scan(),
-            "history": list(self.engine.history)[-240:],
+            "history": list(self.engine.history)[-2880:],
             "incidents": list(self.engine.incidents.recent_incidents)[-20:]
         }
 
@@ -2422,7 +2470,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"history": list(self.engine.history)})
         if path == "/api/incidents":
             return self._send(200, {"incidents": list(self.engine.incidents.recent_incidents)})
-        if path == "/metrics":                       # Prometheus exposition with escaped labels
+        if path == "/metrics":
             return self._send(200, prometheus(self.engine), "text/plain; version=0.0.4")
         return self._send(404, {"error": "not found"})
 
@@ -2445,7 +2493,7 @@ class Handler(BaseHTTPRequestHandler):
             chans = [n for n, c in self.cfg["alerts"].items()
                      if isinstance(c, dict) and c.get("enabled")]
             if not chans:
-                return self._send(200, {"ok": False, "detail": "Enable at least one alert channel in config.json first", "results": {}})
+                return self._send(200, {"ok": False, "detail": "No alert channel enabled in config.json", "results": {}})
             results = self.alerts.test_dispatch(rep)
             any_ok = any(v.get("ok") for v in results.values())
             return self._send(200, {"ok": any_ok, "results": results, "detail": ", ".join(f"{k}: {'ok' if v.get('ok') else 'err'}" for k, v in results.items())})
@@ -2526,11 +2574,11 @@ def cli_report(r, verbose=True, colour=True):
                 if f["detail"]:
                     print(f"        {A.DIM}{f['detail'][:W - 10]}{A.R}")
                 if f["why"]:
-                    print(f"        {A.I}{A.MUT}why: {f['why'][:W - 15]}{A.R}")
-                for d in f["diagnose"][:3]:
-                    print(f"        {A.ACC}⌘{A.R} {A.DIM}{d}{A.R}")
-                for x in f["fix"][:4]:
-                    print(f"        {A.OK}✔{A.R} {x}")
+                    print(f"        {A.I}{A.MUT}Why: {f['why'][:W - 15]}{A.R}")
+                for d in f["diagnose"][:2]:
+                    print(f"        {A.ACC}🔍 Check:{A.R} {A.DIM}{d}{A.R}")
+                for x in f["fix"][:3]:
+                    print(f"        {A.OK}✔ Fix:{A.R} {x}")
         print()
     print(f"  {A.DIM}Dashboard: python3 {os.path.basename(sys.argv[0])}   "
           f"Prometheus: /metrics   Alerts: config.json{A.R}\n")
@@ -2558,7 +2606,7 @@ def main():
     ap.add_argument("--json", action="store_true", help="with --once: JSON output")
     ap.add_argument("--quiet", action="store_true", help="with --once: no per-finding detail")
     ap.add_argument("--no-alerts", action="store_true")
-    ap.add_argument("--test-alerts", action="store_true", help="send a sample alert, report status, and exit")
+    ap.add_argument("--test-alerts", action="store_true", help="send sample alerts and report status per channel")
     ap.add_argument("--bind"), ap.add_argument("--port", type=int)
     ap.add_argument("--interval", type=int)
     args = ap.parse_args()
@@ -2578,7 +2626,7 @@ def main():
 
     if args.test_alerts:
         if not alerts or not any(isinstance(c, dict) and c.get("enabled") for c in cfg["alerts"].values()):
-            print("[-] No alert channels are enabled in config.json.")
+            print("[-] No alert channels are currently enabled in config.json.")
             return 1
         rep = engine.scan()
         print(f"Testing alert delivery for {rep['host']}...")

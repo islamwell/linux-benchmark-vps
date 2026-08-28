@@ -1,7 +1,7 @@
 {
   "hostname": null,
   "scan_interval": 30,
-  "history_points": 720,
+  "history_points": 2880,
   "state_file": "/var/lib/health-sentinel/state.json",
   "incidents_dir": "/var/lib/health-sentinel/incidents",
   "incident_history": 50,
@@ -20,6 +20,8 @@
     "steal_crit": 12,
     "load_warn": 1.0,
     "load_crit": 2.0,
+    "load_absolute_warn": 8.0,
+    "load_absolute_crit": 12.0,
     "mem_warn": 85,
     "mem_crit": 94,
     "swap_warn": 35,
@@ -61,6 +63,18 @@
     "cooldown_minutes": 60,
     "notify_recovery": true,
 
+    "telegram": {
+      "enabled": false,
+      "bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+      "chat_id": "-1001234567890"
+    },
+    "whatsapp": {
+      "enabled": false,
+      "provider": "callmebot",
+      "phone": "+4794441171",
+      "apikey": "",
+      "webhook_url": ""
+    },
     "email": {
       "enabled": false,
       "host": "smtp.gmail.com",
@@ -70,16 +84,11 @@
       "user": "alerts@example.com",
       "password": "app-specific-password",
       "from": "Health Sentinel <alerts@example.com>",
-      "to": ["ops@example.com", "oncall@example.com"]
+      "to": ["ops@example.com"]
     },
     "slack": {
       "enabled": false,
       "webhook_url": "https://hooks.slack.com/services/XXX/YYY/ZZZ"
-    },
-    "telegram": {
-      "enabled": false,
-      "bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
-      "chat_id": "-1001234567890"
     },
     "ntfy": {
       "enabled": false,
