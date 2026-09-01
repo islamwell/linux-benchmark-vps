@@ -36,8 +36,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.5.2"
-UPDATED = "2026-08-28 08:40"
+VERSION = "1.5.3"
+UPDATED = "2026-09-02 00:55"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -1159,6 +1159,103 @@ def _scan_php_slowlogs():
     return results
 
 
+PHP_SERVICE_REGEX = re.compile(r"^(plesk-php\d{2}-fpm|php\d\.\d-fpm|php-fpm|ea-php\d{2}-php-fpm)(\.service)?$")
+
+
+def detect_php_services():
+    """Detects installed and active PHP-FPM services across Plesk, Debian/Ubuntu, and RHEL."""
+    services, seen = [], set()
+
+    candidates = []
+    # Plesk versions (7.0 -> 8.5)
+    for ver in ("70", "71", "72", "73", "74", "80", "81", "82", "83", "84", "85"):
+        candidates.append(f"plesk-php{ver}-fpm")
+    # Standard Debian/Ubuntu (7.4 -> 8.5)
+    for ver in ("7.4", "8.0", "8.1", "8.2", "8.3", "8.4", "8.5"):
+        candidates.append(f"php{ver}-fpm")
+    # Generic & cPanel
+    candidates.append("php-fpm")
+    for ver in ("74", "80", "81", "82", "83"):
+        candidates.append(f"ea-php{ver}-php-fpm")
+
+    for sname in candidates:
+        if sname in seen:
+            continue
+        
+        is_installed = False
+        if sname.startswith("plesk-php"):
+            ver_num = sname.replace("plesk-php", "").replace("-fpm", "")
+            if len(ver_num) == 2:
+                if os.path.isdir(f"/opt/plesk/php/{ver_num[0]}.{ver_num[1]}") or os.path.isfile(f"/lib/systemd/system/{sname}.service") or os.path.isfile(f"/etc/systemd/system/{sname}.service"):
+                    is_installed = True
+        elif sname.startswith("php") and "-fpm" in sname:
+            ver_num = sname.replace("php", "").replace("-fpm", "")
+            if os.path.isdir(f"/etc/php/{ver_num}/fpm") or os.path.isfile(f"/lib/systemd/system/{sname}.service") or os.path.isfile(f"/etc/systemd/system/{sname}.service"):
+                is_installed = True
+        
+        if not is_installed:
+            rc, _ = sh(["systemctl", "status", sname], timeout=2)
+            if rc != 4 and rc != 127:
+                is_installed = True
+
+        if is_installed:
+            seen.add(sname)
+            rc, out = sh(["systemctl", "is-active", sname], timeout=2)
+            state = (out or "").strip() or ("active" if rc == 0 else "inactive")
+            
+            if sname.startswith("plesk-php"):
+                ver_digits = sname.replace("plesk-php", "").replace("-fpm", "")
+                display = f"Plesk PHP {ver_digits[0]}.{ver_digits[1]}" if len(ver_digits) == 2 else sname
+            elif sname.startswith("php") and "-fpm" in sname:
+                v = sname.replace("php", "").replace("-fpm", "")
+                display = f"PHP {v} FPM"
+            elif sname.startswith("ea-php"):
+                v = sname.replace("ea-php", "").replace("-php-fpm", "")
+                display = f"cPanel PHP {v[0]}.{v[1]}" if len(v) == 2 else sname
+            else:
+                display = "PHP-FPM (Default)"
+                
+            services.append({
+                "service": sname,
+                "display": display,
+                "status": state,
+                "is_active": state == "active",
+                "is_failed": state == "failed"
+            })
+
+    services.sort(key=lambda s: (0 if s["is_active"] else 1, s["display"]))
+    return services
+
+
+def control_php_service(service, action):
+    """Safely start, stop, restart, or reload a PHP-FPM service via systemd."""
+    if not service or not PHP_SERVICE_REGEX.match(service):
+        return {"ok": False, "error": f"Invalid or disallowed PHP service name: {service}"}
+    if action not in ("start", "stop", "restart", "reload"):
+        return {"ok": False, "error": f"Invalid action: {action}. Allowed: start, stop, restart, reload"}
+
+    rc, out = sh(["systemctl", action, service], timeout=15)
+    rc_stat, out_stat = sh(["systemctl", "is-active", service], timeout=3)
+    new_state = (out_stat or "").strip() or ("active" if rc_stat == 0 else "inactive")
+    
+    if rc == 0:
+        return {
+            "ok": True,
+            "service": service,
+            "action": action,
+            "status": new_state,
+            "detail": f"Successfully {action}ed {service} (status: {new_state})"
+        }
+    else:
+        return {
+            "ok": False,
+            "service": service,
+            "action": action,
+            "status": new_state,
+            "error": f"Failed to {action} {service}: {out.strip()}"
+        }
+
+
 def check_logs(cur, prev, dt, T):
     c = Check("logs", "Logs & Security Signals", "shield", 1.0)
     rc, errs = sh(["journalctl", "--since", "-1h", "-p", "err", "--no-pager", "-q"], timeout=8, ttl=120)
@@ -2000,6 +2097,7 @@ kbd{font-size:10.5px;padding:1px 5px;border-radius:5px;border:1px solid var(--st
   <input class="search" id="q" placeholder="Filter checks…  ( / )">
   <button class="btn" id="autoBtn" onclick="toggleAuto()"><svg viewBox="0 0 24 24"><path d="M12 6v6l4 2"/><circle cx="12" cy="12" r="9"/></svg><span id="autoTxt">Auto</span></button>
   <button class="btn" onclick="toggleTheme()"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg></button>
+  <button class="btn" onclick="openPhpModal()"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9 9h6M9 12h5M9 15h3"/></svg>🐘 PHP Control</button>
   <button class="btn" onclick="testAlert(this)"><svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 10-12 0c0 7-3 8-3 8h18s-3-1-3-8"/><path d="M13.7 21a2 2 0 01-3.4 0"/></svg>Test alert</button>
   <button class="btn" onclick="dl()"><svg viewBox="0 0 24 24"><path d="M12 3v12M7 11l5 5 5-5M4 20h16"/></svg>JSON</button>
   <button class="btn primary" id="scanBtn" onclick="scan()"><svg viewBox="0 0 24 24" id="scanIco"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 4v5h-5"/></svg>Scan now</button>
@@ -2382,6 +2480,97 @@ function showIncidents(){
  document.body.appendChild(modal);
 }
 
+async function openPhpModal(){
+ const modal = document.createElement('div');
+ modal.id = 'php-modal';
+ modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:999;backdrop-filter:blur(8px);display:grid;place-items:center;padding:20px;';
+ modal.innerHTML = `<div class="glass" style="max-width:760px;width:100%;max-height:85vh;overflow-y:auto;padding:24px;background:var(--bg2);">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+   <div>
+    <h2 style="font-size:18px;display:flex;align-items:center;gap:8px;">🐘 PHP Service Manager</h2>
+    <div style="font-size:12.5px;color:var(--mut);">Start, stop, or restart PHP-FPM pools to clear stuck workers or recover from timeouts.</div>
+   </div>
+   <button class="btn" onclick="this.closest('#php-modal').remove()">Close</button>
+  </div>
+  <div id="php-list" style="padding:20px 0;text-align:center;color:var(--dim);">Detecting PHP services…</div>
+ </div>`;
+ document.body.appendChild(modal);
+ await loadPhpServices();
+}
+
+async function loadPhpServices(){
+ const list = $('#php-list');
+ if(!list) return;
+ try{
+  const r = await api('/api/php-services');
+  const svcs = r.services || [];
+  if(!svcs.length){
+   list.innerHTML = `<div style="padding:24px;background:var(--card);border-radius:12px;border:1px solid var(--stroke);">
+    <b style="font-size:14px;">No standard PHP-FPM services detected</b>
+    <div style="font-size:12.5px;color:var(--mut);margin-top:6px;">If PHP is running under a non-standard service name, check systemctl list-units.</div>
+   </div>`;
+   return;
+  }
+  
+  const activeCount = svcs.filter(s=>s.is_active).length;
+  
+  list.innerHTML = `
+   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+    <span style="font-size:13px;color:var(--mut);">${svcs.length} PHP version(s) found · <b>${activeCount} active</b></span>
+    ${activeCount > 0 ? `<button class="btn" onclick="doPhpAction('all','restart')" style="font-size:12px;height:32px;">🔄 Restart All Active PHP</button>` : ''}
+   </div>
+   <div style="display:flex;flex-direction:column;gap:10px;">
+    ${svcs.map(s=>{
+     const statusColor = s.is_active ? 'var(--ok)' : (s.is_failed ? 'var(--crit)' : 'var(--dim)');
+     const statusLabel = s.is_active ? 'Running' : (s.is_failed ? 'Failed' : 'Stopped');
+     return `
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-radius:12px;background:var(--card);border:1px solid var(--stroke);gap:12px;flex-wrap:wrap;">
+       <div style="display:flex;align-items:center;gap:10px;">
+        <span class="dot" style="color:${statusColor};background:${statusColor}"></span>
+        <div>
+         <b style="font-size:14px;">${esc(s.display)}</b>
+         <span style="font-family:monospace;font-size:11.5px;color:var(--dim);margin-left:6px;">(${esc(s.service)})</span>
+         <div style="font-size:11.5px;color:${statusColor};font-weight:600;margin-top:2px;">● ${statusLabel}</div>
+        </div>
+       </div>
+       <div style="display:flex;gap:6px;">
+        ${!s.is_active ? `<button class="btn" onclick="doPhpAction('${s.service}','start')" style="color:var(--ok);border-color:color-mix(in srgb,var(--ok) 35%,transparent);height:32px;font-size:12px;">▶ Start</button>` : ''}
+        ${s.is_active ? `<button class="btn" onclick="doPhpAction('${s.service}','restart')" style="height:32px;font-size:12px;">🔄 Restart</button>` : ''}
+        ${s.is_active ? `<button class="btn" onclick="doPhpAction('${s.service}','reload')" style="height:32px;font-size:12px;">⚡ Reload</button>` : ''}
+        ${s.is_active ? `<button class="btn" onclick="confirmStopPhp('${s.service}')" style="color:var(--crit);border-color:color-mix(in srgb,var(--crit) 35%,transparent);height:32px;font-size:12px;">⏹ Stop</button>` : ''}
+       </div>
+      </div>`;
+    }).join('')}
+   </div>`;
+ }catch(e){
+  list.innerHTML = `<div style="color:var(--crit);padding:20px;">Error loading PHP services: ${esc(e.message)}</div>`;
+ }
+}
+
+async function doPhpAction(service, action){
+ try{
+  toast('Executing PHP Action', `${action.toUpperCase()} on ${service}…`, 'info', 2000);
+  const res = await api('/api/php-action', {
+   method: 'POST',
+   body: JSON.stringify({ service, action })
+  });
+  if(res.ok){
+   toast('PHP Action Successful', res.detail || `${action} completed`, 'ok', 4000);
+   await loadPhpServices();
+  } else {
+   toast('PHP Action Failed', res.error || res.detail || 'Action failed', 'crit', 6000);
+  }
+ }catch(e){
+  toast('Action Error', e.message, 'crit', 6000);
+ }
+}
+
+function confirmStopPhp(service){
+ if(confirm(`Are you sure you want to STOP ${service}?\n\nWebsites using this PHP version will return 502 Bad Gateway until you start it again.`)){
+  doPhpAction(service, 'stop');
+ }
+}
+
 document.addEventListener('keydown',e=>{
  if(e.target.tagName==='INPUT')return;
  if(e.key==='r')scan(); if(e.key==='e')allOpen(!document.querySelector('.card.open'));
@@ -2470,6 +2659,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"history": list(self.engine.history)})
         if path == "/api/incidents":
             return self._send(200, {"incidents": list(self.engine.incidents.recent_incidents)})
+        if path == "/api/php-services":
+            return self._send(200, {"services": detect_php_services()})
         if path == "/metrics":
             return self._send(200, prometheus(self.engine), "text/plain; version=0.0.4")
         return self._send(404, {"error": "not found"})
@@ -2478,9 +2669,10 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authed():
             return self._send(401, {"error": "unauthorized"})
         path = urllib.parse.urlparse(self.path).path
+        data_bytes = b""
         try:
             n = int(self.headers.get("Content-Length") or 0)
-            self.rfile.read(n)
+            data_bytes = self.rfile.read(n)
         except Exception:
             pass
         if path == "/api/scan":
@@ -2488,6 +2680,27 @@ class Handler(BaseHTTPRequestHandler):
             if self.alerts:
                 self.alerts.process(rep)
             return self._send(200, self._payload())
+        if path == "/api/php-action":
+            try:
+                body = json.loads(data_bytes.decode() or "{}")
+            except Exception as e:
+                return self._send(400, {"ok": False, "error": f"Invalid JSON body: {e}"})
+            
+            service = (body.get("service") or "").strip()
+            action = (body.get("action") or "").strip()
+            
+            if service == "all" and action in ("restart", "reload"):
+                results = []
+                for s in detect_php_services():
+                    if s["is_active"]:
+                        results.append(control_php_service(s["service"], action))
+                any_ok = any(r.get("ok") for r in results)
+                return self._send(200, {"ok": any_ok, "action": action, "batch": True, "results": results,
+                                         "detail": f"Ran {action} on {len(results)} active PHP service(s)"})
+
+            res = control_php_service(service, action)
+            code = 200 if res.get("ok") else 500
+            return self._send(code, res)
         if path == "/api/test-alert":
             rep = self.engine.report or self.engine.scan()
             chans = [n for n, c in self.cfg["alerts"].items()

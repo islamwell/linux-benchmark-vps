@@ -219,8 +219,10 @@ Sentinel supports direct WhatsApp alerting via **CallMeBot** (free & instant):
 ## 🔌 API & Prometheus Endpoints
 
 When `web.enabled` is `true`:
-- `GET /` — Responsive web dashboard with 10-min KPI cards, Y-axis units, and interactive range selectors (1m, 10m, 1h, 1d)
+- `GET /` — Responsive web dashboard with 10-min KPI cards, Y-axis units, interactive range selectors (1m, 10m, 1h, 1d), and **🐘 PHP Controls**
 - `GET /api/health` — Full JSON diagnostic report with simple language findings and metrics
+- `GET /api/php-services` — List all installed PHP versions and their live systemd status
+- `POST /api/php-action` — Start, stop, restart, or reload PHP services (`{"service": "plesk-php82-fpm", "action": "restart"}`)
 - `GET /api/history` — Rolling history data points for graphs and trend analysis
 - `GET /api/incidents` — Preserved incident packets and top CPU/Memory culprits
 - `POST /api/scan` — Force an immediate re-scan and evaluation (thread-safe)
@@ -247,5 +249,6 @@ When `web.enabled` is `true`:
 ---
 
 ## 📜 Versioning
-Current Version: **v1.5.2 (updated 2026-08-28 08:40)**
+Current Version: **v1.5.3 (updated 2026-09-02 00:55)**
+
 
