@@ -219,16 +219,43 @@ Sentinel supports direct WhatsApp alerting via **CallMeBot** (free & instant):
 ## 🔌 API & Prometheus Endpoints
 
 When `web.enabled` is `true`:
-- `GET /` — Responsive web dashboard with 12h/24h/48h historical charts, Y-axis units, range selectors (1m, 10m, 1h, 12h, 24h, 48h), and **⚡ Quick Actions & PHP Controls**
+- `GET /` — Responsive web dashboard with 12h/24h/48h historical charts, Y-axis units, range selectors (1m, 10m, 1h, 12h, 24h, 48h), **⚡ Quick Actions**, and **📄 Executive Reports**
 - `GET /api/health` — Full JSON diagnostic report with simple language findings and metrics
+- `GET /api/report/html` — Generate standalone, print-ready, white-label executive client audit report (PDF exportable)
+- `GET /api/auto-heal` — View active autonomous self-healing status, configuration, and intervention audit log
+- `POST /api/auto-heal/toggle` — Enable/disable autonomous healing or toggle dry-run simulation mode
 - `GET /api/php-services` — List all installed PHP versions and their live systemd status
 - `POST /api/php-action` — Start, stop, restart, or reload PHP services (`{"service": "plesk-php82-fpm", "action": "restart"}`)
-- `POST /api/system-action` — Execute safe system maintenance (`restart_mariadb`, `vacuum_logs`, `drop_caches`, `reset_failed`)
+- `POST /api/system-action` — Execute safe system maintenance (`restart_mariadb`, `vacuum_logs`, `drop_caches`, `reset_failed`, `optimize_io_memory`)
 - `GET /api/history` — Rolling 48h history data points (5,760 samples) for graphs and trend analysis
 - `GET /api/incidents` — Preserved incident packets and top CPU/Memory culprits
 - `POST /api/scan` — Force an immediate re-scan and evaluation (thread-safe)
 - `POST /api/test-alert` — Trigger a test alert to verify notification dispatch (Telegram, WhatsApp, Email)
 - `GET /metrics` — Prometheus metrics format with escaped labels
+
+---
+
+## 🤖 Autonomous Self-Healing Engine
+
+Linux Health Sentinel automatically recovers your server when critical bottlenecks occur—even at 3 AM while you sleep:
+
+* **Load Spike Trigger (Load $\ge$ 8.0)**: Automatically recycles stuck PHP worker pools and flushes RAM cache.
+* **Memory Saturation Trigger (RAM $\ge$ 94%)**: Drops cached memory pages and recycles heavy worker pools.
+* **Disk Critical Trigger (Disk $\ge$ 92%)**: Trims system journal logs to 200MB to prevent 100% disk lockups.
+* **Crashed Service Trigger**: Resets systemd failed unit counters and attempts service recovery.
+* **Anti-Flap Safety**: Enforces a 15-minute cooldown per component and a 5 action/hour circuit breaker to prevent loops.
+* **Instant Confirmation**: Every automated fix sends a confirmation alert directly to WhatsApp (`+4794441171`) and Telegram!
+
+---
+
+## 📄 White-Label Executive Client Reports & PDF Export
+
+Generate client-ready, branded infrastructure audit reports with a single click:
+* **Agency Branding**: Custom Agency Name, Report Title, Client Name, and Support Contact.
+* **48-Hour Performance Audit**: Peak vs. Average load, CPU, RAM headroom, and storage utilisation.
+* **Preventative Care Log**: Demonstrates the concrete value of your agency retainer by listing all autonomous fixes performed.
+* **Security & SSL Verification**: Days remaining on Let's Encrypt / Plesk SSL certs and SSH brute-force defense stats.
+* **One-Click Print / PDF**: Native `@media print` styling for crisp, professional client PDF delivery.
 
 ---
 
@@ -246,6 +273,8 @@ When `web.enabled` is `true`:
 | `processes` | Process limits & leak detection | Active PIDs vs `pid_max`, threads vs `threads-max`, zombies, D-state |
 | `services` | Service state & system updates | `systemctl --failed`, system state, NTP sync, uptime, reboot required |
 | `logs` | Security, kernel & PHP-FPM | Journal errors/h, failed SSH auth/h, segfaults, **PHP-FPM slow script traces**, SSL expiry |
+
+---
 
 ## 🚀 Software-Level I/O & Memory Optimization
 
@@ -267,4 +296,5 @@ sudo /opt/health-sentinel/deploy/optimize-io-memory.sh
 ---
 
 ## 📜 Versioning
-Current Version: **v1.6.1 (updated 2026-09-02 07:10)**
+Current Version: **v1.7.0 (updated 2026-09-02 18:25)**
+

@@ -104,5 +104,43 @@
     "desktop": {
       "enabled": false
     }
+  },
+
+  "auto_heal": {
+    "enabled": true,
+    "dry_run": false,
+    "cooldown_minutes": 15,
+    "max_actions_per_hour": 5,
+    "notify": true,
+    "rules": {
+      "load_spike": {
+        "enabled": true,
+        "trigger_load": 8.0,
+        "consecutive": 2,
+        "actions": ["restart_php_active", "drop_caches"]
+      },
+      "memory_exhaustion": {
+        "enabled": true,
+        "trigger_used_pct": 94.0,
+        "consecutive": 2,
+        "actions": ["drop_caches", "restart_php_active"]
+      },
+      "disk_critical": {
+        "enabled": true,
+        "trigger_worst_pct": 92.0,
+        "actions": ["vacuum_logs"]
+      },
+      "crashed_services": {
+        "enabled": true,
+        "actions": ["reset_failed"]
+      }
+    }
+  },
+
+  "branding": {
+    "agency_name": "OpsCare Managed Cloud",
+    "report_title": "Executive Server Health & Performance Audit",
+    "support_email": "support@example.com",
+    "client_name": "Production VPS"
   }
 }
