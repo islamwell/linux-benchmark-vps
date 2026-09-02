@@ -1,7 +1,7 @@
 {
   "hostname": null,
   "scan_interval": 30,
-  "history_points": 2880,
+  "history_points": 5760,
   "state_file": "/var/lib/health-sentinel/state.json",
   "incidents_dir": "/var/lib/health-sentinel/incidents",
   "incident_history": 50,

@@ -219,11 +219,12 @@ Sentinel supports direct WhatsApp alerting via **CallMeBot** (free & instant):
 ## 🔌 API & Prometheus Endpoints
 
 When `web.enabled` is `true`:
-- `GET /` — Responsive web dashboard with 10-min KPI cards, Y-axis units, interactive range selectors (1m, 10m, 1h, 1d), and **🐘 PHP Controls**
+- `GET /` — Responsive web dashboard with 12h/24h/48h historical charts, Y-axis units, range selectors (1m, 10m, 1h, 12h, 24h, 48h), and **⚡ Quick Actions & PHP Controls**
 - `GET /api/health` — Full JSON diagnostic report with simple language findings and metrics
 - `GET /api/php-services` — List all installed PHP versions and their live systemd status
 - `POST /api/php-action` — Start, stop, restart, or reload PHP services (`{"service": "plesk-php82-fpm", "action": "restart"}`)
-- `GET /api/history` — Rolling history data points for graphs and trend analysis
+- `POST /api/system-action` — Execute safe system maintenance (`restart_mariadb`, `vacuum_logs`, `drop_caches`, `reset_failed`)
+- `GET /api/history` — Rolling 48h history data points (5,760 samples) for graphs and trend analysis
 - `GET /api/incidents` — Preserved incident packets and top CPU/Memory culprits
 - `POST /api/scan` — Force an immediate re-scan and evaluation (thread-safe)
 - `POST /api/test-alert` — Trigger a test alert to verify notification dispatch (Telegram, WhatsApp, Email)
@@ -238,17 +239,18 @@ When `web.enabled` is `true`:
 | `cpu` | CPU utilization & hypervisor steal | User, system, iowait, steal%, PSI stall (some_avg10), top consumers |
 | `load` | Run queue saturation & Load >= 8.0 | 1m, 5m, 15m load normalized & absolute (warn >= 8.0), D-state vs R-state |
 | `memory` | RAM, Swap & OOM Killer | Available RAM%, swap in/out rate, PSI pressure, recent OOM events |
-| `disk` | Filesystem capacity & flags | Mount utilization, free bytes, read-only status |
+| `disk` | Filesystem capacity & flags | Mount utilization, free bytes, read-only status, growth slope forecast |
 | `io` | Storage bottlenecks & latencies | Device utilization%, await times (ms), IOPS, kernel I/O errors |
 | `inodes` | Inode exhaustion & file handles | Mount inode%, system-wide `fs.file-max` saturation |
 | `network` | NIC health & socket state | Interface rx/tx rates, error/drop rates, TCP retrans%, conntrack usage |
 | `processes` | Process limits & leak detection | Active PIDs vs `pid_max`, threads vs `threads-max`, zombies, D-state |
 | `services` | Service state & system updates | `systemctl --failed`, system state, NTP sync, uptime, reboot required |
-| `logs` | Security, kernel & PHP-FPM | Journal errors/h, failed SSH auth/h, segfaults, **PHP-FPM slow script traces** |
+| `logs` | Security, kernel & PHP-FPM | Journal errors/h, failed SSH auth/h, segfaults, **PHP-FPM slow script traces**, SSL expiry |
 
 ---
 
 ## 📜 Versioning
-Current Version: **v1.5.3 (updated 2026-09-02 00:55)**
+Current Version: **v1.6.0 (updated 2026-09-02 07:00)**
+
 
 

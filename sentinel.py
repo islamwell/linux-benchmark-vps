@@ -36,8 +36,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.5.3"
-UPDATED = "2026-09-02 00:55"
+VERSION = "1.6.0"
+UPDATED = "2026-09-02 07:00"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -58,7 +58,7 @@ CORES = os.cpu_count() or 1
 DEFAULTS = {
     "hostname": None,                    # None -> auto
     "scan_interval": 30,                 # seconds between background scans
-    "history_points": 2880,              # 24 hours at 30s intervals
+    "history_points": 5760,              # 48 hours at 30s intervals
     "state_file": "/var/lib/health-sentinel/state.json",
     "incidents_dir": "/var/lib/health-sentinel/incidents",
     "incident_history": 50,
@@ -1256,6 +1256,64 @@ def control_php_service(service, action):
         }
 
 
+def control_system_action(action):
+    """Safely executes one-click server maintenance actions."""
+    allowed = {
+        "restart_mariadb": (["systemctl", "restart", "mariadb"], "MariaDB database server restarted"),
+        "restart_mysql": (["systemctl", "restart", "mysql"], "MySQL database server restarted"),
+        "restart_nginx": (["systemctl", "restart", "nginx"], "Nginx web server restarted"),
+        "restart_apache": (["systemctl", "restart", "apache2"], "Apache web server restarted"),
+        "vacuum_logs": (["journalctl", "--vacuum-size=200M"], "System journal logs trimmed to 200MB"),
+        "drop_caches": (["sh", "-c", "sync; echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true"], "RAM page cache reclaimed"),
+        "reset_failed": (["systemctl", "reset-failed"], "Failed systemd unit counters reset"),
+    }
+    if action not in allowed:
+        return {"ok": False, "error": f"Invalid or unauthorized system action: {action}"}
+    
+    cmd, success_msg = allowed[action]
+    if action in ("restart_mariadb", "restart_mysql"):
+        rc, out = sh(["systemctl", "restart", "mariadb"], timeout=15)
+        if rc != 0:
+            rc, out = sh(["systemctl", "restart", "mysql"], timeout=15)
+    elif action == "restart_apache":
+        rc, out = sh(["systemctl", "restart", "apache2"], timeout=15)
+        if rc != 0:
+            rc, out = sh(["systemctl", "restart", "httpd"], timeout=15)
+    else:
+        rc, out = sh(cmd, timeout=15)
+
+    if rc == 0:
+        return {"ok": True, "action": action, "detail": (out.strip() or success_msg)}
+    else:
+        return {"ok": False, "action": action, "error": f"Command failed: {out.strip()}"}
+
+
+def _scan_ssl_certs():
+    """Scans web certificates for upcoming expiry (< 14 days)."""
+    certs = []
+    paths = glob.glob("/etc/letsencrypt/live/*/cert.pem") + \
+            glob.glob("/var/www/vhosts/system/*/ssl.crt") + \
+            glob.glob("/etc/ssl/certs/*.pem")[:5]
+    now = time.time()
+    for p in paths[:12]:
+        try:
+            rc, out = sh(["openssl", "x509", "-enddate", "-noout", "-in", p], timeout=3)
+            if rc == 0 and "notAfter=" in out:
+                date_str = out.replace("notAfter=", "").strip()
+                try:
+                    exp_dt = datetime.strptime(date_str, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
+                    days_left = (exp_dt.timestamp() - now) / 86400.0
+                    domain = p.split("/")[-2] if "live" in p or "system" in p else os.path.basename(p)
+                    certs.append({"domain": domain, "path": p, "days_left": round(days_left, 1),
+                                  "expires": exp_dt.strftime("%Y-%m-%d")})
+                except Exception:
+                    pass
+        except Exception:
+            continue
+    certs.sort(key=lambda c: c["days_left"])
+    return certs
+
+
 def check_logs(cur, prev, dt, T):
     c = Check("logs", "Logs & Security Signals", "shield", 1.0)
     rc, errs = sh(["journalctl", "--since", "-1h", "-p", "err", "--no-pager", "-q"], timeout=8, ttl=120)
@@ -2097,7 +2155,7 @@ kbd{font-size:10.5px;padding:1px 5px;border-radius:5px;border:1px solid var(--st
   <input class="search" id="q" placeholder="Filter checks…  ( / )">
   <button class="btn" id="autoBtn" onclick="toggleAuto()"><svg viewBox="0 0 24 24"><path d="M12 6v6l4 2"/><circle cx="12" cy="12" r="9"/></svg><span id="autoTxt">Auto</span></button>
   <button class="btn" onclick="toggleTheme()"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg></button>
-  <button class="btn" onclick="openPhpModal()"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9 9h6M9 12h5M9 15h3"/></svg>🐘 PHP Control</button>
+  <button class="btn" onclick="openQuickActionsModal()"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>⚡ Quick Actions &amp; PHP</button>
   <button class="btn" onclick="testAlert(this)"><svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 10-12 0c0 7-3 8-3 8h18s-3-1-3-8"/><path d="M13.7 21a2 2 0 01-3.4 0"/></svg>Test alert</button>
   <button class="btn" onclick="dl()"><svg viewBox="0 0 24 24"><path d="M12 3v12M7 11l5 5 5-5M4 20h16"/></svg>JSON</button>
   <button class="btn primary" id="scanBtn" onclick="scan()"><svg viewBox="0 0 24 24" id="scanIco"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 4v5h-5"/></svg>Scan now</button>
@@ -2190,19 +2248,42 @@ function toast(title,msg,kind='info',ms=4200){
   setTimeout(()=>d.remove(),300)},ms);
 }
 
-/* ── filter history by range (1m, 10m, 1h, 1d) ── */
+/* ── filter history by range (1m, 10m, 1h, 12h, 24h, 48h) ── */
 function getRangeData(key, rangeKey='10m'){
  if(!HIST.length) return [];
  const now = HIST[HIST.length-1].t || (Date.now()/1000);
- const secs = { '1m': 60, '10m': 600, '1h': 3600, '1d': 86400 }[rangeKey] || 600;
+ const secs = {
+  '1m': 60,
+  '10m': 600,
+  '1h': 3600,
+  '12h': 43200,
+  '24h': 86400,
+  '48h': 172800,
+  '1d': 86400,
+  '2d': 172800
+ }[rangeKey] || 600;
  const minT = now - secs;
  const filtered = HIST.filter(p => p.t >= minT);
  return filtered.length >= 2 ? filtered : HIST.slice(-20);
 }
 
+/* ── smart downsampling for smooth high-res 48h rendering ── */
+function downsample(data, maxPoints=120){
+ if(data.length <= maxPoints) return data;
+ const step = data.length / maxPoints;
+ const out = [];
+ for(let i = 0; i < maxPoints; i++){
+  const idx = Math.min(Math.floor(i * step), data.length - 1);
+  out.push(data[idx]);
+ }
+ if(out[out.length-1] !== data[data.length-1]) out[out.length-1] = data[data.length-1];
+ return out;
+}
+
 /* ── rich SVG chart with Y-Axis units & X-Axis time markers ── */
 function renderCardChart(key, color, unit, rangeKey='10m'){
- const data = getRangeData(key, rangeKey);
+ const fullData = getRangeData(key, rangeKey);
+ const data = downsample(fullData, 120);
  const vals = data.map(d => Number(d[key]) || 0);
  if(!vals.length) return '<div style="color:var(--dim);font-size:11px;padding:20px 0;text-align:center">Waiting for scan data…</div>';
  
@@ -2223,7 +2304,7 @@ function renderCardChart(key, color, unit, rangeKey='10m'){
  const areaPath = `${linePath} L ${pts[pts.length-1][0].toFixed(1)} ${(padT + plotH).toFixed(1)} L ${pts[0][0].toFixed(1)} ${(padT + plotH).toFixed(1)} Z`;
  const id = 'g_' + key + '_' + Math.random().toString(36).slice(2, 7);
  
- const yTopLabel = maxV >= 100 ? `${maxV.toFixed(0)}${unit}` : `${maxV.toFixed(0)}${unit}`;
+ const yTopLabel = `${maxV.toFixed(0)}${unit}`;
  const yMidLabel = `${(maxV/2).toFixed(0)}${unit}`;
  const yBotLabel = `0${unit}`;
  
@@ -2278,7 +2359,7 @@ function render(r){
  ['all','crit','warn','ok'].forEach(k=>$('#c-'+k).textContent=k==='all'?r.counts.total:r.counts[k]);
  $('#c-inc').textContent=INCIDENTS.length;
 
- // Top 4 KPI Cards with dedicated 10-min SVG charts & Y-axis units
+ // Top 4 KPI Cards with dedicated historical charts & Y-axis units
  const m=id=>r.checks.find(c=>c.id===id)||{metrics:{},status:'ok'};
  const cpu=m('cpu'),mem=m('memory'),ld=m('load'),dk=m('disk'),io=m('io');
  
@@ -2296,7 +2377,7 @@ function render(r){
    <div class="kh">
     <span>${t.t}</span>
     <div class="kranges" onclick="event.stopPropagation()">
-     ${['1m','10m','1h','1d'].map(rk=>`<button class="kr-btn${rk===range?' active':''}" onclick="setCardRange('${t.k}','${rk}')">${rk}</button>`).join('')}
+     ${['10m','1h','12h','24h','48h'].map(rk=>`<button class="kr-btn${rk===range?' active':''}" onclick="setCardRange('${t.k}','${rk}')">${rk}</button>`).join('')}
     </div>
    </div>
    <div class="kvals">
@@ -2320,8 +2401,8 @@ function setCardRange(key, rk){
 
 function openChartModal(key, title, color, unit){
  const range = ACTIVE_RANGES[key] || '10m';
- const data = getRangeData(key, range);
- const vals = data.map(d=>Number(d[key])||0);
+ const fullData = getRangeData(key, range);
+ const vals = fullData.map(d=>Number(d[key])||0);
  const avg = vals.length ? (vals.reduce((a,b)=>a+b,0)/vals.length).toFixed(1) : '0';
  const max = vals.length ? Math.max(...vals).toFixed(1) : '0';
  const min = vals.length ? Math.min(...vals).toFixed(1) : '0';
@@ -2329,17 +2410,17 @@ function openChartModal(key, title, color, unit){
  
  const modal = document.createElement('div');
  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:999;backdrop-filter:blur(8px);display:grid;place-items:center;padding:20px;';
- modal.innerHTML = `<div class="glass" style="max-width:780px;width:100%;padding:24px;background:var(--bg2);">
+ modal.innerHTML = `<div class="glass" style="max-width:820px;width:100%;padding:24px;background:var(--bg2);">
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
    <div>
     <h2 style="font-size:18px;">📊 ${esc(title)} — Historical Trend</h2>
-    <div style="font-size:12px;color:var(--mut);">Select time range: <b>1 minute</b>, <b>10 minutes</b>, <b>1 hour</b>, or <b>1 day</b></div>
+    <div style="font-size:12px;color:var(--mut);">Select time range: <b>1m</b>, <b>10m</b>, <b>1h</b>, <b>12h</b>, <b>24h</b>, or <b>48h</b></div>
    </div>
    <button class="btn" onclick="this.closest('div[style*=position]').remove()">Close</button>
   </div>
   
-  <div style="display:flex;gap:6px;margin-bottom:16px;">
-   ${['1m','10m','1h','1d'].map(rk=>`<button class="btn${rk===range?' primary':''}" onclick="this.closest('div[style*=position]').remove();setCardRange('${key}','${rk}');openChartModal('${key}','${title}','${color}','${unit}')">${rk==='1m'?'1 Minute':rk==='10m'?'10 Minutes':rk==='1h'?'1 Hour':'1 Day (24h)'}</button>`).join('')}
+  <div style="display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap;">
+   ${['1m','10m','1h','12h','24h','48h'].map(rk=>`<button class="btn${rk===range?' primary':''}" onclick="this.closest('div[style*=position]').remove();setCardRange('${key}','${rk}');openChartModal('${key}','${title}','${color}','${unit}')">${rk==='1m'?'1 Min':rk==='10m'?'10 Mins':rk==='1h'?'1 Hour':rk==='12h'?'12 Hours':rk==='24h'?'24 Hours':'48 Hours'}</button>`).join('')}
   </div>
 
   <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:18px;">
@@ -2480,22 +2561,60 @@ function showIncidents(){
  document.body.appendChild(modal);
 }
 
-async function openPhpModal(){
+async function openQuickActionsModal(){
  const modal = document.createElement('div');
- modal.id = 'php-modal';
+ modal.id = 'actions-modal';
  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:999;backdrop-filter:blur(8px);display:grid;place-items:center;padding:20px;';
- modal.innerHTML = `<div class="glass" style="max-width:760px;width:100%;max-height:85vh;overflow-y:auto;padding:24px;background:var(--bg2);">
+ modal.innerHTML = `<div class="glass" style="max-width:800px;width:100%;max-height:88vh;overflow-y:auto;padding:24px;background:var(--bg2);">
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
    <div>
-    <h2 style="font-size:18px;display:flex;align-items:center;gap:8px;">🐘 PHP Service Manager</h2>
-    <div style="font-size:12.5px;color:var(--mut);">Start, stop, or restart PHP-FPM pools to clear stuck workers or recover from timeouts.</div>
+    <h2 style="font-size:18px;display:flex;align-items:center;gap:8px;">⚡ Server Maintenance &amp; PHP Control</h2>
+    <div style="font-size:12.5px;color:var(--mut);">One-click safe fixes for PHP-FPM, MySQL database, disk logs, and system memory.</div>
    </div>
-   <button class="btn" onclick="this.closest('#php-modal').remove()">Close</button>
+   <button class="btn" onclick="this.closest('#actions-modal').remove()">Close</button>
   </div>
-  <div id="php-list" style="padding:20px 0;text-align:center;color:var(--dim);">Detecting PHP services…</div>
+
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-bottom:20px;">
+   <div style="padding:12px 14px;border-radius:12px;background:var(--card);border:1px solid var(--stroke);">
+    <b style="font-size:13px;display:block;margin-bottom:4px;">🗄️ Database Service</b>
+    <div style="font-size:11.5px;color:var(--mut);margin-bottom:10px;">Restart MariaDB / MySQL to clear stuck locks or high connections.</div>
+    <button class="btn" onclick="doSystemAction('restart_mariadb')" style="width:100%;height:32px;font-size:12px;">🔄 Restart Database</button>
+   </div>
+   <div style="padding:12px 14px;border-radius:12px;background:var(--card);border:1px solid var(--stroke);">
+    <b style="font-size:13px;display:block;margin-bottom:4px;">🧹 Disk Space Cleanup</b>
+    <div style="font-size:11.5px;color:var(--mut);margin-bottom:10px;">Trim system journal logs to 200MB to free hard drive space.</div>
+    <button class="btn" onclick="doSystemAction('vacuum_logs')" style="width:100%;height:32px;font-size:12px;">🧹 Vacuum Logs</button>
+   </div>
+   <div style="padding:12px 14px;border-radius:12px;background:var(--card);border:1px solid var(--stroke);">
+    <b style="font-size:13px;display:block;margin-bottom:4px;">💧 Reclaim RAM Cache</b>
+    <div style="font-size:11.5px;color:var(--mut);margin-bottom:10px;">Sync and free cached memory pages to give apps more RAM.</div>
+    <button class="btn" onclick="doSystemAction('drop_caches')" style="width:100%;height:32px;font-size:12px;">💧 Flush Page Cache</button>
+   </div>
+  </div>
+
+  <h3 style="font-size:15px;margin-bottom:12px;display:flex;align-items:center;gap:6px;">🐘 PHP-FPM Service Pools</h3>
+  <div id="php-list" style="padding:16px 0;text-align:center;color:var(--dim);">Detecting PHP services…</div>
  </div>`;
  document.body.appendChild(modal);
  await loadPhpServices();
+}
+
+async function doSystemAction(action){
+ try{
+  toast('Running System Action', `Executing ${action}…`, 'info', 2000);
+  const res = await api('/api/system-action', {
+   method: 'POST',
+   body: JSON.stringify({ action })
+  });
+  if(res.ok){
+   toast('Action Successful', res.detail || `${action} executed successfully`, 'ok', 4500);
+   if(REPORT) scan();
+  } else {
+   toast('Action Failed', res.error || res.detail || 'Action failed', 'crit', 6000);
+  }
+ }catch(e){
+  toast('System Error', e.message, 'crit', 6000);
+ }
 }
 
 async function loadPhpServices(){
@@ -2505,9 +2624,9 @@ async function loadPhpServices(){
   const r = await api('/api/php-services');
   const svcs = r.services || [];
   if(!svcs.length){
-   list.innerHTML = `<div style="padding:24px;background:var(--card);border-radius:12px;border:1px solid var(--stroke);">
-    <b style="font-size:14px;">No standard PHP-FPM services detected</b>
-    <div style="font-size:12.5px;color:var(--mut);margin-top:6px;">If PHP is running under a non-standard service name, check systemctl list-units.</div>
+   list.innerHTML = `<div style="padding:20px;background:var(--card);border-radius:12px;border:1px solid var(--stroke);">
+    <b style="font-size:13.5px;">No standard PHP-FPM services detected</b>
+    <div style="font-size:12px;color:var(--mut);margin-top:4px;">If PHP is running under a custom unit name, check systemctl list-units.</div>
    </div>`;
    return;
   }
@@ -2515,35 +2634,35 @@ async function loadPhpServices(){
   const activeCount = svcs.filter(s=>s.is_active).length;
   
   list.innerHTML = `
-   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
-    <span style="font-size:13px;color:var(--mut);">${svcs.length} PHP version(s) found · <b>${activeCount} active</b></span>
-    ${activeCount > 0 ? `<button class="btn" onclick="doPhpAction('all','restart')" style="font-size:12px;height:32px;">🔄 Restart All Active PHP</button>` : ''}
+   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+    <span style="font-size:12.5px;color:var(--mut);">${svcs.length} PHP version(s) found · <b>${activeCount} active</b></span>
+    ${activeCount > 0 ? `<button class="btn" onclick="doPhpAction('all','restart')" style="font-size:12px;height:30px;">🔄 Restart All Active PHP</button>` : ''}
    </div>
-   <div style="display:flex;flex-direction:column;gap:10px;">
+   <div style="display:flex;flex-direction:column;gap:8px;">
     ${svcs.map(s=>{
      const statusColor = s.is_active ? 'var(--ok)' : (s.is_failed ? 'var(--crit)' : 'var(--dim)');
      const statusLabel = s.is_active ? 'Running' : (s.is_failed ? 'Failed' : 'Stopped');
      return `
-      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-radius:12px;background:var(--card);border:1px solid var(--stroke);gap:12px;flex-wrap:wrap;">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-radius:10px;background:var(--card);border:1px solid var(--stroke);gap:10px;flex-wrap:wrap;">
        <div style="display:flex;align-items:center;gap:10px;">
         <span class="dot" style="color:${statusColor};background:${statusColor}"></span>
         <div>
-         <b style="font-size:14px;">${esc(s.display)}</b>
-         <span style="font-family:monospace;font-size:11.5px;color:var(--dim);margin-left:6px;">(${esc(s.service)})</span>
-         <div style="font-size:11.5px;color:${statusColor};font-weight:600;margin-top:2px;">● ${statusLabel}</div>
+         <b style="font-size:13.5px;">${esc(s.display)}</b>
+         <span style="font-family:monospace;font-size:11px;color:var(--dim);margin-left:5px;">(${esc(s.service)})</span>
+         <div style="font-size:11px;color:${statusColor};font-weight:600;">● ${statusLabel}</div>
         </div>
        </div>
-       <div style="display:flex;gap:6px;">
-        ${!s.is_active ? `<button class="btn" onclick="doPhpAction('${s.service}','start')" style="color:var(--ok);border-color:color-mix(in srgb,var(--ok) 35%,transparent);height:32px;font-size:12px;">▶ Start</button>` : ''}
-        ${s.is_active ? `<button class="btn" onclick="doPhpAction('${s.service}','restart')" style="height:32px;font-size:12px;">🔄 Restart</button>` : ''}
-        ${s.is_active ? `<button class="btn" onclick="doPhpAction('${s.service}','reload')" style="height:32px;font-size:12px;">⚡ Reload</button>` : ''}
-        ${s.is_active ? `<button class="btn" onclick="confirmStopPhp('${s.service}')" style="color:var(--crit);border-color:color-mix(in srgb,var(--crit) 35%,transparent);height:32px;font-size:12px;">⏹ Stop</button>` : ''}
+       <div style="display:flex;gap:5px;">
+        ${!s.is_active ? `<button class="btn" onclick="doPhpAction('${s.service}','start')" style="color:var(--ok);border-color:color-mix(in srgb,var(--ok) 35%,transparent);height:30px;font-size:11.5px;">▶ Start</button>` : ''}
+        ${s.is_active ? `<button class="btn" onclick="doPhpAction('${s.service}','restart')" style="height:30px;font-size:11.5px;">🔄 Restart</button>` : ''}
+        ${s.is_active ? `<button class="btn" onclick="doPhpAction('${s.service}','reload')" style="height:30px;font-size:11.5px;">⚡ Reload</button>` : ''}
+        ${s.is_active ? `<button class="btn" onclick="confirmStopPhp('${s.service}')" style="color:var(--crit);border-color:color-mix(in srgb,var(--crit) 35%,transparent);height:30px;font-size:11.5px;">⏹ Stop</button>` : ''}
        </div>
       </div>`;
     }).join('')}
    </div>`;
  }catch(e){
-  list.innerHTML = `<div style="color:var(--crit);padding:20px;">Error loading PHP services: ${esc(e.message)}</div>`;
+  list.innerHTML = `<div style="color:var(--crit);padding:16px;">Error loading PHP services: ${esc(e.message)}</div>`;
  }
 }
 
@@ -2699,6 +2818,16 @@ class Handler(BaseHTTPRequestHandler):
                                          "detail": f"Ran {action} on {len(results)} active PHP service(s)"})
 
             res = control_php_service(service, action)
+            code = 200 if res.get("ok") else 500
+            return self._send(code, res)
+        if path == "/api/system-action":
+            try:
+                body = json.loads(data_bytes.decode() or "{}")
+            except Exception as e:
+                return self._send(400, {"ok": False, "error": f"Invalid JSON body: {e}"})
+            
+            action = (body.get("action") or "").strip()
+            res = control_system_action(action)
             code = 200 if res.get("ok") else 500
             return self._send(code, res)
         if path == "/api/test-alert":
