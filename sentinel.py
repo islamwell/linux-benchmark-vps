@@ -36,8 +36,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.6.0"
-UPDATED = "2026-09-02 07:00"
+VERSION = "1.6.1"
+UPDATED = "2026-09-02 07:10"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -1266,6 +1266,7 @@ def control_system_action(action):
         "vacuum_logs": (["journalctl", "--vacuum-size=200M"], "System journal logs trimmed to 200MB"),
         "drop_caches": (["sh", "-c", "sync; echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true"], "RAM page cache reclaimed"),
         "reset_failed": (["systemctl", "reset-failed"], "Failed systemd unit counters reset"),
+        "optimize_io_memory": (["bash", "/opt/health-sentinel/deploy/optimize-io-memory.sh"], "Applied I/O and kernel memory optimizations"),
     }
     if action not in allowed:
         return {"ok": False, "error": f"Invalid or unauthorized system action: {action}"}
@@ -2589,6 +2590,11 @@ async function openQuickActionsModal(){
     <b style="font-size:13px;display:block;margin-bottom:4px;">💧 Reclaim RAM Cache</b>
     <div style="font-size:11.5px;color:var(--mut);margin-bottom:10px;">Sync and free cached memory pages to give apps more RAM.</div>
     <button class="btn" onclick="doSystemAction('drop_caches')" style="width:100%;height:32px;font-size:12px;">💧 Flush Page Cache</button>
+   </div>
+   <div style="padding:12px 14px;border-radius:12px;background:var(--card);border:1px solid var(--stroke);">
+    <b style="font-size:13px;display:block;margin-bottom:4px;">🚀 I/O &amp; RAM Tuning</b>
+    <div style="font-size:11.5px;color:var(--mut);margin-bottom:10px;">Apply noatime, swappiness=10, write-batching, and zram compressed swap.</div>
+    <button class="btn primary" onclick="doSystemAction('optimize_io_memory')" style="width:100%;height:32px;font-size:12px;">🚀 Optimize I/O &amp; RAM</button>
    </div>
   </div>
 

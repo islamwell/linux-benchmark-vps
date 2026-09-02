@@ -247,10 +247,24 @@ When `web.enabled` is `true`:
 | `services` | Service state & system updates | `systemctl --failed`, system state, NTP sync, uptime, reboot required |
 | `logs` | Security, kernel & PHP-FPM | Journal errors/h, failed SSH auth/h, segfaults, **PHP-FPM slow script traces**, SSL expiry |
 
+## 🚀 Software-Level I/O & Memory Optimization
+
+If your VPS has high `iowait` (slow disk) and limited RAM, run the automated tuning script to apply non-destructive kernel, filesystem, and database optimizations without hardware upgrades:
+
+```bash
+sudo /opt/health-sentinel/deploy/optimize-io-memory.sh
+```
+
+**What it tunes:**
+1. **`noatime,nodiratime`**: Stops updating file access timestamps on every read, eliminating useless metadata writes.
+2. **`vm.swappiness = 10` & `vm.vfs_cache_pressure = 50`**: Keeps file caches longer in RAM and avoids aggressive disk swapping.
+3. **Dirty Writeback Batching**: Sets `dirty_background_ratio=5` and `dirty_ratio=20` to batch disk writes and prevent disk queue stalls.
+4. **Compressed RAM Swap (zram)**: Sets up compressed in-RAM swap so low-memory spikes don't thrash the physical disk.
+5. **MySQL / MariaDB Flush Batching**: Sets `innodb_flush_log_at_trx_commit = 2` to batch transaction disk writes once per second.
+
+*You can also trigger this optimization with a single click from the **`⚡ Quick Actions`** dashboard modal.*
+
 ---
 
 ## 📜 Versioning
-Current Version: **v1.6.0 (updated 2026-09-02 07:00)**
-
-
-
+Current Version: **v1.6.1 (updated 2026-09-02 07:10)**

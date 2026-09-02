@@ -172,6 +172,10 @@ if [ -f "${SOURCE_DIR}/deploy/enable-plesk-php-slowlog.sh" ]; then
     cp "${SOURCE_DIR}/deploy/enable-plesk-php-slowlog.sh" "${INSTALL_DIR}/deploy/"
     chmod 755 "${INSTALL_DIR}/deploy/enable-plesk-php-slowlog.sh"
 fi
+if [ -f "${SOURCE_DIR}/deploy/optimize-io-memory.sh" ]; then
+    cp "${SOURCE_DIR}/deploy/optimize-io-memory.sh" "${INSTALL_DIR}/deploy/"
+    chmod 755 "${INSTALL_DIR}/deploy/optimize-io-memory.sh"
+fi
 if [ -f "${SOURCE_DIR}/deploy/sentinel-cron.service" ]; then
     cp "${SOURCE_DIR}/deploy/sentinel-cron.service" "${INSTALL_DIR}/deploy/"
 fi
