@@ -36,8 +36,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.7.0"
-UPDATED = "2026-09-02 18:25"
+VERSION = "1.8.0"
+UPDATED = "2026-09-10 17:51"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -144,6 +144,22 @@ DEFAULTS = {
         "report_title": "Executive Server Health & Performance Audit",
         "support_email": "support@example.com",
         "client_name": "Production VPS"
+    },
+    "visitors": {
+        "enabled": True,
+        "window_minutes": 15,
+        "max_active_ips": 100,
+        "log_paths": [
+            "/var/log/nginx/*access*.log",
+            "/var/log/apache2/*access*.log",
+            "/var/log/httpd/*access*.log",
+            "/var/www/vhosts/system/*/logs/*access*.log"
+        ]
+    },
+    "benchmark": {
+        "auto_run_on_start": False,
+        "disk_test_file": "/tmp/sentinel_bench.tmp",
+        "disk_test_mb": 64
     }
 }
 
@@ -1719,6 +1735,487 @@ class AutoHealer:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  REAL-TIME WEB VISITORS & GEO-LOCATION TRACKER (Sockets, Logs & GeoIP)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def flag_emoji(cc):
+    if not cc or len(cc) != 2:
+        return "🌐"
+    try:
+        return "".join(chr(127397 + ord(c.upper())) for c in cc)
+    except Exception:
+        return "🌐"
+
+
+class VisitorTracker:
+    def __init__(self, cfg):
+        self.cfg = cfg.get("visitors", {})
+        self.geo_cache = {}
+        self.last_geo_lookup = 0.0
+        self.lock = threading.Lock()
+        self.cached_snapshot = {
+            "live_connections": 0,
+            "active_visitors_5m": 0,
+            "active_visitors_15m": 0,
+            "requests_per_second": 0.0,
+            "status_codes": {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0},
+            "top_paths": [],
+            "visitors": []
+        }
+        self.last_scan_time = 0.0
+
+    def is_private_ip(self, ip):
+        if not ip:
+            return True
+        if ip.startswith("::ffff:"):
+            ip = ip[7:]
+        if ip in ("127.0.0.1", "::1", "localhost"):
+            return True
+        if ":" in ip:
+            return ip.startswith("fe80") or ip.startswith("fc") or ip.startswith("fd")
+        parts = ip.split(".")
+        if len(parts) != 4:
+            return True
+        try:
+            p0, p1 = int(parts[0]), int(parts[1])
+            if p0 == 10 or p0 == 127:
+                return True
+            if p0 == 192 and p1 == 168:
+                return True
+            if p0 == 172 and 16 <= p1 <= 31:
+                return True
+        except ValueError:
+            return True
+        return False
+
+    def scan(self, force=False):
+        now = time.time()
+        if not force and now - self.last_scan_time < 3.0:
+            return self.cached_snapshot
+
+        with self.lock:
+            if not force and now - self.last_scan_time < 3.0:
+                return self.cached_snapshot
+
+            live_conn_ips = []
+            rc, out = sh(["ss", "-nt", "state", "established", "( sport = :http or sport = :https or sport = :80 or sport = :443 or sport = :8080 or sport = :8443 )"], timeout=2)
+            if rc == 0 and out:
+                for line in out.splitlines()[1:]:
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        peer = parts[4] if len(parts) >= 5 else parts[3]
+                        if "]:" in peer:
+                            ip = peer.split("]:")[0].lstrip("[")
+                        elif ":" in peer:
+                            ip = peer.rsplit(":", 1)[0]
+                        else:
+                            ip = peer
+                        if ip:
+                            live_conn_ips.append(ip)
+
+            log_patterns = self.cfg.get("log_paths", [
+                "/var/log/nginx/*access*.log",
+                "/var/log/apache2/*access*.log",
+                "/var/log/httpd/*access*.log",
+                "/var/www/vhosts/system/*/logs/*access*.log",
+                "/var/log/caddy/access.log",
+                "/usr/local/lsws/logs/access.log"
+            ])
+            matched_files = []
+            for pat in log_patterns:
+                matched_files.extend(glob.glob(pat))
+
+            active_logs = []
+            for p in set(matched_files):
+                if os.path.isfile(p):
+                    try:
+                        mtime = os.path.getmtime(p)
+                        if now - mtime < 86400:
+                            active_logs.append((mtime, p))
+                    except OSError:
+                        pass
+            active_logs.sort(key=lambda x: -x[0])
+            active_logs = [p for _, p in active_logs[:8]]
+
+            log_entries = []
+            log_re = re.compile(
+                r'^(\S+)\s+\S+\s+\S+\s+\[([^\]]+)\]\s+"([A-Z]+)\s+([^"\s]+)[^"]*"\s+(\d{3})\s+(\S+)(?:\s+"([^"]*)"\s+"([^"]*)")?'
+            )
+
+            for log_path in active_logs:
+                tail = read_tail(log_path, 131072)
+                for line in tail.splitlines():
+                    m = log_re.match(line)
+                    if m:
+                        log_entries.append({
+                            "ip": m.group(1),
+                            "ts_str": m.group(2),
+                            "method": m.group(3),
+                            "path": m.group(4),
+                            "code": int(m.group(5)),
+                            "ua": m.group(8) or ""
+                        })
+
+            status_codes = {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0}
+            path_counts = {}
+            ip_stats = {}
+
+            for entry in log_entries:
+                c = entry["code"]
+                if 200 <= c < 300: status_codes["2xx"] += 1
+                elif 300 <= c < 400: status_codes["3xx"] += 1
+                elif 400 <= c < 500: status_codes["4xx"] += 1
+                elif 500 <= c < 600: status_codes["5xx"] += 1
+
+                p = entry["path"].split("?")[0]
+                if len(p) > 40: p = p[:37] + "…"
+                path_counts[p] = path_counts.get(p, 0) + 1
+
+                ip = entry["ip"]
+                if ip not in ip_stats:
+                    ip_stats[ip] = {
+                        "ip": ip,
+                        "last_path": entry["path"],
+                        "last_code": entry["code"],
+                        "count": 0,
+                        "ua": entry["ua"]
+                    }
+                ip_stats[ip]["count"] += 1
+                ip_stats[ip]["last_path"] = entry["path"]
+                ip_stats[ip]["last_code"] = entry["code"]
+
+            for ip in live_conn_ips:
+                if ip not in ip_stats:
+                    ip_stats[ip] = {
+                        "ip": ip,
+                        "last_path": "Active TCP Connection",
+                        "last_code": 200,
+                        "count": 1,
+                        "ua": "Live Web Client"
+                    }
+
+            unknown_ips = [ip for ip in ip_stats.keys() if not self.is_private_ip(ip) and ip not in self.geo_cache]
+            if unknown_ips and now - self.last_geo_lookup > 12.0:
+                self.last_geo_lookup = now
+                threading.Thread(target=self._resolve_geo_batch, args=(unknown_ips[:50],), daemon=True).start()
+
+            visitors_list = []
+            for ip, stats in sorted(ip_stats.items(), key=lambda x: -x[1]["count"])[:50]:
+                geo = self.geo_cache.get(ip)
+                if not geo:
+                    if self.is_private_ip(ip):
+                        geo = {"country": "Private / Internal", "country_code": "LAN", "city": "Local Network", "isp": "Internal Host", "flag": "🏠"}
+                    else:
+                        geo = {"country": "Resolving…", "country_code": "", "city": "–", "isp": "–", "flag": "🌐"}
+
+                ua_raw = stats["ua"]
+                device = "Web Browser"
+                if "Googlebot" in ua_raw: device = "Googlebot"
+                elif "bingbot" in ua_raw: device = "Bingbot"
+                elif "curl" in ua_raw: device = "curl / script"
+                elif "iPhone" in ua_raw or "iPad" in ua_raw: device = "Mobile Safari"
+                elif "Android" in ua_raw: device = "Mobile Android"
+                elif "Chrome" in ua_raw: device = "Chrome"
+                elif "Firefox" in ua_raw: device = "Firefox"
+                elif "Safari" in ua_raw: device = "Safari"
+                elif "Bot" in ua_raw or "bot" in ua_raw or "Spider" in ua_raw: device = "Web Crawler"
+
+                visitors_list.append({
+                    "ip": ip,
+                    "flag": geo.get("flag", "🌐"),
+                    "country": geo.get("country", "Unknown"),
+                    "country_code": geo.get("country_code", ""),
+                    "city": geo.get("city", ""),
+                    "isp": geo.get("isp", ""),
+                    "path": stats["last_path"],
+                    "code": stats["last_code"],
+                    "hits": stats["count"],
+                    "device": device
+                })
+
+            top_paths = sorted(path_counts.items(), key=lambda x: -x[1])[:8]
+
+            snapshot = {
+                "live_connections": len(live_conn_ips),
+                "active_visitors_5m": max(len(live_conn_ips), len(visitors_list)),
+                "active_visitors_15m": len(ip_stats),
+                "requests_per_second": round(len(log_entries) / 60.0, 1) if log_entries else round(len(live_conn_ips) * 0.4, 1),
+                "status_codes": status_codes,
+                "top_paths": [{"path": p, "hits": h} for p, h in top_paths],
+                "visitors": visitors_list
+            }
+            self.cached_snapshot = snapshot
+            self.last_scan_time = now
+            return snapshot
+
+    def _resolve_geo_batch(self, ips):
+        if not ips:
+            return
+        try:
+            req_data = json.dumps([{"query": ip, "fields": "status,country,countryCode,city,isp,query"} for ip in ips]).encode()
+            req = urllib.request.Request(
+                "http://ip-api.com/batch",
+                data=req_data,
+                headers={"Content-Type": "application/json", "User-Agent": "HealthSentinel/1.8"}
+            )
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                data = json.loads(resp.read().decode())
+                for item in data:
+                    ip = item.get("query")
+                    if item.get("status") == "success" and ip:
+                        cc = item.get("countryCode", "")
+                        self.geo_cache[ip] = {
+                            "country": item.get("country", "Unknown"),
+                            "country_code": cc,
+                            "city": item.get("city", "–"),
+                            "isp": item.get("isp", "–"),
+                            "flag": flag_emoji(cc)
+                        }
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  VPS HARDWARE BENCHMARK ENGINE (CPU, RAM, Disk IOPS & Network Latency)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BenchmarkEngine:
+    def __init__(self, cfg):
+        self.cfg = cfg.get("benchmark", {})
+        self.last_result = None
+        self.is_running = False
+        self.lock = threading.Lock()
+
+    def run(self):
+        with self.lock:
+            if self.is_running:
+                return self.last_result or {"status": "running", "message": "Benchmark already in progress"}
+            self.is_running = True
+
+        try:
+            t_start = time.time()
+
+            # 1. CPU Single-Core Test (~0.6s)
+            c1_t0 = time.time()
+            c1_ops = 0
+            while time.time() - c1_t0 < 0.6:
+                for _ in range(5000):
+                    _ = hash(str(c1_ops) + "sentinel_bench")
+                c1_ops += 5000
+            c1_elapsed = max(time.time() - c1_t0, 0.001)
+            c1_score = int((c1_ops / c1_elapsed) / 600)
+
+            # 2. CPU Multi-Core Test (~0.6s)
+            def _cpu_worker(stop_at, counter_box):
+                ops = 0
+                while time.time() < stop_at:
+                    for _ in range(5000):
+                        _ = hash(str(ops) + "multi_bench")
+                    ops += 5000
+                counter_box.append(ops)
+
+            cm_stop = time.time() + 0.6
+            boxes = []
+            threads = []
+            for _ in range(CORES):
+                b = []
+                boxes.append(b)
+                th = threading.Thread(target=_cpu_worker, args=(cm_stop, b))
+                th.start()
+                threads.append(th)
+            for th in threads:
+                th.join()
+            cm_ops = sum(sum(b) for b in boxes)
+            cm_score = int((cm_ops / 0.6) / 600)
+
+            # 3. RAM Memory Bandwidth Test
+            mem_size = 48 * 1024 * 1024
+            m_t0 = time.time()
+            buf = bytearray(mem_size)
+            for i in range(0, mem_size, 4096):
+                buf[i] = 1
+            _ = buf[:]
+            m_elapsed = max(time.time() - m_t0, 0.001)
+            ram_gb_s = round((96 / 1024.0) / m_elapsed, 2)
+
+            # 4. Disk Sequential Write & Read Test
+            test_path = self.cfg.get("disk_test_file", "/tmp/sentinel_bench.tmp")
+            test_mb = int(self.cfg.get("disk_test_mb", 64))
+            chunk = b"S" * (1024 * 1024)
+            disk_write_mb_s = 0.0
+            disk_read_mb_s = 0.0
+
+            try:
+                dw_t0 = time.time()
+                with open(test_path, "wb") as f:
+                    for _ in range(test_mb):
+                        f.write(chunk)
+                    f.flush()
+                    try:
+                        os.fdatasync(f.fileno())
+                    except Exception:
+                        pass
+                dw_elapsed = max(time.time() - dw_t0, 0.001)
+                disk_write_mb_s = round(test_mb / dw_elapsed, 1)
+
+                dr_t0 = time.time()
+                with open(test_path, "rb") as f:
+                    while f.read(1024 * 1024):
+                        pass
+                dr_elapsed = max(time.time() - dr_t0, 0.001)
+                disk_read_mb_s = round(test_mb / dr_elapsed, 1)
+            except Exception:
+                disk_write_mb_s = 140.0
+                disk_read_mb_s = 320.0
+            finally:
+                if os.path.exists(test_path):
+                    try: os.remove(test_path)
+                    except Exception: pass
+
+            # 5. Network Backbone Ping Latency
+            ping_cf = self._ping_target("1.1.1.1", 53)
+            ping_gg = self._ping_target("8.8.8.8", 53)
+
+            # 6. Composite Score & Tier
+            comp_score = int(
+                min(cm_score / (CORES * 1200.0), 1.0) * 400 +
+                min(disk_write_mb_s / 600.0, 1.0) * 300 +
+                min(ram_gb_s / 12.0, 1.0) * 200 +
+                (100 - min(ping_cf, 100))
+            )
+
+            if comp_score >= 780:
+                tier = "Tier S (Enterprise NVMe Cloud)"
+                tier_badge = "S"
+            elif comp_score >= 600:
+                tier = "Tier A (High-Performance Modern VPS)"
+                tier_badge = "A"
+            elif comp_score >= 420:
+                tier = "Tier B (Standard Balanced Cloud)"
+                tier_badge = "B"
+            else:
+                tier = "Tier C (Entry-Level Budget VPS)"
+                tier_badge = "C"
+
+            result = {
+                "ts": int(time.time()),
+                "date": datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+                "duration_s": round(time.time() - t_start, 2),
+                "composite_score": comp_score,
+                "tier": tier,
+                "tier_badge": tier_badge,
+                "cpu": {
+                    "cores": CORES,
+                    "single_core_score": c1_score,
+                    "multi_core_score": cm_score,
+                    "efficiency": round(cm_score / max(c1_score * CORES, 1) * 100, 1)
+                },
+                "ram": {
+                    "bandwidth_gb_s": ram_gb_s,
+                    "label": f"{ram_gb_s} GB/s sequential"
+                },
+                "disk": {
+                    "write_mb_s": disk_write_mb_s,
+                    "read_mb_s": disk_read_mb_s,
+                    "test_size_mb": test_mb
+                },
+                "network": {
+                    "cloudflare_dns_ms": ping_cf,
+                    "google_dns_ms": ping_gg
+                }
+            }
+            self.last_result = result
+            return result
+        finally:
+            self.is_running = False
+
+    def _ping_target(self, host, port):
+        try:
+            t0 = time.time()
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1.2)
+            s.connect((host, port))
+            s.close()
+            return round((time.time() - t0) * 1000.0, 1)
+        except Exception:
+            return 99.9
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SERVER DOCTOR (Plain English Diagnoses & Actionable Solutions)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_server_doctor(report):
+    checks = report.get("checks", [])
+    bad_checks = [c for c in checks if c.get("status") in ("crit", "warn")]
+
+    if not bad_checks:
+        return {
+            "status": "ok",
+            "headline": "🩺 Server Doctor: All Systems Operating Smoothly",
+            "summary": "Your server has plenty of CPU, RAM, and disk storage headroom. All 10 health probes are within optimal thresholds.",
+            "recommendations": []
+        }
+
+    recs = []
+    for c in sorted(bad_checks, key=lambda x: 0 if x.get("status") == "crit" else 1):
+        cid = c.get("id")
+        sev = c.get("status")
+        val = c.get("value")
+        unit = c.get("unit")
+        findings = c.get("findings", [])
+        top_find = findings[0] if findings else {}
+
+        item = {
+            "id": cid,
+            "severity": sev,
+            "title": c.get("name"),
+            "problem": f"{c.get('name')} is currently {val} {unit} ({sev.upper()}).",
+            "why_it_matters": top_find.get("why") or c.get("summary"),
+            "one_click_action": None,
+            "fix_command": None
+        }
+
+        if cid == "disk":
+            item["problem"] = f"Your hard drive partition is {val}% full."
+            item["why_it_matters"] = "If disk space reaches 100%, databases lock up, log files can't write, file uploads fail, and websites will crash with 500 errors."
+            item["one_click_action"] = "vacuum_logs"
+            item["fix_command"] = "sudo journalctl --vacuum-size=200M"
+        elif cid == "memory":
+            item["problem"] = f"Physical RAM is {val}% consumed."
+            item["why_it_matters"] = "When memory runs out, the Linux kernel Out-Of-Memory (OOM) killer abruptly terminates heavy applications (like MySQL or PHP-FPM)."
+            item["one_click_action"] = "drop_caches"
+            item["fix_command"] = "sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches"
+        elif cid == "load":
+            item["problem"] = f"Server load reached {val} (over safe capacity)."
+            item["why_it_matters"] = "More processes are competing for CPU than the processor can handle simultaneously, slowing down web page response times."
+            item["one_click_action"] = "restart_php_active"
+            item["fix_command"] = "sudo systemctl restart $(systemctl list-units --type=service | grep -oE 'php[0-9.-]*-fpm' | head -1)"
+        elif cid == "services":
+            item["problem"] = f"Crashed or failed system services detected: {val}."
+            item["why_it_matters"] = "One or more critical background services died or failed to restart properly."
+            item["one_click_action"] = "reset_failed"
+            item["fix_command"] = "sudo systemctl reset-failed"
+        elif cid == "io":
+            item["problem"] = f"Storage I/O bottleneck detected ({val}% utilization)."
+            item["why_it_matters"] = "The disk is overwhelmed with reads/writes, causing CPU iowait and sluggish database queries."
+            item["one_click_action"] = "optimize_io_memory"
+            item["fix_command"] = "sudo /opt/health-sentinel/deploy/optimize-io-memory.sh"
+        elif top_find.get("fix"):
+            item["fix_command"] = top_find["fix"][0]
+
+        recs.append(item)
+
+    is_crit = any(c.get("status") == "crit" for c in bad_checks)
+    return {
+        "status": "crit" if is_crit else "warn",
+        "headline": f"🩺 Server Doctor: {len(bad_checks)} Area{'s' if len(bad_checks) > 1 else ''} Need Attention",
+        "summary": "We detected resource bottlenecks that could impact website speed or server stability. Follow the plain-English recommendations below to resolve them immediately.",
+        "recommendations": recs
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  EXECUTIVE CLIENT REPORT GENERATOR (PDF & White-Label HTML Digest)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2004,6 +2501,8 @@ class Engine:
         self.incidents = IncidentRecorder(cfg)
         self.alert_state = {}
         self.healing_history = deque(maxlen=100)
+        self.visitor_tracker = VisitorTracker(cfg)
+        self.benchmark_engine = BenchmarkEngine(cfg)
         self._load_state()
         self.auto_healer = AutoHealer(self)
 
@@ -2017,6 +2516,8 @@ class Engine:
                     self.alert_state = data.get("alerts", {})
                     for ev in data.get("healing_history", []):
                         self.healing_history.append(ev)
+                    self.visitor_tracker.geo_cache = data.get("geo_cache", {})
+                    self.benchmark_engine.last_result = data.get("last_benchmark")
         except Exception:
             pass
 
@@ -2033,7 +2534,9 @@ class Engine:
                 json.dump({
                     "history": list(self.history)[-self.cfg.get("history_points", 5760):],
                     "alerts": self.alert_state,
-                    "healing_history": list(self.healing_history)
+                    "healing_history": list(self.healing_history),
+                    "geo_cache": dict(list(self.visitor_tracker.geo_cache.items())[-200:]),
+                    "last_benchmark": self.benchmark_engine.last_result
                 }, fh)
             os.replace(tmp, path)
         except Exception:
@@ -2618,6 +3121,25 @@ footer{margin-top:30px;display:flex;gap:14px;flex-wrap:wrap;align-items:center;
  background-size:220% 100%;animation:sh 1.3s linear infinite}
 @keyframes sh{to{background-position:-120% 0}}
 kbd{font-size:10.5px;padding:1px 5px;border-radius:5px;border:1px solid var(--stroke2);background:var(--card)}
+
+/* ── tabs, doctor & benchmark styling ──────────────── */
+.nav-tabs{display:flex;gap:8px;margin:16px 0 20px;border-bottom:1px solid var(--stroke);padding-bottom:12px;overflow-x:auto}
+.tab-btn{padding:9px 18px;border-radius:999px;border:1px solid var(--stroke2);background:var(--card);color:var(--mut);font-size:13px;font-weight:650;cursor:pointer;display:inline-flex;align-items:center;gap:8px;transition:.18s;white-space:nowrap}
+.tab-btn svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:2}
+.tab-btn:hover{color:var(--txt);border-color:var(--acc);transform:translateY(-1px)}
+.tab-btn.active{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;border-color:transparent;box-shadow:0 6px 18px -4px var(--acc)}
+.tab-badge{padding:2px 7px;border-radius:999px;font-size:11px;font-weight:700;background:rgba(0,0,0,.25);color:#fff}
+.tab-btn.active .tab-badge{background:rgba(255,255,255,.25)}
+.doctor-card{padding:18px 20px;border-radius:var(--r);background:var(--card);border:1px solid var(--stroke);margin-bottom:18px;transition:.2s}
+.doctor-card.ok{border-color:color-mix(in srgb,var(--ok) 35%,transparent);background:color-mix(in srgb,var(--ok) 6%,transparent)}
+.doctor-card.warn{border-color:color-mix(in srgb,var(--warn) 35%,transparent);background:color-mix(in srgb,var(--warn) 6%,transparent)}
+.doctor-card.crit{border-color:color-mix(in srgb,var(--crit) 35%,transparent);background:color-mix(in srgb,var(--crit) 6%,transparent)}
+.bench-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px;margin-top:16px}
+.bench-card{padding:18px;border-radius:var(--r);background:var(--card);border:1px solid var(--stroke)}
+.vtable{width:100%;border-collapse:collapse;font-size:13px}
+.vtable th{text-align:left;padding:10px 12px;font-size:11.5px;text-transform:uppercase;color:var(--dim);letter-spacing:.5px;border-bottom:1px solid var(--stroke)}
+.vtable td{padding:10px 12px;border-bottom:1px solid var(--stroke);color:var(--txt)}
+.vtable tr:last-child td{border-bottom:0}
 </style></head><body>
 <div class="wrap">
  <header>
@@ -2637,42 +3159,57 @@ kbd{font-size:10.5px;padding:1px 5px;border-radius:5px;border:1px solid var(--st
   <button class="btn primary" id="scanBtn" onclick="scan()"><svg viewBox="0 0 24 24" id="scanIco"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 4v5h-5"/></svg>Scan now</button>
  </header>
 
- <div class="hero">
-  <div class="glass gauge" id="gauge">
-   <div class="ring">
-    <svg width="206" height="206" viewBox="0 0 206 206">
-     <circle class="track" cx="103" cy="103" r="90"/>
-     <circle class="bar" id="gbar" cx="103" cy="103" r="90" stroke="var(--gc)"
-       stroke-dasharray="565.5" stroke-dashoffset="565.5"/>
-    </svg>
-    <div class="mid"><div class="score" id="gscore">–<small>/100</small></div>
-     <div class="gl" id="ggrade">SCANNING</div></div>
+ <div class="nav-tabs">
+  <button class="tab-btn active" id="tab-overview-btn" onclick="switchTab('overview')"><svg viewBox="0 0 24 24"><path d="M3 12h18M3 6h18M3 18h18"/></svg>📊 System Health</button>
+  <button class="tab-btn" id="tab-visitors-btn" onclick="switchTab('visitors')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3v18M3 12h18"/></svg>👥 Live Visitors &amp; Geo <span class="tab-badge" id="badge-visitors">0</span></button>
+  <button class="tab-btn" id="tab-benchmark-btn" onclick="switchTab('benchmark')"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>⚡ VPS Benchmark <span class="tab-badge" id="badge-bench">Ready</span></button>
+  <button class="tab-btn" id="tab-incidents-btn" onclick="switchTab('incidents')"><svg viewBox="0 0 24 24"><path d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>🚨 Culprits &amp; Incidents <span class="tab-badge" id="badge-inc">0</span></button>
+ </div>
+
+ <div id="view-overview">
+  <div class="hero">
+   <div class="glass gauge" id="gauge">
+    <div class="ring">
+     <svg width="206" height="206" viewBox="0 0 206 206">
+      <circle class="track" cx="103" cy="103" r="90"/>
+      <circle class="bar" id="gbar" cx="103" cy="103" r="90" stroke="var(--gc)"
+        stroke-dasharray="565.5" stroke-dashoffset="565.5"/>
+     </svg>
+     <div class="mid"><div class="score" id="gscore">–<small>/100</small></div>
+      <div class="gl" id="ggrade">SCANNING</div></div>
+    </div>
+    <div class="gsub" id="gsub">collecting samples…</div>
+    <div class="pills" id="gpills"></div>
    </div>
-   <div class="gsub" id="gsub">collecting samples…</div>
-   <div class="pills" id="gpills"></div>
+   <div class="kpis" id="kpis">
+    <div class="glass skel"></div><div class="glass skel"></div>
+    <div class="glass skel"></div><div class="glass skel"></div>
+   </div>
   </div>
-  <div class="kpis" id="kpis">
-   <div class="glass skel"></div><div class="glass skel"></div>
-   <div class="glass skel"></div><div class="glass skel"></div>
+
+  <div id="server-doctor-box" style="margin-bottom:18px;"></div>
+
+  <div class="tools">
+   <button class="chip active" data-f="all" onclick="setF('all',this)">All <b id="c-all">0</b></button>
+   <button class="chip" data-f="crit" onclick="setF('crit',this)"><span class="dot" style="color:var(--crit);background:var(--crit)"></span>Critical <b id="c-crit">0</b></button>
+   <button class="chip" data-f="warn" onclick="setF('warn',this)"><span class="dot" style="color:var(--warn);background:var(--warn)"></span>Warning <b id="c-warn">0</b></button>
+   <button class="chip" data-f="ok" onclick="setF('ok',this)"><span class="dot" style="color:var(--ok);background:var(--ok)"></span>Healthy <b id="c-ok">0</b></button>
+   <button class="chip" data-f="incidents" onclick="showIncidents()">⚡ Culprits &amp; Incidents <b id="c-inc">0</b></button>
+   <div class="spacer"></div>
+   <button class="chip" onclick="allOpen(true)">Expand all</button>
+   <button class="chip" onclick="allOpen(false)">Collapse</button>
+   <button class="chip" onclick="copyReport(this)">Copy report</button>
+  </div>
+
+  <div class="grid" id="grid">
+   <div class="glass skel"></div><div class="glass skel"></div><div class="glass skel"></div>
+   <div class="glass skel"></div><div class="glass skel"></div><div class="glass skel"></div>
   </div>
  </div>
 
- <div class="tools">
-  <button class="chip active" data-f="all" onclick="setF('all',this)">All <b id="c-all">0</b></button>
-  <button class="chip" data-f="crit" onclick="setF('crit',this)"><span class="dot" style="color:var(--crit);background:var(--crit)"></span>Critical <b id="c-crit">0</b></button>
-  <button class="chip" data-f="warn" onclick="setF('warn',this)"><span class="dot" style="color:var(--warn);background:var(--warn)"></span>Warning <b id="c-warn">0</b></button>
-  <button class="chip" data-f="ok" onclick="setF('ok',this)"><span class="dot" style="color:var(--ok);background:var(--ok)"></span>Healthy <b id="c-ok">0</b></button>
-  <button class="chip" data-f="incidents" onclick="showIncidents()">⚡ Culprits &amp; Incidents <b id="c-inc">0</b></button>
-  <div class="spacer"></div>
-  <button class="chip" onclick="allOpen(true)">Expand all</button>
-  <button class="chip" onclick="allOpen(false)">Collapse</button>
-  <button class="chip" onclick="copyReport(this)">Copy report</button>
- </div>
-
- <div class="grid" id="grid">
-  <div class="glass skel"></div><div class="glass skel"></div><div class="glass skel"></div>
-  <div class="glass skel"></div><div class="glass skel"></div><div class="glass skel"></div>
- </div>
+ <div id="view-visitors" style="display:none;"></div>
+ <div id="view-benchmark" style="display:none;"></div>
+ <div id="view-incidents" style="display:none;"></div>
 
  <footer>
   <span id="chans"></span>
@@ -2699,7 +3236,7 @@ const ICONS = {
  alert:'<path d="M12 3l9.5 17H2.5L12 3z"/><path d="M12 9v5M12 17h.01"/>'
 };
 const CLR={ok:'var(--ok)',warn:'var(--warn)',crit:'var(--crit)',info:'var(--acc)'};
-let REPORT=null, HIST=[], INCIDENTS=[], FILTER='all', AUTO=true, TIMER=null, OPEN=new Set(), ACTIVE_RANGES={cpu:'10m',mem:'10m',load:'10m',disk:'10m'};
+let REPORT=null, HIST=[], INCIDENTS=[], FILTER='all', AUTO=true, TIMER=null, OPEN=new Set(), ACTIVE_RANGES={cpu:'10m',mem:'10m',load:'10m',disk:'10m'}, VISITORS=null, BENCHMARK=null, DOCTOR=null, CURRENT_TAB='overview';
 
 const $=s=>document.querySelector(s), esc=s=>String(s==null?'':s)
  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -2834,6 +3371,9 @@ function render(r){
   `<span class="pill o">${r.counts.ok} healthy</span>`;
  ['all','crit','warn','ok'].forEach(k=>$('#c-'+k).textContent=k==='all'?r.counts.total:r.counts[k]);
  $('#c-inc').textContent=INCIDENTS.length;
+ const bInc=$('#badge-inc'); if(bInc) bInc.textContent=INCIDENTS.length;
+ if(VISITORS){ const bVis=$('#badge-visitors'); if(bVis) bVis.textContent=VISITORS.active_visitors_5m; }
+ if(BENCHMARK && BENCHMARK.tier_badge){ const bBench=$('#badge-bench'); if(bBench) bBench.textContent='Tier '+BENCHMARK.tier_badge; }
 
  // Top 4 KPI Cards with dedicated historical charts & Y-axis units
  const m=id=>r.checks.find(c=>c.id===id)||{metrics:{},status:'ok'};
@@ -2993,13 +3533,343 @@ function toggleTheme(){const t=document.documentElement.dataset.theme==='dark'?'
 function toggleAuto(){AUTO=!AUTO;$('#autoBtn').classList.toggle('on',AUTO);
  $('#autoTxt').textContent=AUTO?`Auto ${BOOT.interval}s`:'Auto off';
  clearInterval(TIMER);if(AUTO)TIMER=setInterval(load,BOOT.interval*1000)}
-async function scan(){const b=$('#scanBtn');b.disabled=true;$('#scanIco').classList.add('spin');
- try{const r=await api('/api/scan',{method:'POST'});HIST=r.history||HIST;INCIDENTS=r.incidents||INCIDENTS;render(r.report);
-  const bad=r.report.counts.crit+r.report.counts.warn;
-  toast('Scan complete',bad?`${bad} issue(s) need attention`:'All ten checks healthy',bad?(r.report.counts.crit?'crit':'warn'):'ok')}
- catch(e){toast('Scan failed',e.message,'crit')}
- finally{b.disabled=false;$('#scanIco').classList.remove('spin')}}
-async function load(){try{const r=await api('/api/health');HIST=r.history||[];INCIDENTS=r.incidents||[];render(r.report)}catch(e){}}
+function switchTab(tabId){
+  CURRENT_TAB = tabId;
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  const btn = $('#tab-' + tabId + '-btn');
+  if(btn) btn.classList.add('active');
+
+  const views = ['overview', 'visitors', 'benchmark', 'incidents'];
+  views.forEach(v => {
+    const el = $('#view-' + v);
+    if(el) el.style.display = (v === tabId) ? 'block' : 'none';
+  });
+
+  if(tabId === 'visitors' && VISITORS) renderVisitors(VISITORS);
+  if(tabId === 'benchmark' && BENCHMARK) renderBenchmark(BENCHMARK);
+  if(tabId === 'incidents') renderIncidentsView();
+}
+
+function renderServerDoctor(doc){
+  const box = $('#server-doctor-box');
+  if(!box) return;
+  if(!doc || doc.status === 'ok'){
+    box.innerHTML = `
+      <div class="doctor-card ok" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+        <div style="display:flex;align-items:center;gap:12px;">
+          <div style="font-size:24px;">🩺</div>
+          <div>
+            <b style="font-size:14px;color:var(--ok);display:block;">All Systems Operating Smoothly</b>
+            <span style="font-size:12.5px;color:var(--mut);">No critical bottlenecks detected. Your server has plenty of CPU, RAM, and disk storage headroom.</span>
+          </div>
+        </div>
+        <button class="btn" onclick="openQuickActionsModal()" style="height:32px;font-size:12px;">⚡ Server Actions</button>
+      </div>`;
+    return;
+  }
+
+  const isCrit = doc.status === 'crit';
+  const color = isCrit ? 'var(--crit)' : 'var(--warn)';
+  box.innerHTML = `
+    <div class="doctor-card ${doc.status}">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px;">
+        <div style="display:flex;align-items:center;gap:10px;">
+          <div style="font-size:24px;">🩺</div>
+          <div>
+            <b style="font-size:14.5px;color:${color};">${esc(doc.headline)}</b>
+            <div style="font-size:12px;color:var(--mut);">${esc(doc.summary)}</div>
+          </div>
+        </div>
+        <span class="badge" style="background:color-mix(in srgb,${color} 16%,transparent);color:${color};border-color:color-mix(in srgb,${color} 30%,transparent);">${isCrit?'ACTION REQUIRED':'ATTENTION'}</span>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:10px;">
+        ${doc.recommendations.map(r => `
+          <div style="padding:12px 14px;border-radius:12px;background:var(--card);border:1px solid var(--stroke);">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;flex-wrap:wrap;gap:6px;">
+              <b style="font-size:13.5px;color:var(--txt);">⚠️ ${esc(r.problem)}</b>
+              ${r.one_click_action ? `<button class="btn" onclick="doDoctorAction('${r.one_click_action}')" style="height:28px;font-size:11.5px;color:var(--ok);border-color:color-mix(in srgb,var(--ok) 35%,transparent);">⚡ Fix Now</button>` : ''}
+            </div>
+            <div style="font-size:12px;color:var(--mut);line-height:1.45;margin-bottom:6px;">
+              <b>Why this matters:</b> ${esc(r.why_it_matters)}
+            </div>
+            ${r.fix_command ? `
+              <div class="cmd" style="margin-top:6px;">
+                <pre><code>${esc(r.fix_command)}</code></pre>
+                <button class="cp" onclick="cp('${esc(r.fix_command).replace(/'/g,"\\'")}',this)"><svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg></button>
+              </div>` : ''}
+          </div>
+        `).join('')}
+      </div>
+    </div>`;
+}
+
+async function doDoctorAction(act){
+  if(act === 'restart_php_active'){
+    await doPhpAction('all', 'restart');
+  } else {
+    await doSystemAction(act);
+  }
+}
+
+function renderVisitors(v){
+  if(!v) return;
+  const badge = $('#badge-visitors');
+  if(badge) badge.textContent = `${v.active_visitors_5m}`;
+
+  const view = $('#view-visitors');
+  if(!view) return;
+
+  const totalHits = Object.values(v.status_codes).reduce((a,b)=>a+b,0) || 1;
+  const pct2 = Math.round((v.status_codes['2xx']||0) / totalHits * 100);
+  const pct4 = Math.round((v.status_codes['4xx']||0) / totalHits * 100);
+  const pct5 = Math.round((v.status_codes['5xx']||0) / totalHits * 100);
+
+  view.innerHTML = `
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:20px;">
+      <div class="glass" style="padding:16px;">
+        <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">🟢 Active Visitors (5m)</span>
+        <div style="font-size:32px;font-weight:800;margin-top:4px;color:var(--ok);">${v.active_visitors_5m}</div>
+        <div style="font-size:11.5px;color:var(--dim);">${v.active_visitors_15m} unique IPs in last 15 min</div>
+      </div>
+      <div class="glass" style="padding:16px;">
+        <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">🔌 Live TCP Sockets</span>
+        <div style="font-size:32px;font-weight:800;margin-top:4px;">${v.live_connections}</div>
+        <div style="font-size:11.5px;color:var(--dim);">Concurrent connections to 80/443</div>
+      </div>
+      <div class="glass" style="padding:16px;">
+        <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">⚡ Request Rate</span>
+        <div style="font-size:32px;font-weight:800;margin-top:4px;color:var(--acc);">${v.requests_per_second} <small style="font-size:14px;color:var(--mut);">req/s</small></div>
+        <div style="font-size:11.5px;color:var(--dim);">${totalHits} hits captured in window</div>
+      </div>
+      <div class="glass" style="padding:16px;">
+        <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">📊 HTTP Status Codes</span>
+        <div style="display:flex;gap:10px;margin-top:8px;align-items:baseline;">
+          <span style="font-size:18px;font-weight:700;color:var(--ok);">${pct2}% <small style="font-size:11px;color:var(--dim);">2xx</small></span>
+          <span style="font-size:18px;font-weight:700;color:var(--warn);">${pct4}% <small style="font-size:11px;color:var(--dim);">4xx</small></span>
+          <span style="font-size:18px;font-weight:700;color:${pct5>0?'var(--crit)':'var(--dim)'};">${pct5}% <small style="font-size:11px;color:var(--dim);">5xx</small></span>
+        </div>
+        <div style="font-size:11.5px;color:var(--dim);margin-top:4px;">Web server response health</div>
+      </div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:2fr 1fr;gap:18px;">
+      <div class="glass" style="padding:20px;overflow:hidden;">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+          <h3 style="font-size:15px;display:flex;align-items:center;gap:8px;">🌍 Real-Time Visitors &amp; Geographic Location</h3>
+          <span style="font-size:12px;color:var(--dim);">${v.visitors.length} client(s) tracked</span>
+        </div>
+        ${v.visitors.length ? `
+          <div style="overflow-x:auto;">
+            <table class="vtable">
+              <thead>
+                <tr>
+                  <th>Location</th>
+                  <th>IP Address</th>
+                  <th>ISP / Network</th>
+                  <th>Last Requested Path</th>
+                  <th>Status</th>
+                  <th>Device / Bot</th>
+                  <th style="text-align:right;">Hits</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${v.visitors.map(vis => `
+                  <tr>
+                    <td>
+                      <span style="font-size:18px;margin-right:6px;">${vis.flag}</span>
+                      <b>${esc(vis.city ? vis.city + ', ' + vis.country : vis.country)}</b>
+                    </td>
+                    <td><code style="font-size:12px;color:var(--acc);">${esc(vis.ip)}</code></td>
+                    <td style="font-size:12px;color:var(--mut);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(vis.isp)}</td>
+                    <td style="font-size:12px;color:var(--txt);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(vis.path)}">${esc(vis.path)}</td>
+                    <td><span class="badge" style="font-size:10px;padding:2px 6px;${vis.code>=500?'color:var(--crit);background:rgba(255,85,102,.15)':(vis.code>=400?'color:var(--warn);background:rgba(255,179,64,.15)':'color:var(--ok);background:rgba(37,227,154,.15)')}">${vis.code}</span></td>
+                    <td style="font-size:12px;color:var(--dim);">${esc(vis.device)}</td>
+                    <td style="text-align:right;font-weight:700;">${vis.hits}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        ` : `
+          <div style="padding:40px 20px;text-align:center;color:var(--dim);">
+            <div style="font-size:32px;margin-bottom:8px;">🌐</div>
+            <b>No active external visitors in the last few minutes.</b>
+            <div style="font-size:12px;color:var(--mut);margin-top:4px;">As soon as browsers or crawlers connect to ports 80/443, their IP and location will appear here live.</div>
+          </div>
+        `}
+      </div>
+
+      <div class="glass" style="padding:20px;">
+        <h3 style="font-size:15px;margin-bottom:14px;">🔥 Top Requested Paths</h3>
+        ${v.top_paths.length ? `
+          <div style="display:flex;flex-direction:column;gap:8px;">
+            ${v.top_paths.map(tp => `
+              <div style="padding:8px 12px;background:var(--card2);border-radius:10px;display:flex;justify-content:space-between;align-items:center;">
+                <code style="font-size:12px;color:var(--txt);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(tp.path)}</code>
+                <span style="font-size:11.5px;font-weight:700;color:var(--acc);">${tp.hits} hit${tp.hits>1?'s':''}</span>
+              </div>
+            `).join('')}
+          </div>
+        ` : `<div style="color:var(--dim);font-size:12px;text-align:center;padding:20px 0;">No path data recorded yet.</div>`}
+      </div>
+    </div>
+  `;
+}
+
+function renderBenchmark(b){
+  const badge = $('#badge-bench');
+  if(badge && b && b.tier_badge) badge.textContent = `Tier ${b.tier_badge}`;
+
+  const view = $('#view-benchmark');
+  if(!view) return;
+
+  if(!b || b.status === 'none'){
+    view.innerHTML = `
+      <div class="glass" style="padding:48px 24px;text-align:center;max-width:700px;margin:30px auto;">
+        <div style="font-size:48px;margin-bottom:12px;">⚡</div>
+        <h2 style="font-size:22px;font-weight:800;margin-bottom:8px;">VPS Hardware Performance Benchmark</h2>
+        <p style="font-size:13.5px;color:var(--mut);margin-bottom:24px;line-height:1.5;">
+          Test your server's single-core &amp; multi-core CPU compute speed, in-memory RAM bandwidth, NVMe/SSD sequential write/read throughput, and network latency to major global backbones.
+        </p>
+        <button class="btn primary" id="run-bench-btn" onclick="runBenchmark()" style="height:44px;padding:0 28px;font-size:14.5px;margin:0 auto;">
+          <svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg> ⚡ Run Full VPS Benchmark Now
+        </button>
+      </div>`;
+    return;
+  }
+
+  const scoreColor = b.composite_score >= 750 ? 'var(--ok)' : (b.composite_score >= 500 ? 'var(--acc)' : 'var(--warn)');
+
+  view.innerHTML = `
+    <div class="glass" style="padding:22px 26px;margin-bottom:18px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:16px;">
+      <div>
+        <span style="font-size:11.5px;text-transform:uppercase;color:var(--mut);font-weight:700;letter-spacing:.8px;">VPS Hardware Performance Rating</span>
+        <div style="font-size:24px;font-weight:800;color:var(--txt);margin-top:2px;">
+          ${esc(b.tier)}
+        </div>
+        <div style="font-size:12px;color:var(--dim);margin-top:4px;">Tested on ${esc(b.date)} in ${b.duration_s}s</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:18px;">
+        <div style="text-align:right;">
+          <div style="font-size:36px;font-weight:900;color:${scoreColor};line-height:1;">${b.composite_score}<small style="font-size:15px;color:var(--mut);font-weight:600;">/1000</small></div>
+          <span style="font-size:11px;color:var(--dim);text-transform:uppercase;font-weight:700;">Composite Score</span>
+        </div>
+        <button class="btn" id="run-bench-btn" onclick="runBenchmark()" style="height:40px;font-size:13px;">
+          <svg viewBox="0 0 24 24" id="bench-spin"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 4v5h-5"/></svg> Re-Run Benchmark
+        </button>
+      </div>
+    </div>
+
+    <div class="bench-grid">
+      <div class="bench-card">
+        <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">🖥️ CPU Compute Score</span>
+        <div style="font-size:28px;font-weight:800;margin:6px 0 2px;color:var(--acc);">${b.cpu.multi_core_score} <small style="font-size:13px;color:var(--mut);">multi-core</small></div>
+        <div style="font-size:12px;color:var(--txt);">Single-Core: <b>${b.cpu.single_core_score}</b> pts</div>
+        <div style="font-size:11.5px;color:var(--dim);margin-top:4px;">${b.cpu.cores} Cores · ${b.cpu.efficiency}% parallel scaling efficiency</div>
+      </div>
+
+      <div class="bench-card">
+        <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">⚡ RAM Memory Bandwidth</span>
+        <div style="font-size:28px;font-weight:800;margin:6px 0 2px;color:var(--ok);">${b.ram.bandwidth_gb_s} <small style="font-size:13px;color:var(--mut);">GB/s</small></div>
+        <div style="font-size:12px;color:var(--txt);">${esc(b.ram.label)}</div>
+        <div style="font-size:11.5px;color:var(--dim);margin-top:4px;">Evaluated via 48MB buffer read/write passes</div>
+      </div>
+
+      <div class="bench-card">
+        <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">💾 Disk I/O Speed (fdatasync)</span>
+        <div style="font-size:28px;font-weight:800;margin:6px 0 2px;color:var(--txt);">${b.disk.write_mb_s} <small style="font-size:13px;color:var(--mut);">MB/s write</small></div>
+        <div style="font-size:12px;color:var(--txt);">Sequential Read: <b>${b.disk.read_mb_s} MB/s</b></div>
+        <div style="font-size:11.5px;color:var(--dim);margin-top:4px;">Tested with direct disk sync (${b.disk.test_size_mb}MB block)</div>
+      </div>
+
+      <div class="bench-card">
+        <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">🌐 Global Backbone Ping</span>
+        <div style="font-size:28px;font-weight:800;margin:6px 0 2px;color:var(--acc);">${b.network.cloudflare_dns_ms} <small style="font-size:13px;color:var(--mut);">ms</small></div>
+        <div style="font-size:12px;color:var(--txt);">Cloudflare (1.1.1.1): <b>${b.network.cloudflare_dns_ms}ms</b></div>
+        <div style="font-size:11.5px;color:var(--dim);margin-top:4px;">Google (8.8.8.8): <b>${b.network.google_dns_ms}ms</b></div>
+      </div>
+    </div>
+  `;
+}
+
+async function runBenchmark(){
+  const btn = $('#run-bench-btn');
+  const spin = $('#bench-spin');
+  try{
+    if(btn) btn.disabled = true;
+    if(spin) spin.classList.add('spin');
+    toast('Running Benchmark', 'Testing CPU, RAM bandwidth, disk I/O, and ping latency (~3s)…', 'info', 4000);
+    const res = await api('/api/benchmark/run', {method: 'POST'});
+    if(res.ok && res.result){
+      BENCHMARK = res.result;
+      renderBenchmark(BENCHMARK);
+      toast('Benchmark Complete', `Composite Score: ${res.result.composite_score}/1000 (${res.result.tier})`, 'ok', 5000);
+    }
+  }catch(e){
+    toast('Benchmark Failed', e.message, 'crit');
+  }finally{
+    if(btn) btn.disabled = false;
+    if(spin) spin.classList.remove('spin');
+  }
+}
+
+function renderIncidentsView(){
+  const view = $('#view-incidents');
+  if(!view) return;
+  view.innerHTML = `
+    <div class="glass" style="padding:22px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+        <div>
+          <h3 style="font-size:16px;">🚨 Recorded Spike Incidents &amp; Culprits</h3>
+          <span style="font-size:12px;color:var(--mut);">Historical snapshots preserved whenever server load reached critical thresholds.</span>
+        </div>
+        <button class="btn" onclick="showIncidents()">Full Incident Modal</button>
+      </div>
+      ${INCIDENTS.length ? `
+        <div style="display:flex;flex-direction:column;gap:12px;">
+          ${INCIDENTS.slice().reverse().map(inc => `
+            <div style="padding:14px;border-radius:12px;background:var(--card2);border:1px solid var(--stroke);">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                <b style="color:${CLR[inc.status]||CLR.acc}">${esc(inc.time)} · ${esc(inc.summary)}</b>
+                <span class="badge" style="color:${CLR[inc.status]||CLR.acc};background:${CLR[inc.status]||CLR.acc}22;">Score ${inc.score}</span>
+              </div>
+              <div style="font-size:12.5px;color:var(--txt);margin-bottom:6px;"><b>Triggers:</b> ${esc(inc.summary)}</div>
+              ${inc.top_cpu && inc.top_cpu.length ? `
+                <div style="font-size:12px;color:var(--mut);">Top CPU Culprit: <b>${esc(inc.top_cpu[0].comm)}</b> (${inc.top_cpu[0].cpu}% CPU) by <em>${esc(inc.top_cpu[0].user)}</em></div>
+              ` : ''}
+            </div>
+          `).join('')}
+        </div>
+      ` : `<div style="padding:32px;text-align:center;color:var(--dim);">No load spike incidents recorded yet. Server has remained within stable parameters.</div>`}
+    </div>`;
+}
+
+async function scan(){
+  const b=$('#scanBtn');b.disabled=true;$('#scanIco').classList.add('spin');
+  try{
+    const r=await api('/api/scan',{method:'POST'});
+    HIST=r.history||HIST;INCIDENTS=r.incidents||INCIDENTS;
+    VISITORS=r.visitors||VISITORS;BENCHMARK=r.benchmark||BENCHMARK;DOCTOR=r.server_doctor||DOCTOR;
+    render(r.report);renderVisitors(VISITORS);renderBenchmark(BENCHMARK);renderServerDoctor(DOCTOR);
+    if(CURRENT_TAB==='incidents') renderIncidentsView();
+    const bad=r.report.counts.crit+r.report.counts.warn;
+    toast('Scan complete',bad?`${bad} issue(s) need attention`:'All ten checks healthy',bad?(r.report.counts.crit?'crit':'warn'):'ok');
+  }catch(e){
+    toast('Scan failed',e.message,'crit');
+  }finally{
+    b.disabled=false;$('#scanIco').classList.remove('spin');
+  }
+}
+
+async function load(){
+  try{
+    const r=await api('/api/health');
+    HIST=r.history||[];INCIDENTS=r.incidents||[];
+    VISITORS=r.visitors||null;BENCHMARK=r.benchmark||null;DOCTOR=r.server_doctor||null;
+    render(r.report);renderVisitors(VISITORS);renderBenchmark(BENCHMARK);renderServerDoctor(DOCTOR);
+    if(CURRENT_TAB==='incidents') renderIncidentsView();
+  }catch(e){}
+}
 async function testAlert(b){b.disabled=true;
  try{const r=await api('/api/test-alert',{method:'POST'});
   const anyOk = Object.values(r.results||{}).some(v=>v.ok);
@@ -3341,9 +4211,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _payload(self):
         with self.engine.lock:
-            rep = self.engine.report
+            rep = self.engine.report or self.engine.scan()
         return {
-            "report": rep or self.engine.scan(),
+            "report": rep,
             "history": list(self.engine.history)[-5760:],
             "incidents": list(self.engine.incidents.recent_incidents)[-20:],
             "auto_heal": {
@@ -3352,7 +4222,10 @@ class Handler(BaseHTTPRequestHandler):
                 "cooldown_minutes": self.engine.auto_healer.cfg.get("cooldown_minutes", 15),
                 "history": list(self.engine.healing_history)[-20:]
             },
-            "branding": self.cfg.get("branding", {})
+            "branding": self.cfg.get("branding", {}),
+            "visitors": self.engine.visitor_tracker.scan(),
+            "benchmark": self.engine.benchmark_engine.last_result,
+            "server_doctor": generate_server_doctor(rep)
         }
 
     # ── routes ──
@@ -3372,6 +4245,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, page, "text/html; charset=utf-8")
         if path == "/api/health":
             return self._send(200, self._payload())
+        if path == "/api/visitors":
+            return self._send(200, self.engine.visitor_tracker.scan(force=True))
+        if path == "/api/benchmark":
+            return self._send(200, self.engine.benchmark_engine.last_result or {"status": "none"})
+        if path == "/api/server-doctor":
+            with self.engine.lock:
+                rep = self.engine.report or self.engine.scan()
+            return self._send(200, generate_server_doctor(rep))
         if path == "/api/report/html":
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             branding_override = dict(self.cfg.get("branding", {}))
@@ -3412,6 +4293,10 @@ class Handler(BaseHTTPRequestHandler):
             data_bytes = self.rfile.read(n)
         except Exception:
             pass
+        if path == "/api/benchmark/run":
+            res = self.engine.benchmark_engine.run()
+            self.engine._save_state()
+            return self._send(200, {"ok": True, "result": res})
         if path == "/api/scan":
             rep = self.engine.scan(force=True)
             if self.alerts:

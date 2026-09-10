@@ -259,6 +259,38 @@ Generate client-ready, branded infrastructure audit reports with a single click:
 
 ---
 
+## 👥 Real-Time Visitors & Geographic Intelligence
+
+Monitor active web visitors to your server in real time:
+* **Live Concurrent Sockets**: Analyzes active TCP connections on HTTP/HTTPS ports (80, 443) using `ss -nt`.
+* **Multi-Engine Web Log Intelligence**: Tails real-time access logs across Nginx, Apache, Plesk vhosts, LiteSpeed, and Caddy.
+* **GeoIP Location & Country Flags**: Automatically identifies visitor country flags (e.g. 🇳🇴, 🇩🇪, 🇺🇸, 🇬🇧), city, ISP/Org, and active request endpoints.
+* **Zero-Overhead Asynchronous Resolution**: Cached lookups handled asynchronously in background threads with local private subnet detection so request processing is never slowed down.
+
+---
+
+## ⚡ Built-in Safe VPS Hardware Benchmark Engine
+
+Benchmark your VPS performance on demand without external dependencies:
+* **CPU Compute**: Single-core and multi-core calculation benchmarks with safe, bounded execution (~0.6s).
+* **Memory Bandwidth**: High-speed memory throughput testing (GB/s).
+* **Storage Sequential I/O**: Direct sequential write throughput (MB/s with `os.fdatasync`) and read throughput, with immediate safe cleanup.
+* **Network Edge Latency**: Low-overhead ping tests to Cloudflare (`1.1.1.1`) and Google (`8.8.8.8`) DNS endpoints.
+* **Composite Score & Tier Classification**: Generates an overall score and rates your server tier (**Tier S**, **Tier A**, **Tier B**, or **Tier C**).
+* **1-Click Execution**: Run directly from the web dashboard or via API (`POST /api/benchmark/run`).
+
+---
+
+## 🩺 Plain-English "Server Doctor" & Smart Recommendations
+
+No more confusing sysadmin jargon! Sentinel translates server metrics into plain English:
+* **What is Happening**: Clear explanation of any detected bottleneck (e.g., *"Disk is being overwhelmed by too many writes (iowait 91.8%)"*).
+* **Why it Matters**: Explanation of the impact on your websites and visitors (e.g., *"Websites feel sluggish because the CPU is constantly waiting for the slow disk"*).
+* **Actionable Solutions**: Concrete, safe advice tailored to your system (e.g., adjusting swappiness, enabling dirty page batching, restarting stuck worker pools).
+* **1-Click Fixes & Copyable Commands**: Single-click fix buttons directly in the alert card or terminal-ready commands.
+
+---
+
 ## 📊 Health Checks Summary
 
 | Check ID | Probe Focus | Key Metrics |
@@ -296,5 +328,5 @@ sudo /opt/health-sentinel/deploy/optimize-io-memory.sh
 ---
 
 ## 📜 Versioning
-Current Version: **v1.7.0 (updated 2026-09-02 18:25)**
+Current Version: **v1.8.0 (updated 2026-09-10 17:51)**
 

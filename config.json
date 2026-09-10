@@ -142,5 +142,23 @@
     "report_title": "Executive Server Health & Performance Audit",
     "support_email": "support@example.com",
     "client_name": "Production VPS"
+  },
+
+  "visitors": {
+    "enabled": true,
+    "window_minutes": 15,
+    "max_active_ips": 100,
+    "log_paths": [
+      "/var/log/nginx/*access*.log",
+      "/var/log/apache2/*access*.log",
+      "/var/log/httpd/*access*.log",
+      "/var/www/vhosts/system/*/logs/*access*.log"
+    ]
+  },
+
+  "benchmark": {
+    "auto_run_on_start": false,
+    "disk_test_file": "/tmp/sentinel_bench.tmp",
+    "disk_test_mb": 64
   }
 }
