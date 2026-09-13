@@ -2,6 +2,8 @@
 
 A **production-ready**, **zero-dependency** (pure Python 3 stdlib) Linux server health platform and forensics monitor featuring:
 
+* **👥 Safe Visitor Traffic Capacity & Stress Benchmark**: Safely tests how many simultaneous active visitors and requests/second your server can sustain. Features progressive concurrency ramping (5 → 15 → 30 → 50 → 150), real-time RPS/latency telemetry, and an **auto-abort circuit breaker** that halts immediately if load &ge; 4.5 or available RAM &lt; 120MB to guarantee zero downtime.
+* **🔄 Universal 1-Command Auto-Updater (`update.sh`)**: Update or install to the latest release in seconds with a single command without overwriting your tokens or custom thresholds.
 * **Top-10 Core Linux Health Probes**: CPU utilization & steal time, normalized load average, memory & swap pressure (with PSI), disk space & read-only detection, disk I/O bottlenecks & await latencies, inode exhaustion & open file handles, network drops/errors/retransmits/conntrack, processes/threads/zombies/D-state, systemd failed services/uptime/reboot flags/NTP, and journal errors/SSH brute-force detection.
 * **0–100 Scoring Engine**: Linear threshold interpolation, severity caps (max 54 for critical, max 79 for warning), and letter grades (A+ through F).
 * **High-Load Incident Preservation & Culprit Forensics**: When load spikes or thresholds breach, Sentinel immediately captures an immutable snapshot of top CPU/RSS processes with full command-line arguments (`cmdline`), usernames/UIDs, cgroups/systemd units, and D-state kernel stack traces, persisting evidence to disk so culprits cannot hide even if processes exit before inspection.
@@ -13,10 +15,23 @@ A **production-ready**, **zero-dependency** (pure Python 3 stdlib) Linux server 
 
 ---
 
+## 🚀 1-Command Universal Auto-Update or Install
+
+To install Sentinel or upgrade an existing installation to the latest release (**v2.0.0**), simply run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/islamwell/linux-benchmark-vps/master/update.sh | sudo bash
+```
+
+*This command safely pulls the latest code, preserves your existing `/etc/health-sentinel/config.json` security tokens and thresholds, sets correct file permissions, updates systemd services, and cleanly restarts Sentinel with zero manual editing.*
+
+---
+
 ## 📁 Repository Structure
 
 ```
 linux-health-sentinel/
+├── update.sh                # 1-command universal auto-updater (preserves tokens & restarts daemon)
 ├── install.sh               # Automated one-command installer and service manager
 ├── sentinel.py              # Single-file daemon, web UI, checks, scoring, incidents & alerts
 ├── config.json              # Thresholds, intervals, and notification credentials
@@ -24,15 +39,14 @@ linux-health-sentinel/
 │   ├── sentinel.service     # Systemd daemon service (web UI + background alerts)
 │   ├── sentinel-cron.service# Systemd oneshot unit for scheduled/cron scans
 │   ├── sentinel-cron.timer  # Systemd 5-minute timer for periodic checks
+│   ├── optimize-io-memory.sh# 1-click script to optimize low-RAM and slow-disk VPS servers
 │   └── enable-plesk-php-slowlog.sh # Safe script to configure slow logging across all PHP pools
 └── README.md                # Documentation and setup guide
 ```
 
 ---
 
-## 🚀 Quick Start (Automated Installation)
-
-Run the installer on your server to verify Python 3, create directory structures, generate a random security token, and register the systemd daemon:
+## 🚀 Manual Installation
 
 ```bash
 # 1. Clone the repository
@@ -290,6 +304,21 @@ Track the speed and availability of all client websites and virtual hosts hosted
 
 ---
 
+## 👥 Safe Visitor Traffic Capacity & Stress Benchmark
+
+Accurately find out **how many simultaneous visitors your server can handle** before slowing down or throwing 502/504 errors:
+
+* **Progressive Concurrency Ramping**: Safely tests traffic stages (e.g. 5 → 15 → 30 → 50 concurrent simulated users for Quick Mode, or up to 150 for Full Stress Mode).
+* **Live Telemetry & Diagnostics**: Measures real-time requests/sec (RPS), average latency (ms), 95th percentile response time, and error rates (% 4xx/5xx/timeouts).
+* **🛡️ Built-in Auto-Abort Circuit Breakers**:
+  1. **CPU Load Watchdog**: Instantly stops the test if CPU Load Average spikes $\ge 4.5$ (or $> 3\times$ CPU cores).
+  2. **Memory Guard**: Automatically halts if available RAM drops below 120MB, protecting your system from the Linux OOM killer.
+  3. **Error Spike Protection**: Freezes further escalation if error rates exceed 25% or response latency exceeds 2,200ms, designating the previous stable stage as maximum safe capacity.
+  4. **Emergency Stop Button**: Stop workers in under 100ms from the web interface at any time.
+* **Plain-English Capacity Verdict**: Explains safe concurrent visitors, sustainable monthly pageviews, identifies the primary bottleneck (CPU, RAM, PHP-FPM worker pool, or I/O), and provides specific actionable optimization steps.
+
+---
+
 ## ⚡ Built-in Safe VPS Hardware Benchmark Engine
 
 Benchmark your VPS performance on demand without external dependencies:
@@ -349,5 +378,6 @@ sudo /opt/health-sentinel/deploy/optimize-io-memory.sh
 ---
 
 ## 📜 Versioning
-Current Version: **v1.9.0 (updated 2026-09-13 06:00)**
+Current Version: **v2.0.0 (updated 2026-09-13 06:15)**
+
 
