@@ -42,8 +42,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.2.1"
-UPDATED = "2026-09-13 14:50"
+VERSION = "2.2.2"
+UPDATED = "2026-09-13 14:58"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -4501,9 +4501,9 @@ h1{font-size:19px;font-weight:750;letter-spacing:-.3px}
 .chip:hover{color:var(--txt);border-color:var(--acc)}
 .chip.active{background:var(--txt);color:var(--bg);border-color:transparent}
 .chip b{font-size:11px;opacity:.8}
-.search{flex:1;min-width:180px;max-width:320px;height:36px;border-radius:11px;border:1px solid var(--stroke2);
- background:var(--card);color:var(--txt);padding:0 13px;font-size:13.5px;outline:0}
-.search:focus{border-color:var(--acc);box-shadow:0 0 0 3px color-mix(in srgb,var(--acc) 18%,transparent)}
+.search{min-width:160px;max-width:240px;height:33px;border-radius:999px;border:1px solid var(--stroke2);
+ background:var(--card);color:var(--txt);padding:0 14px;font-size:12.5px;outline:0;transition:.18s}
+.search:focus{border-color:var(--acc);box-shadow:0 0 0 3px color-mix(in srgb,var(--acc) 18%,transparent);max-width:290px}
 
 /* ── check cards ────────────────────────────────────── */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(390px,1fr));gap:16px}
@@ -4621,7 +4621,6 @@ body.role-viewer .admin-only{display:none!important}
     <div class="sub" id="hostline">loading…</div></div>
   </div>
   <div class="spacer"></div>
-  <input class="search" id="q" placeholder="Filter checks…  ( / )">
   <button class="btn" id="autoBtn" onclick="toggleAuto()"><svg viewBox="0 0 24 24"><path d="M12 6v6l4 2"/><circle cx="12" cy="12" r="9"/></svg><span id="autoTxt">Auto</span></button>
   <button class="btn" onclick="toggleTheme()"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg></button>
   <button class="btn" id="licenseBtn" onclick="openLicenseModal()"><svg viewBox="0 0 24 24"><path d="M12 2a5 5 0 00-5 5v3H6a2 2 0 00-2 2v8a2 2 0 002 2h12a2 2 0 002-2v-8a2 2 0 00-2-2h-1V7a5 5 0 00-5-5zm-3 5a3 3 0 016 0v3H9V7z"/></svg><span id="licenseBtnText">🔑 License</span></button>
@@ -4671,6 +4670,7 @@ body.role-viewer .admin-only{display:none!important}
    <button class="chip" data-f="warn" onclick="setF('warn',this)"><span class="dot" style="color:var(--warn);background:var(--warn)"></span>Warning <b id="c-warn">0</b></button>
    <button class="chip" data-f="ok" onclick="setF('ok',this)"><span class="dot" style="color:var(--ok);background:var(--ok)"></span>Healthy <b id="c-ok">0</b></button>
    <button class="chip" data-f="incidents" onclick="showIncidents()">⚡ Culprits &amp; Incidents <b id="c-inc">0</b></button>
+   <input class="search" id="q" placeholder="Filter checks…  ( / )">
    <div class="spacer"></div>
    <button class="chip" onclick="allOpen(true)">Expand all</button>
    <button class="chip" onclick="allOpen(false)">Collapse</button>

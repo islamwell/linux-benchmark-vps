@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — Automated Installer & Service Manager
-# Version: 2.2.1 (updated 2026-09-13 14:50)
+# Version: 2.2.2 (updated 2026-09-13 14:58)
 # ==============================================================================
 
 set -euo pipefail
 
-VERSION="2.2.1"
-UPDATED="2026-09-13 14:50"
+VERSION="2.2.2"
+UPDATED="2026-09-13 14:58"
 
 # Target installation paths
 INSTALL_DIR="/opt/health-sentinel"
