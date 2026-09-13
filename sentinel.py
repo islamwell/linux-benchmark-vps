@@ -15,21 +15,28 @@
 import argparse
 import base64
 import concurrent.futures
+import fcntl
 import glob
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
+import posixpath
 import pwd
 import re
 import secrets
 import shutil
+import signal
 import smtplib
 import socket
+import stat
 import http.client
 import ssl
 import subprocess
 import sys
+import syslog
+import tempfile
 import threading
 import time
 import urllib.error
@@ -42,8 +49,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.2.4"
-UPDATED = "2026-09-13 18:35"
+VERSION = "2.2.5"
+UPDATED = "2026-09-13 19:10"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -220,22 +227,77 @@ def load_config(path):
     return cfg
 
 
+_CFG_LOCK = threading.RLock()
+
+
 def save_config_section(path, section_name, data):
     """
     Atomically updates and saves a specific section in config.json.
+    Enforces cross-process locking, rejects symlinks, uses mkstemp with 0600 mode,
+    and durable fsync on both file and directory.
     """
     if not path:
         return False, "No config path specified"
+    d = os.path.dirname(os.path.abspath(path)) or "."
     try:
-        current = {}
-        if os.path.exists(path):
-            with open(path, "r") as fh:
-                current = json.load(fh)
-        current[section_name] = data
-        tmp_path = path + ".tmp"
-        with open(tmp_path, "w") as fh:
-            json.dump(current, fh, indent=2)
-        os.replace(tmp_path, path)
+        os.makedirs(d, exist_ok=True)
+        with _CFG_LOCK:
+            lock_path = os.path.join(d, ".cfg.lock")
+            lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(lfd, fcntl.LOCK_EX)
+                current = {}
+                try:
+                    open_flags = os.O_RDONLY
+                    if hasattr(os, "O_NOFOLLOW"):
+                        open_flags |= os.O_NOFOLLOW
+                    fd = os.open(path, open_flags)
+                    try:
+                        st = os.fstat(fd)
+                        if not stat.S_ISREG(st.st_mode):
+                            return False, "config is not a regular file"
+                        raw = os.read(fd, 8 << 20)
+                        if raw:
+                            current = json.loads(raw.decode("utf-8"))
+                    finally:
+                        os.close(fd)
+                except FileNotFoundError:
+                    current = {}
+                except OSError as e:
+                    return False, f"Cannot open config file safely: {e}"
+
+                if not isinstance(current, dict):
+                    return False, "config is not a JSON object"
+
+                current[section_name] = data
+                tfd, tmp = tempfile.mkstemp(dir=d, prefix=".cfg.", suffix=".tmp")
+                try:
+                    os.fchmod(tfd, 0o600)
+                    with os.fdopen(tfd, "w", encoding="utf-8") as fh:
+                        json.dump(current, fh, indent=2)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    os.replace(tmp, path)
+                    try:
+                        dfd = os.open(d, os.O_RDONLY)
+                        try:
+                            os.fsync(dfd)
+                        finally:
+                            os.close(dfd)
+                    except Exception:
+                        pass
+                except BaseException:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    raise
+            finally:
+                try:
+                    fcntl.flock(lfd, fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                os.close(lfd)
         return True, "Configuration saved successfully"
     except Exception as e:
         return False, f"Failed to save config: {e}"
@@ -280,8 +342,16 @@ _cache = {}
 _cache_lock = threading.Lock()
 
 
+SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/homebrew/bin:/opt/homebrew/sbin"
+SAFE_ENV = {
+    "PATH": SAFE_PATH,
+    "LC_ALL": "C",
+    "LANG": "C",
+}
+
+
 def sh(cmd, timeout=4, ttl=0):
-    """Run a shell-less command list; optional TTL cache for slow tools."""
+    """Run a shell-less command list with sanitized env; optional TTL cache for slow tools."""
     key = tuple(cmd)
     now = time.time()
     if ttl:
@@ -289,12 +359,24 @@ def sh(cmd, timeout=4, ttl=0):
             hit = _cache.get(key)
             if hit and now - hit[0] < ttl:
                 return hit[1]
-    if not shutil.which(cmd[0]):
+    bin_path = shutil.which(cmd[0], path=SAFE_ENV["PATH"]) or shutil.which(cmd[0])
+    if not bin_path:
         res = (127, "")
     else:
+        exec_cmd = [bin_path] + list(cmd[1:])
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            p = subprocess.run(
+                exec_cmd,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=SAFE_ENV,
+                start_new_session=True,
+            )
             res = (p.returncode, (p.stdout or "") + (p.stderr or ""))
+        except subprocess.TimeoutExpired:
+            res = (124, "Command timed out")
         except Exception:
             res = (1, "")
     if ttl:
@@ -1279,7 +1361,7 @@ def _scan_php_slowlogs():
     return results
 
 
-PHP_SERVICE_REGEX = re.compile(r"^(plesk-php\d{2}-fpm|php\d\.\d-fpm|php-fpm|ea-php\d{2}-php-fpm)(\.service)?$")
+PHP_SERVICE_REGEX = re.compile(r"\A(plesk-php\d{2}-fpm|php\d(?:\.\d+)?-fpm|php-fpm|ea-php\d{2}-php-fpm)(\.service)?\Z")
 
 
 def detect_php_services():
@@ -1349,13 +1431,13 @@ def detect_php_services():
 
 def control_php_service(service, action):
     """Safely start, stop, restart, or reload a PHP-FPM service via systemd."""
-    if not service or not PHP_SERVICE_REGEX.match(service):
+    if not service or not PHP_SERVICE_REGEX.fullmatch(service):
         return {"ok": False, "error": f"Invalid or disallowed PHP service name: {service}"}
     if action not in ("start", "stop", "restart", "reload"):
         return {"ok": False, "error": f"Invalid action: {action}. Allowed: start, stop, restart, reload"}
 
-    rc, out = sh(["systemctl", action, service], timeout=15)
-    rc_stat, out_stat = sh(["systemctl", "is-active", service], timeout=3)
+    rc, out = sh(["systemctl", action, "--", service], timeout=15)
+    rc_stat, out_stat = sh(["systemctl", "is-active", "--", service], timeout=3)
     new_state = (out_stat or "").strip() or ("active" if rc_stat == 0 else "inactive")
     
     if rc == 0:
@@ -1376,30 +1458,75 @@ def control_php_service(service, action):
         }
 
 
+def _root_trusted(path):
+    """Verifies that a script path is a regular file owned by root and writable only by root,
+    and all ancestor directories up to root are owned by root and writable only by root."""
+    try:
+        real_path = os.path.realpath(path)
+        st = os.lstat(real_path)
+        if not stat.S_ISREG(st.st_mode):
+            return False
+        if st.st_uid != 0 or (st.st_mode & 0o022):
+            return False
+        d = os.path.dirname(real_path)
+        while True:
+            dst = os.stat(d)
+            if dst.st_uid != 0 or (dst.st_mode & 0o022):
+                return False
+            parent = os.path.dirname(d)
+            if d == "/" or d == parent:
+                break
+            d = parent
+        return True
+    except Exception:
+        return False
+
+
 def control_system_action(action):
-    """Safely executes one-click server maintenance actions."""
+    """Safely executes one-click server maintenance actions without shell execution."""
+    if action == "drop_caches":
+        try:
+            sh(["sync"], timeout=5)
+            drop_path = "/proc/sys/vm/drop_caches"
+            if os.path.exists(drop_path):
+                with open(drop_path, "w") as fh:
+                    fh.write("1\n")
+            return {"ok": True, "action": action, "detail": "RAM page cache reclaimed"}
+        except Exception as e:
+            return {"ok": False, "action": action, "error": f"Failed to drop caches: {e}"}
+
+    if action == "optimize_io_memory":
+        script_path = "/opt/health-sentinel/deploy/optimize-io-memory.sh"
+        if not os.path.exists(script_path):
+            return {"ok": False, "action": action, "error": f"Script not found: {script_path}"}
+        if not _root_trusted(script_path):
+            return {"ok": False, "action": action, "error": f"Security verification failed: {script_path} must be owned by root:root and not group/world-writable"}
+        rc, out = sh([script_path], timeout=30)
+        if rc == 0:
+            return {"ok": True, "action": action, "detail": out.strip() or "Applied I/O and kernel memory optimizations"}
+        else:
+            return {"ok": False, "action": action, "error": f"Optimization script failed (rc={rc}): {out.strip()}"}
+
     allowed = {
-        "restart_mariadb": (["systemctl", "restart", "mariadb"], "MariaDB database server restarted"),
-        "restart_mysql": (["systemctl", "restart", "mysql"], "MySQL database server restarted"),
-        "restart_nginx": (["systemctl", "restart", "nginx"], "Nginx web server restarted"),
-        "restart_apache": (["systemctl", "restart", "apache2"], "Apache web server restarted"),
+        "restart_mariadb": (["systemctl", "restart", "--", "mariadb"], "MariaDB database server restarted"),
+        "restart_mysql": (["systemctl", "restart", "--", "mysql"], "MySQL database server restarted"),
+        "restart_nginx": (["systemctl", "restart", "--", "nginx"], "Nginx web server restarted"),
+        "restart_apache": (["systemctl", "restart", "--", "apache2"], "Apache web server restarted"),
         "vacuum_logs": (["journalctl", "--vacuum-size=200M"], "System journal logs trimmed to 200MB"),
-        "drop_caches": (["sh", "-c", "sync; echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true"], "RAM page cache reclaimed"),
         "reset_failed": (["systemctl", "reset-failed"], "Failed systemd unit counters reset"),
-        "optimize_io_memory": (["bash", "/opt/health-sentinel/deploy/optimize-io-memory.sh"], "Applied I/O and kernel memory optimizations"),
     }
     if action not in allowed:
         return {"ok": False, "error": f"Invalid or unauthorized system action: {action}"}
     
     cmd, success_msg = allowed[action]
     if action in ("restart_mariadb", "restart_mysql"):
-        rc, out = sh(["systemctl", "restart", "mariadb"], timeout=15)
+        rc, out = sh(["systemctl", "restart", "--", "mariadb"], timeout=15)
         if rc != 0:
-            rc, out = sh(["systemctl", "restart", "mysql"], timeout=15)
+            rc, out = sh(["systemctl", "restart", "--", "mysql"], timeout=15)
     elif action == "restart_apache":
-        rc, out = sh(["systemctl", "restart", "apache2"], timeout=15)
+        rc, out = sh(["systemctl", "restart", "--", "apache2"], timeout=15)
         if rc != 0:
-            rc, out = sh(["systemctl", "restart", "httpd"], timeout=15)
+            rc, out = sh(["systemctl", "restart", "--", "httpd"], timeout=15)
     else:
         rc, out = sh(cmd, timeout=15)
 
@@ -2678,8 +2805,11 @@ class CapacityBenchmark:
 class AuthRateLimiter:
     """
     Sliding-window authentication rate limiter preventing brute-force token attacks.
-    Blocks any client IP exceeding 5 failed token attempts in 60s for 15 minutes.
+    Blocks any client IP/subnet exceeding 5 failed token attempts in 60s for 15 minutes.
+    Thread-safe, atomic checks, normalized IPv6 (/64 subnet) & IPv4-mapped, capped memory.
     """
+    MAX_KEYS = 20000
+
     def __init__(self, max_fails=5, window_seconds=60, lockout_seconds=900):
         self.max_fails = max_fails
         self.window = window_seconds
@@ -2688,37 +2818,115 @@ class AuthRateLimiter:
         self.lockouts = {}
         self.lock = threading.Lock()
 
+    def _key(self, ip):
+        if not ip or not isinstance(ip, str):
+            return ""
+        ip_clean = ip.strip()
+        try:
+            obj = ipaddress.ip_address(ip_clean)
+            if obj.version == 6:
+                if obj.ipv4_mapped:
+                    return str(obj.ipv4_mapped)
+                net = ipaddress.ip_network(f"{obj}/64", strict=False)
+                return str(net.network_address)
+            return str(obj)
+        except Exception:
+            return ip_clean
+
+    def _sweep(self, now, force=False):
+        """Must be called while holding self.lock."""
+        if not force and len(self.failed_attempts) < 500 and len(self.lockouts) < 500:
+            return
+        exp_keys = [k for k, exp in self.lockouts.items() if now >= exp]
+        for k in exp_keys:
+            del self.lockouts[k]
+        stale_keys = [k for k, times in self.failed_attempts.items() if not times or (now - times[-1] >= self.window)]
+        for k in stale_keys:
+            del self.failed_attempts[k]
+        if len(self.failed_attempts) > self.MAX_KEYS:
+            self.failed_attempts.clear()
+        if len(self.lockouts) > self.MAX_KEYS:
+            self.lockouts.clear()
+
     def is_locked(self, ip):
-        if not ip:
+        k = self._key(ip)
+        if not k:
             return False
         now = time.time()
         with self.lock:
-            exp = self.lockouts.get(ip)
+            exp = self.lockouts.get(k)
             if exp:
                 if now < exp:
                     return True
-                else:
-                    del self.lockouts[ip]
-                    self.failed_attempts.pop(ip, None)
+                del self.lockouts[k]
+                self.failed_attempts.pop(k, None)
             return False
 
+    def begin(self, ip):
+        """
+        Atomically inspects rate-limit status and records an authentication attempt.
+        Returns True if allowed to proceed with credential check, False if locked/exceeded.
+        """
+        k = self._key(ip)
+        if not k:
+            return True
+        now = time.time()
+        with self.lock:
+            self._sweep(now)
+            exp = self.lockouts.get(k)
+            if exp:
+                if now < exp:
+                    return False
+                del self.lockouts[k]
+                self.failed_attempts.pop(k, None)
+
+            times = [t for t in self.failed_attempts.get(k, []) if now - t < self.window]
+            if len(times) >= self.max_fails:
+                self.lockouts[k] = now + self.lockout
+                self.failed_attempts[k] = times
+                return False
+
+            times.append(now)
+            self.failed_attempts[k] = times
+            if len(times) >= self.max_fails:
+                self.lockouts[k] = now + self.lockout
+                return False
+            return True
+
+    def succeed(self, ip):
+        """Rolls back the speculative attempt upon successful authentication."""
+        k = self._key(ip)
+        if not k:
+            return
+        with self.lock:
+            times = self.failed_attempts.get(k)
+            if times:
+                times.pop()
+                if not times:
+                    self.failed_attempts.pop(k, None)
+
     def record_fail(self, ip):
-        if not ip:
+        """Backward-compatibility wrapper for recording failure."""
+        k = self._key(ip)
+        if not k:
             return
         now = time.time()
         with self.lock:
-            times = [t for t in self.failed_attempts.get(ip, []) if now - t < self.window]
+            self._sweep(now)
+            times = [t for t in self.failed_attempts.get(k, []) if now - t < self.window]
             times.append(now)
-            self.failed_attempts[ip] = times
+            self.failed_attempts[k] = times
             if len(times) >= self.max_fails:
-                self.lockouts[ip] = now + self.lockout
+                self.lockouts[k] = now + self.lockout
 
     def reset(self, ip):
-        if not ip:
+        k = self._key(ip)
+        if not k:
             return
         with self.lock:
-            self.failed_attempts.pop(ip, None)
-            self.lockouts.pop(ip, None)
+            self.failed_attempts.pop(k, None)
+            self.lockouts.pop(k, None)
+
 
 AUTH_LIMITER = AuthRateLimiter()
 
@@ -2741,7 +2949,7 @@ class SecurityShield:
     def _load(self):
         try:
             if os.path.isfile(self.banned_file):
-                with open(self.banned_file) as f:
+                with open(self.banned_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     if isinstance(data, dict):
                         self.banned_ips = data
@@ -2750,143 +2958,170 @@ class SecurityShield:
 
     def _save(self):
         try:
-            os.makedirs(os.path.dirname(self.banned_file), exist_ok=True)
-            tmp = self.banned_file + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(self.banned_ips, f, indent=2)
-            os.replace(tmp, self.banned_file)
+            d = os.path.dirname(os.path.abspath(self.banned_file))
+            os.makedirs(d, exist_ok=True)
+            if hasattr(os, "geteuid") and os.geteuid() == 0:
+                try:
+                    os.chmod(d, 0o700)
+                except OSError:
+                    pass
+            fd, tmp = tempfile.mkstemp(prefix=".banned_ips-", suffix=".tmp", dir=d)
+            try:
+                os.chmod(tmp, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(self.banned_ips, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.banned_file)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
         except Exception:
             pass
 
     def _setup_firewall(self):
         try:
-            rc, _ = sh(["which", "iptables"], timeout=2)
-            if rc == 0:
+            has_ipt4 = (sh(["which", "iptables"], timeout=2)[0] == 0)
+            has_ipt6 = (sh(["which", "ip6tables"], timeout=2)[0] == 0)
+            has_fwd = (sh(["which", "firewall-cmd"], timeout=2)[0] == 0)
+
+            if has_ipt4:
                 sh(["iptables", "-N", "SENTINEL_BLOCK"], timeout=2)
-                rc_c, _ = sh(["iptables", "-C", "INPUT", "-j", "SENTINEL_BLOCK"], timeout=2)
-                if rc_c != 0:
+                if sh(["iptables", "-C", "INPUT", "-j", "SENTINEL_BLOCK"], timeout=2)[0] != 0:
                     sh(["iptables", "-I", "INPUT", "1", "-j", "SENTINEL_BLOCK"], timeout=2)
-                for ip in list(self.banned_ips.keys()):
-                    rc_chk, _ = sh(["iptables", "-C", "SENTINEL_BLOCK", "-s", ip, "-j", "DROP"], timeout=2)
-                    if rc_chk != 0:
+            if has_ipt6:
+                sh(["ip6tables", "-N", "SENTINEL_BLOCK_V6"], timeout=2)
+                if sh(["ip6tables", "-C", "INPUT", "-j", "SENTINEL_BLOCK_V6"], timeout=2)[0] != 0:
+                    sh(["ip6tables", "-I", "INPUT", "1", "-j", "SENTINEL_BLOCK_V6"], timeout=2)
+
+            for ip_str in list(self.banned_ips.keys()):
+                try:
+                    obj = ipaddress.ip_address(ip_str)
+                except ValueError:
+                    continue
+                ip = str(obj)
+                if obj.version == 4 and has_ipt4:
+                    if sh(["iptables", "-C", "SENTINEL_BLOCK", "-s", ip, "-j", "DROP"], timeout=2)[0] != 0:
                         sh(["iptables", "-I", "SENTINEL_BLOCK", "-s", ip, "-j", "DROP"], timeout=2)
-            else:
-                rc_fw, _ = sh(["which", "firewall-cmd"], timeout=2)
-                if rc_fw == 0:
-                    for ip in list(self.banned_ips.keys()):
-                        sh(["firewall-cmd", "--permanent", f"--add-rich-rule=rule family=ipv4 source address={ip} drop"], timeout=2)
-                    sh(["firewall-cmd", "--reload"], timeout=2)
+                elif obj.version == 6 and has_ipt6:
+                    if sh(["ip6tables", "-C", "SENTINEL_BLOCK_V6", "-s", ip, "-j", "DROP"], timeout=2)[0] != 0:
+                        sh(["ip6tables", "-I", "SENTINEL_BLOCK_V6", "-s", ip, "-j", "DROP"], timeout=2)
+                elif has_fwd:
+                    fam = "ipv4" if obj.version == 4 else "ipv6"
+                    sh(["firewall-cmd", "--permanent", f"--add-rich-rule=rule family={fam} source address={ip} drop"], timeout=2)
+            if has_fwd and self.banned_ips:
+                sh(["firewall-cmd", "--reload"], timeout=2)
         except Exception:
             pass
 
     def is_private_ip(self, ip):
-        if not ip:
-            return True
-        if ip.startswith("::ffff:"):
-            ip = ip[7:]
-        if ip in ("127.0.0.1", "::1", "localhost"):
-            return True
-        if ":" in ip:
-            return ip.startswith("fe80") or ip.startswith("fc") or ip.startswith("fd")
-        parts = ip.split(".")
-        if len(parts) != 4:
+        if not ip or not isinstance(ip, str):
             return True
         try:
-            p0, p1 = int(parts[0]), int(parts[1])
-            if p0 in (10, 127):
-                return True
-            if p0 == 192 and p1 == 168:
-                return True
-            if p0 == 172 and 16 <= p1 <= 31:
-                return True
+            obj = ipaddress.ip_address(ip.strip())
+            return (obj.is_private or obj.is_loopback or obj.is_link_local
+                    or obj.is_multicast or obj.is_reserved or obj.is_unspecified)
         except ValueError:
             return True
-        return False
 
     def is_valid_ip(self, ip):
         if not ip or not isinstance(ip, str):
             return False
-        ip = ip.strip()
-        if ip.startswith("::ffff:"):
-            ip = ip[7:]
         try:
-            socket.inet_aton(ip)
-            return ip.count(".") == 3
-        except socket.error:
-            pass
-        try:
-            socket.inet_pton(socket.AF_INET6, ip)
+            ipaddress.ip_address(ip.strip())
             return True
-        except (socket.error, AttributeError):
-            pass
-        return False
+        except ValueError:
+            return False
 
     def ban_ip(self, ip, reason="Manual ban via Web UI", admin_ip=None):
-        if not ip:
+        if not ip or not isinstance(ip, str):
             return False, "IP address is required."
-        ip = ip.strip()
-        if ip.startswith("::ffff:"):
-            ip = ip[7:]
-        if not self.is_valid_ip(ip):
+        try:
+            obj = ipaddress.ip_address(ip.strip())
+        except ValueError:
             return False, f"Invalid IP address format: {ip}"
-        if self.is_private_ip(ip) or ip in self.whitelist:
-            return False, f"Cannot ban private, loopback or whitelisted IP ({ip})."
+
+        norm_ip = str(obj)
+        if (obj.is_private or obj.is_loopback or obj.is_link_local
+                or obj.is_multicast or obj.is_reserved or obj.is_unspecified
+                or norm_ip in self.whitelist):
+            return False, f"Cannot ban private, loopback, reserved or whitelisted IP ({norm_ip})."
+
         if admin_ip:
-            if admin_ip.startswith("::ffff:"):
-                admin_ip = admin_ip[7:]
-            if ip == admin_ip:
-                return False, f"Safety lockout prevented: Cannot ban your own active admin IP ({ip})."
+            try:
+                admin_obj = ipaddress.ip_address(admin_ip.strip())
+                if obj == admin_obj:
+                    return False, f"Safety lockout prevented: Cannot ban your own active admin IP ({norm_ip})."
+            except ValueError:
+                pass
 
         with self.lock:
             applied = False
-            rc_ipt, _ = sh(["which", "iptables"], timeout=2)
-            if rc_ipt == 0:
-                sh(["iptables", "-N", "SENTINEL_BLOCK"], timeout=2)
-                sh(["iptables", "-C", "INPUT", "-j", "SENTINEL_BLOCK"], timeout=2)
-                rc_c, _ = sh(["iptables", "-C", "INPUT", "-j", "SENTINEL_BLOCK"], timeout=2)
-                if rc_c != 0:
-                    sh(["iptables", "-I", "INPUT", "1", "-j", "SENTINEL_BLOCK"], timeout=2)
-                sh(["iptables", "-I", "SENTINEL_BLOCK", "-s", ip, "-j", "DROP"], timeout=2)
-                applied = True
-            else:
-                rc_ufw, _ = sh(["which", "ufw"], timeout=2)
-                if rc_ufw == 0:
-                    sh(["ufw", "insert", "1", "deny", "from", ip, "to", "any"], timeout=2)
-                    applied = True
-                else:
-                    rc_fw, _ = sh(["which", "firewall-cmd"], timeout=2)
-                    if rc_fw == 0:
-                        sh(["firewall-cmd", "--permanent", f"--add-rich-rule=rule family=ipv4 source address={ip} drop"], timeout=3)
-                        sh(["firewall-cmd", "--reload"], timeout=3)
-                        applied = True
+            has_ipt4 = (sh(["which", "iptables"], timeout=2)[0] == 0)
+            has_ipt6 = (sh(["which", "ip6tables"], timeout=2)[0] == 0)
+            has_ufw = (sh(["which", "ufw"], timeout=2)[0] == 0)
+            has_fwd = (sh(["which", "firewall-cmd"], timeout=2)[0] == 0)
 
-            self.banned_ips[ip] = {
-                "ip": ip,
+            if obj.version == 4 and has_ipt4:
+                sh(["iptables", "-N", "SENTINEL_BLOCK"], timeout=2)
+                if sh(["iptables", "-C", "INPUT", "-j", "SENTINEL_BLOCK"], timeout=2)[0] != 0:
+                    sh(["iptables", "-I", "INPUT", "1", "-j", "SENTINEL_BLOCK"], timeout=2)
+                if sh(["iptables", "-C", "SENTINEL_BLOCK", "-s", norm_ip, "-j", "DROP"], timeout=2)[0] != 0:
+                    sh(["iptables", "-I", "SENTINEL_BLOCK", "-s", norm_ip, "-j", "DROP"], timeout=2)
+                applied = True
+            elif obj.version == 6 and has_ipt6:
+                sh(["ip6tables", "-N", "SENTINEL_BLOCK_V6"], timeout=2)
+                if sh(["ip6tables", "-C", "INPUT", "-j", "SENTINEL_BLOCK_V6"], timeout=2)[0] != 0:
+                    sh(["ip6tables", "-I", "INPUT", "1", "-j", "SENTINEL_BLOCK_V6"], timeout=2)
+                if sh(["ip6tables", "-C", "SENTINEL_BLOCK_V6", "-s", norm_ip, "-j", "DROP"], timeout=2)[0] != 0:
+                    sh(["ip6tables", "-I", "SENTINEL_BLOCK_V6", "-s", norm_ip, "-j", "DROP"], timeout=2)
+                applied = True
+            elif has_ufw:
+                sh(["ufw", "insert", "1", "deny", "from", norm_ip, "to", "any"], timeout=2)
+                applied = True
+            elif has_fwd:
+                fam = "ipv4" if obj.version == 4 else "ipv6"
+                sh(["firewall-cmd", "--permanent", f"--add-rich-rule=rule family={fam} source address={norm_ip} drop"], timeout=3)
+                sh(["firewall-cmd", "--reload"], timeout=3)
+                applied = True
+
+            self.banned_ips[norm_ip] = {
+                "ip": norm_ip,
                 "reason": reason,
                 "banned_at": int(time.time()),
                 "date": datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S"),
                 "firewall_applied": applied
             }
             self._save()
-            return True, f"IP {ip} successfully banned."
+            return True, f"IP {norm_ip} successfully banned."
 
     def unban_ip(self, ip):
-        if not ip:
+        if not ip or not isinstance(ip, str):
             return False, "IP address is required."
-        ip = ip.strip()
-        if ip.startswith("::ffff:"):
-            ip = ip[7:]
+        try:
+            obj = ipaddress.ip_address(ip.strip())
+            norm_ip = str(obj)
+        except ValueError:
+            norm_ip = ip.strip()
+            obj = None
 
         with self.lock:
-            sh(["iptables", "-D", "SENTINEL_BLOCK", "-s", ip, "-j", "DROP"], timeout=2)
-            sh(["ufw", "delete", "deny", "from", ip, "to", "any"], timeout=2)
-            sh(["firewall-cmd", "--permanent", f"--remove-rich-rule=rule family=ipv4 source address={ip} drop"], timeout=3)
+            if obj and obj.version == 6:
+                sh(["ip6tables", "-D", "SENTINEL_BLOCK_V6", "-s", norm_ip, "-j", "DROP"], timeout=2)
+                sh(["firewall-cmd", "--permanent", f"--remove-rich-rule=rule family=ipv6 source address={norm_ip} drop"], timeout=3)
+            else:
+                sh(["iptables", "-D", "SENTINEL_BLOCK", "-s", norm_ip, "-j", "DROP"], timeout=2)
+                sh(["firewall-cmd", "--permanent", f"--remove-rich-rule=rule family=ipv4 source address={norm_ip} drop"], timeout=3)
+            sh(["ufw", "delete", "deny", "from", norm_ip, "to", "any"], timeout=2)
             sh(["firewall-cmd", "--reload"], timeout=3)
-            if ip in self.banned_ips:
-                del self.banned_ips[ip]
+            if norm_ip in self.banned_ips:
+                del self.banned_ips[norm_ip]
                 self._save()
-                return True, f"IP {ip} successfully unbanned."
-            return False, f"IP {ip} was not in banned list."
+                return True, f"IP {norm_ip} successfully unbanned."
+            return False, f"IP {norm_ip} was not in banned list."
 
     def list_banned(self):
         with self.lock:
@@ -3282,38 +3517,47 @@ class LicenseManager:
         self.secret = os.environ.get("SENTINEL_LICENSE_SECRET", secret)
         self.lock = threading.Lock()
 
+    KEY_RE = re.compile(r'\AHS-(pro|agency)-([A-Za-z0-9_-]{1,512})-([0-9a-fA-F]{16,64})\Z', re.IGNORECASE)
+
     def verify_key(self, key_str):
         if not key_str or not isinstance(key_str, str):
             return {"valid": False, "error": "No license key provided", "tier": "community"}
         key_str = key_str.strip()
-        parts = key_str.split("-")
-        if len(parts) < 4 or parts[0] != "HS":
+        m = self.KEY_RE.match(key_str)
+        if not m:
             return {"valid": False, "error": "Invalid license key format", "tier": "community"}
-        tier = parts[1].lower()
-        if tier not in ("pro", "agency"):
-            return {"valid": False, "error": f"Unknown tier: {tier}", "tier": "community"}
-        payload_b64 = parts[2]
-        provided_sig = parts[3].upper()
+        tier = m.group(1).lower()
+        payload_b64 = m.group(2)
+        provided_sig = m.group(3).lower()
 
-        expected_sig = hmac.new(self.secret.encode(), f"{tier}.{payload_b64}".encode(), hashlib.sha256).hexdigest()[:16].upper()
-        if not hmac.compare_digest(provided_sig, expected_sig):
-            return {"valid": False, "error": "Cryptographic signature mismatch (invalid key)", "tier": "community"}
+        full_expected = hmac.new(self.secret.encode(), f"{tier}.{payload_b64}".encode(), hashlib.sha256).hexdigest().lower()
+        if len(provided_sig) == 64:
+            if not hmac.compare_digest(provided_sig, full_expected):
+                return {"valid": False, "error": "Cryptographic signature mismatch (invalid key)", "tier": "community"}
+        elif len(provided_sig) == 16:
+            if not hmac.compare_digest(provided_sig, full_expected[:16]):
+                return {"valid": False, "error": "Cryptographic signature mismatch (invalid key)", "tier": "community"}
+        else:
+            return {"valid": False, "error": "Invalid signature length", "tier": "community"}
 
         try:
             rem = len(payload_b64) % 4
             padded = payload_b64 + ('=' * ((4 - rem) % 4))
-            payload = json.loads(base64.urlsafe_b64decode(padded.encode()).decode())
+            payload = json.loads(base64.urlsafe_b64decode(padded.encode()).decode("utf-8"))
         except Exception as e:
             return {"valid": False, "error": f"Malformed payload: {e}", "tier": "community"}
+
+        if not isinstance(payload, dict):
+            return {"valid": False, "error": "Invalid payload structure", "tier": "community"}
 
         expires = payload.get("expires")
         if expires:
             try:
-                exp_dt = datetime.strptime(expires, "%Y-%m-%d").date()
+                exp_dt = datetime.strptime(str(expires).strip(), "%Y-%m-%d").date()
                 if datetime.now(timezone.utc).date() > exp_dt:
                     return {"valid": False, "error": f"License expired on {expires}", "tier": "community", "expired": True}
-            except Exception:
-                pass
+            except Exception as e:
+                return {"valid": False, "error": f"Malformed expiry date: {e}", "tier": "community"}
 
         return {
             "valid": True,
@@ -6995,12 +7239,37 @@ FAVICON = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
 <path d="M9.4 12.2l1.8 1.8 3.6-4" fill="none" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/></svg>"""
 
 
+HEX_COLOR_RE = re.compile(r'\A#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})\Z')
+URL_RE = re.compile(r'\A(?:https?://[^\s<>"{}|\\^`]+|/[a-zA-Z0-9_\-./]+)\Z')
+EMAIL_RE = re.compile(r'\A[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+\Z')
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = f"HealthSentinel/{VERSION}"
+    timeout = 10
+    protocol_version = "HTTP/1.1"
+    MAX_BODY = 64 * 1024
     engine: Engine = None
     alerts: AlertManager = None
     cfg: dict = None
     cfg_path: str = None
+
+    ALLOWED_GET_ROUTES = {
+        "/favicon.svg", "/", "/index.html", "/api/branding", "/api/license",
+        "/api/fleet", "/api/health", "/api/visitors", "/api/benchmark",
+        "/api/benchmark/capacity", "/api/security/banned", "/api/sites",
+        "/api/server-doctor", "/api/report/html", "/api/auto-heal",
+        "/api/history", "/api/incidents", "/api/php-services", "/metrics"
+    }
+
+    ALLOWED_POST_ROUTES = {
+        "/api/branding", "/api/benchmark/run", "/api/benchmark/capacity/run",
+        "/api/benchmark/capacity/stop", "/api/security/ban", "/api/security/unban",
+        "/api/sites/check", "/api/sites/add", "/api/sites/remove", "/api/scan",
+        "/api/auto-heal/toggle", "/api/php-action", "/api/system-action",
+        "/api/test-alert", "/api/license/activate", "/api/fleet/add",
+        "/api/fleet/remove", "/api/fleet/poll"
+    }
 
     def log_message(self, *a):
         pass
@@ -7011,19 +7280,50 @@ class Handler(BaseHTTPRequestHandler):
             return self.client_address[0]
         return "127.0.0.1"
 
+    def _check_origin(self):
+        """Validates Origin and Referer against Host header on state-modifying requests."""
+        host = (self.headers.get("Host") or "").lower()
+        if not host:
+            return False
+        origin = self.headers.get("Origin")
+        if origin:
+            try:
+                parsed = urllib.parse.urlparse(origin)
+                orig_host = (parsed.netloc or parsed.path).lower()
+                if orig_host and orig_host != host:
+                    return False
+            except Exception:
+                return False
+            return True
+        referer = self.headers.get("Referer")
+        if referer:
+            try:
+                ref_host = urllib.parse.urlparse(referer).netloc.lower()
+                if ref_host and ref_host != host:
+                    return False
+            except Exception:
+                return False
+        return True
+
     def _auth_role(self):
         """
         Returns (role, err_code) where role is 'admin', 'viewer', or None.
-        err_code is None, 401, or 429.
-        Enforces anti-brute-force rate limiting (AUTH_LIMITER) and constant-time token comparison.
+        err_code is None, 401, 429, or 503.
+        Fail-closed: requires admin_token with len >= 32.
+        Constant-time comparisons, atomic rate limiting, and ASCII safe decoding.
         """
-        web_cfg = self.cfg.get("web", {}) if self.cfg else {}
+        web_cfg = (self.cfg or {}).get("web", {}) or {}
         admin_tok = (web_cfg.get("admin_token") or web_cfg.get("token") or "").strip()
         view_tok = (web_cfg.get("view_token") or "").strip()
 
-        # If no tokens configured at all, grant admin access
-        if not admin_tok and not view_tok:
-            return ("admin", None)
+        # C1: Fail closed if admin token missing or shorter than 32 chars
+        if not admin_tok or len(admin_tok) < 32:
+            return (None, 503)
+
+        # C1: If view_tok is configured, ensure >= 32 chars and distinct from admin_tok
+        if view_tok:
+            if len(view_tok) < 32 or hmac.compare_digest(admin_tok, view_tok):
+                return (None, 503)
 
         ip = self._client_ip()
         if AUTH_LIMITER.is_locked(ip):
@@ -7038,20 +7338,30 @@ class Handler(BaseHTTPRequestHandler):
         if not req_token:
             return (None, 401)
 
-        # Check admin token
-        if admin_tok and hmac.compare_digest(req_token, admin_tok):
-            AUTH_LIMITER.reset(ip)
+        # H4: Atomic speculative attempt
+        if not AUTH_LIMITER.begin(ip):
+            return (None, 429)
+
+        # H1: Strict ASCII encoding to prevent crash or latin-1 bypass
+        try:
+            req_bytes = req_token.encode("ascii", "strict")
+            admin_bytes = admin_tok.encode("ascii", "strict")
+        except UnicodeEncodeError:
+            return (None, 401)
+
+        if hmac.compare_digest(req_bytes, admin_bytes):
+            AUTH_LIMITER.succeed(ip)
             return ("admin", None)
 
-        # Check viewer token
-        if view_tok and hmac.compare_digest(req_token, view_tok):
-            AUTH_LIMITER.reset(ip)
-            return ("viewer", None)
+        if view_tok:
+            try:
+                view_bytes = view_tok.encode("ascii", "strict")
+                if hmac.compare_digest(req_bytes, view_bytes):
+                    AUTH_LIMITER.succeed(ip)
+                    return ("viewer", None)
+            except UnicodeEncodeError:
+                pass
 
-        # Failed attempt
-        AUTH_LIMITER.record_fail(ip)
-        if AUTH_LIMITER.is_locked(ip):
-            return (None, 429)
         return (None, 401)
 
     def _authed(self):
@@ -7105,17 +7415,24 @@ class Handler(BaseHTTPRequestHandler):
 
     # ── routes ──
     def do_GET(self):
-        path = urllib.parse.urlparse(self.path).path
-        if path == "/favicon.svg":
+        raw_path = urllib.parse.urlparse(self.path).path
+        norm_path = posixpath.normpath(raw_path)
+
+        if norm_path not in self.ALLOWED_GET_ROUTES:
+            return self._send(404, {"error": "not found"})
+
+        if norm_path == "/favicon.svg":
             return self._send(200, FAVICON, "image/svg+xml")
 
         role, err = self._auth_role()
+        if err == 503:
+            return self._send(503, {"error": "Service Unavailable: admin_token must be configured and at least 32 characters."})
         if err == 429:
             return self._send(429, {"error": "Too many failed authentication attempts. Locked out for 15 minutes."})
         if err == 401:
             return self._send(401, {"error": "unauthorized"})
 
-        if path in ("/", "/index.html"):
+        if norm_path in ("/", "/index.html"):
             channels = [n for n, c in self.cfg["alerts"].items()
                         if isinstance(c, dict) and c.get("enabled")]
             boot = {"interval": self.cfg["scan_interval"],
@@ -7126,29 +7443,29 @@ class Handler(BaseHTTPRequestHandler):
                     "license": self.engine.license_manager.get_status()}
             page = HTML_PAGE.replace("__BOOTSTRAP__", json.dumps(boot)).replace("__VER__", VERSION).replace("__UPDATED__", UPDATED)
             return self._send(200, page, "text/html; charset=utf-8")
-        if path == "/api/branding":
+        if norm_path == "/api/branding":
             return self._send(200, self.cfg.get("branding", {}))
-        if path == "/api/license":
+        if norm_path == "/api/license":
             return self._send(200, self.engine.license_manager.get_status())
-        if path == "/api/fleet":
+        if norm_path == "/api/fleet":
             return self._send(200, self.engine.fleet_manager.get_summary())
-        if path == "/api/health":
+        if norm_path == "/api/health":
             return self._send(200, self._payload(role=role))
-        if path == "/api/visitors":
+        if norm_path == "/api/visitors":
             return self._send(200, self.engine.visitor_tracker.scan(force=True))
-        if path == "/api/benchmark":
+        if norm_path == "/api/benchmark":
             return self._send(200, self.engine.benchmark_engine.last_result or {"status": "none"})
-        if path == "/api/benchmark/capacity":
+        if norm_path == "/api/benchmark/capacity":
             return self._send(200, self.engine.capacity_benchmark.get_status())
-        if path == "/api/security/banned":
+        if norm_path == "/api/security/banned":
             return self._send(200, {"banned_ips": self.engine.security_shield.list_banned()})
-        if path == "/api/sites":
+        if norm_path == "/api/sites":
             return self._send(200, self.engine.site_monitor.get_summary())
-        if path == "/api/server-doctor":
+        if norm_path == "/api/server-doctor":
             with self.engine.lock:
                 rep = self.engine.report or self.engine.scan()
             return self._send(200, generate_server_doctor(rep))
-        if path == "/api/report/html":
+        if norm_path == "/api/report/html":
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             branding_override = dict(self.cfg.get("branding", {}))
             if "agency" in q:
@@ -7161,40 +7478,58 @@ class Handler(BaseHTTPRequestHandler):
                 rep = self.engine.report or self.engine.scan()
             html = generate_executive_html(rep, self.engine.history, branding_override, self.engine.healing_history)
             return self._send(200, html, "text/html; charset=utf-8")
-        if path == "/api/auto-heal":
+        if norm_path == "/api/auto-heal":
             return self._send(200, {
                 "enabled": self.engine.auto_healer.cfg.get("enabled", True),
                 "dry_run": self.engine.auto_healer.cfg.get("dry_run", False),
                 "cooldown_minutes": self.engine.auto_healer.cfg.get("cooldown_minutes", 15),
                 "history": list(self.engine.healing_history)
             })
-        if path == "/api/history":
+        if norm_path == "/api/history":
             return self._send(200, {"history": list(self.engine.history)})
-        if path == "/api/incidents":
+        if norm_path == "/api/incidents":
             return self._send(200, {"incidents": list(self.engine.incidents.recent_incidents)})
-        if path == "/api/php-services":
+        if norm_path == "/api/php-services":
             return self._send(200, {"services": detect_php_services()})
-        if path == "/metrics":
+        if norm_path == "/metrics":
             return self._send(200, prometheus(self.engine), "text/plain; version=0.0.4")
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        role, err = self._auth_role()
-        if err == 429:
-            return self._send(429, {"error": "Too many failed authentication attempts. Locked out for 15 minutes."})
-        if err == 401:
-            return self._send(401, {"error": "unauthorized"})
+        raw_path = urllib.parse.urlparse(self.path).path
+        norm_path = posixpath.normpath(raw_path)
 
-        path = urllib.parse.urlparse(self.path).path
-        if role != "admin" and path != "/api/sites/check":
+        if norm_path not in self.ALLOWED_POST_ROUTES:
+            return self._send(404, {"error": "not found"})
+
+        if not self._check_origin():
+            return self._send(403, {"ok": False, "error": "Cross-origin request rejected: Origin/Referer does not match Host."})
+
+        role, err = self._auth_role()
+        if err == 503:
+            return self._send(503, {"ok": False, "error": "Service Unavailable: admin_token must be configured and at least 32 characters."})
+        if err == 429:
+            return self._send(429, {"ok": False, "error": "Too many failed authentication attempts. Locked out for 15 minutes."})
+        if err == 401:
+            return self._send(401, {"ok": False, "error": "unauthorized"})
+
+        if role != "admin" and norm_path != "/api/sites/check":
             return self._send(403, {"ok": False, "error": "Forbidden: View-only role cannot execute administrative actions."})
-        data_bytes = b""
+
+        cl_hdr = self.headers.get("Content-Length")
         try:
-            n = int(self.headers.get("Content-Length") or 0)
-            data_bytes = self.rfile.read(n)
-        except Exception:
-            pass
-        if path == "/api/branding":
+            n = int(cl_hdr) if cl_hdr else 0
+            if n < 0:
+                return self._send(400, {"ok": False, "error": "Invalid Content-Length"})
+            if n > self.MAX_BODY:
+                return self._send(413, {"ok": False, "error": f"Payload Too Large (max {self.MAX_BODY} bytes)"})
+            data_bytes = self.rfile.read(n) if n > 0 else b""
+        except ValueError:
+            return self._send(400, {"ok": False, "error": "Invalid Content-Length header"})
+        except Exception as e:
+            return self._send(400, {"ok": False, "error": f"Failed reading request body: {e}"})
+
+        if norm_path == "/api/branding":
             try:
                 body = json.loads(data_bytes.decode() or "{}")
             except Exception as e:
@@ -7207,7 +7542,17 @@ class Handler(BaseHTTPRequestHandler):
                     if key == "white_label":
                         current_branding[key] = bool(body[key])
                     else:
-                        current_branding[key] = str(body[key]).strip()
+                        val = str(body[key]).strip()[:512]
+                        if key in ("primary_color", "accent_color"):
+                            if val and not HEX_COLOR_RE.match(val):
+                                return self._send(400, {"ok": False, "error": f"Invalid hex color for {key}: {val}"})
+                        elif key in ("logo_url", "support_url"):
+                            if val and not URL_RE.match(val):
+                                return self._send(400, {"ok": False, "error": f"Invalid URL format for {key}"})
+                        elif key == "support_email":
+                            if val and not EMAIL_RE.match(val):
+                                return self._send(400, {"ok": False, "error": f"Invalid email format for {key}"})
+                        current_branding[key] = val
             if "company_name" in body and "agency_name" not in body:
                 current_branding["agency_name"] = current_branding["company_name"]
             elif "agency_name" in body and "company_name" not in body:
@@ -7220,11 +7565,11 @@ class Handler(BaseHTTPRequestHandler):
                 "message": msg,
                 "branding": current_branding
             })
-        if path == "/api/benchmark/run":
+        if norm_path == "/api/benchmark/run":
             res = self.engine.benchmark_engine.run()
             self.engine._save_state()
             return self._send(200, {"ok": True, "result": res})
-        if path == "/api/benchmark/capacity/run":
+        if norm_path == "/api/benchmark/capacity/run":
             try:
                 body = json.loads(data_bytes.decode() or "{}")
             except Exception:
@@ -7233,10 +7578,10 @@ class Handler(BaseHTTPRequestHandler):
             mode = body.get("mode", "quick")
             res = self.engine.capacity_benchmark.start(target_url=target, mode=mode)
             return self._send(200 if res.get("ok") else 400, res)
-        if path == "/api/benchmark/capacity/stop":
+        if norm_path == "/api/benchmark/capacity/stop":
             res = self.engine.capacity_benchmark.stop()
             return self._send(200, res)
-        if path == "/api/security/ban":
+        if norm_path == "/api/security/ban":
             try:
                 body = json.loads(data_bytes.decode() or "{}")
             except Exception as e:
@@ -7250,7 +7595,7 @@ class Handler(BaseHTTPRequestHandler):
                 "message": msg,
                 "banned_ips": self.engine.security_shield.list_banned()
             })
-        if path == "/api/security/unban":
+        if norm_path == "/api/security/unban":
             try:
                 body = json.loads(data_bytes.decode() or "{}")
             except Exception as e:
@@ -7262,10 +7607,10 @@ class Handler(BaseHTTPRequestHandler):
                 "message": msg,
                 "banned_ips": self.engine.security_shield.list_banned()
             })
-        if path == "/api/sites/check":
+        if norm_path == "/api/sites/check":
             summary = self.engine.site_monitor.check_all(force=True)
             return self._send(200, {"ok": True, "sites": summary})
-        if path == "/api/sites/add":
+        if norm_path == "/api/sites/add":
             try:
                 body = json.loads(data_bytes.decode() or "{}")
             except Exception as e:
@@ -7277,7 +7622,7 @@ class Handler(BaseHTTPRequestHandler):
                 "message": msg,
                 "sites": self.engine.site_monitor.get_summary()
             })
-        if path == "/api/sites/remove":
+        if norm_path == "/api/sites/remove":
             try:
                 body = json.loads(data_bytes.decode() or "{}")
             except Exception as e:
@@ -7289,12 +7634,12 @@ class Handler(BaseHTTPRequestHandler):
                 "message": msg,
                 "sites": self.engine.site_monitor.get_summary()
             })
-        if path == "/api/scan":
+        if norm_path == "/api/scan":
             rep = self.engine.scan(force=True)
             if self.alerts:
                 self.alerts.process(rep)
             return self._send(200, self._payload())
-        if path == "/api/auto-heal/toggle":
+        if norm_path == "/api/auto-heal/toggle":
             try:
                 body = json.loads(data_bytes.decode() or "{}")
             except Exception:
@@ -7308,7 +7653,7 @@ class Handler(BaseHTTPRequestHandler):
                 "enabled": self.engine.auto_healer.cfg.get("enabled", True),
                 "dry_run": self.engine.auto_healer.cfg.get("dry_run", False)
             })
-        if path == "/api/php-action":
+        if norm_path == "/api/php-action":
             try:
                 body = json.loads(data_bytes.decode() or "{}")
             except Exception as e:
@@ -7329,7 +7674,7 @@ class Handler(BaseHTTPRequestHandler):
             res = control_php_service(service, action)
             code = 200 if res.get("ok") else 500
             return self._send(code, res)
-        if path == "/api/system-action":
+        if norm_path == "/api/system-action":
             try:
                 body = json.loads(data_bytes.decode() or "{}")
             except Exception as e:
@@ -7339,7 +7684,7 @@ class Handler(BaseHTTPRequestHandler):
             res = control_system_action(action)
             code = 200 if res.get("ok") else 500
             return self._send(code, res)
-        if path == "/api/test-alert":
+        if norm_path == "/api/test-alert":
             rep = self.engine.report or self.engine.scan()
             chans = [n for n, c in self.cfg["alerts"].items()
                      if isinstance(c, dict) and c.get("enabled")]
@@ -7348,7 +7693,7 @@ class Handler(BaseHTTPRequestHandler):
             results = self.alerts.test_dispatch(rep)
             any_ok = any(v.get("ok") for v in results.values())
             return self._send(200, {"ok": any_ok, "results": results, "detail": ", ".join(f"{k}: {'ok' if v.get('ok') else 'err'}" for k, v in results.items())})
-        if path == "/api/license/activate":
+        if norm_path == "/api/license/activate":
             try:
                 body = json.loads(data_bytes.decode() or "{}")
             except Exception as e:
@@ -7361,7 +7706,7 @@ class Handler(BaseHTTPRequestHandler):
                 "message": msg,
                 "license": self.engine.license_manager.get_status()
             })
-        if path == "/api/fleet/add":
+        if norm_path == "/api/fleet/add":
             try:
                 body = json.loads(data_bytes.decode() or "{}")
             except Exception as e:
@@ -7377,7 +7722,7 @@ class Handler(BaseHTTPRequestHandler):
                 "message": msg,
                 "fleet": self.engine.fleet_manager.get_summary()
             })
-        if path == "/api/fleet/remove":
+        if norm_path == "/api/fleet/remove":
             try:
                 body = json.loads(data_bytes.decode() or "{}")
             except Exception as e:
@@ -7390,7 +7735,7 @@ class Handler(BaseHTTPRequestHandler):
                 "message": msg,
                 "fleet": self.engine.fleet_manager.get_summary()
             })
-        if path == "/api/fleet/poll":
+        if norm_path == "/api/fleet/poll":
             summary = self.engine.fleet_manager.poll_all(force=True)
             return self._send(200, {"ok": True, "fleet": summary})
         return self._send(404, {"error": "not found"})
@@ -7569,11 +7914,25 @@ def main():
         except KeyboardInterrupt:
             return 0
 
+    web_cfg = cfg.setdefault("web", {})
+    admin_tok = (web_cfg.get("admin_token") or web_cfg.get("token") or "").strip()
+    if not admin_tok or len(admin_tok) < 32:
+        new_token = "adm_" + secrets.token_urlsafe(24)
+        web_cfg["admin_token"] = new_token
+        web_cfg["token"] = new_token
+        if args.config and os.path.exists(os.path.dirname(os.path.abspath(args.config))):
+            try:
+                save_config_section(args.config, "web", web_cfg)
+            except Exception:
+                pass
+        print(f"[sentinel] Generated secure 36-char admin token: {new_token}")
+
     Handler.engine, Handler.alerts, Handler.cfg, Handler.cfg_path = engine, alerts, cfg, args.config
     srv = ThreadingHTTPServer((cfg["web"]["bind"], cfg["web"]["port"]), Handler)
+    active_tok = cfg["web"].get("admin_token") or cfg["web"].get("token")
     url = f"http://{cfg['web']['bind']}:{cfg['web']['port']}"
-    if cfg["web"].get("token"):
-        url += "?token=" + cfg["web"]["token"]
+    if active_tok:
+        url += "?token=" + active_tok
     print(f"\n  🛡  Linux Health Sentinel v{VERSION}\n  ▸ dashboard  {url}\n"
           f"  ▸ metrics    {url.split('?')[0]}/metrics\n"
           f"  ▸ incidents  {url.split('?')[0]}/api/incidents\n"

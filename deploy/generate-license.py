@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Linux Health Sentinel — Commercial License Generator
-Version: 2.2.4 (updated 2026-09-13 18:35)
+Version: 2.2.5 (updated 2026-09-13 19:10)
 
 Generates tamper-proof cryptographic license keys for Sentinel Pro and Agency tiers.
 Usage:
@@ -45,7 +45,7 @@ def generate_key(tier: str, email: str, nodes: int = 1, days: int = None, secret
     payload_json = json.dumps(payload, separators=(',', ':'), sort_keys=True)
     payload_b64 = base64.urlsafe_b64encode(payload_json.encode()).decode().rstrip('=')
 
-    sig = hmac.new(secret.encode(), f"{tier}.{payload_b64}".encode(), hashlib.sha256).hexdigest()[:16].upper()
+    sig = hmac.new(secret.encode(), f"{tier}.{payload_b64}".encode(), hashlib.sha256).hexdigest().upper()
     license_key = f"HS-{tier.upper()}-{payload_b64}-{sig}"
 
     return {
