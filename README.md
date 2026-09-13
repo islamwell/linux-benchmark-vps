@@ -269,6 +269,27 @@ Monitor active web visitors to your server in real time:
 
 ---
 
+## 🛡️ 1-Click IP Ban & Bad-Bot Firewall Shield
+
+Safeguard your server against aggressive scrapers, WordPress attackers, and exploit scanners:
+* **Automatic Threat Classification**: Detects WordPress brute-force probes (`/wp-login.php`, `xmlrpc.php`), sensitive credential scans (`/.env`, `/.git/`, `phpmyadmin`), and high-frequency error flooding.
+* **1-Click IP Drop**: Instant `🚫 Ban IP` button right inside the Live Visitors table that drops the attacking IP via `iptables` or `ufw`.
+* **Lockout Prevention**: Strictly protects private subnets (`127.0.0.1`, `10.*`, `192.168.*`) and dynamically whitelist protects your own active admin IP so you can never accidentally lock yourself out.
+* **Firewall Manager**: Inspect and manage blocked IPs directly from the dashboard with 1-click unban.
+
+---
+
+## 🌐 Multi-Site Uptime & Response Speed Monitor
+
+Track the speed and availability of all client websites and virtual hosts hosted on your VPS:
+* **Automatic Local Discovery**: Scans Plesk vhosts (`/var/www/vhosts/`), Nginx configs (`sites-enabled`), and Apache vhosts automatically.
+* **Millisecond Precision**: Measures real-time round-trip HTTP response latency (e.g. `⚡ 120ms` vs `🐢 3,400ms`).
+* **HTTP Status Code Verification**: Alerts if a site returns `500 Server Error`, `502 Bad Gateway`, or connection timeouts.
+* **SSL Expiration Countdown**: Monitors TLS/SSL peer certificates and calculates remaining validity days (`🔒 SSL: 68d left`), warning before certificates expire.
+* **Custom Domain Support**: Add, test, and remove custom domains or API endpoints on the fly.
+
+---
+
 ## ⚡ Built-in Safe VPS Hardware Benchmark Engine
 
 Benchmark your VPS performance on demand without external dependencies:
@@ -328,5 +349,5 @@ sudo /opt/health-sentinel/deploy/optimize-io-memory.sh
 ---
 
 ## 📜 Versioning
-Current Version: **v1.8.0 (updated 2026-09-10 17:51)**
+Current Version: **v1.9.0 (updated 2026-09-13 06:00)**
 

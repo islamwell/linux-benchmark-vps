@@ -13,6 +13,7 @@
 """
 
 import argparse
+import concurrent.futures
 import glob
 import json
 import os
@@ -36,8 +37,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.8.0"
-UPDATED = "2026-09-10 17:51"
+VERSION = "1.9.0"
+UPDATED = "2026-09-13 06:00"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -160,6 +161,19 @@ DEFAULTS = {
         "auto_run_on_start": False,
         "disk_test_file": "/tmp/sentinel_bench.tmp",
         "disk_test_mb": 64
+    },
+    "security_shield": {
+        "enabled": True,
+        "firewall_backend": "auto",
+        "auto_flag_scanners": True,
+        "whitelist_ips": ["127.0.0.1", "::1"]
+    },
+    "site_monitor": {
+        "enabled": True,
+        "check_interval_seconds": 60,
+        "timeout_seconds": 5,
+        "auto_discover_local_vhosts": True,
+        "custom_sites": []
     }
 }
 
@@ -1748,8 +1762,9 @@ def flag_emoji(cc):
 
 
 class VisitorTracker:
-    def __init__(self, cfg):
+    def __init__(self, cfg, security_shield=None):
         self.cfg = cfg.get("visitors", {})
+        self.security_shield = security_shield
         self.geo_cache = {}
         self.last_geo_lookup = 0.0
         self.lock = threading.Lock()
@@ -1920,6 +1935,15 @@ class VisitorTracker:
                 elif "Safari" in ua_raw: device = "Safari"
                 elif "Bot" in ua_raw or "bot" in ua_raw or "Spider" in ua_raw: device = "Web Crawler"
 
+                threat_info = self.security_shield.analyze_visitor_threat({
+                    "ip": ip,
+                    "path": stats["last_path"],
+                    "code": stats["last_code"],
+                    "hits": stats["count"]
+                }) if self.security_shield else {
+                    "level": "clean", "label": "🟢 Clean", "color": "var(--ok)", "reason": "Normal browsing activity", "is_banned": False
+                }
+
                 visitors_list.append({
                     "ip": ip,
                     "flag": geo.get("flag", "🌐"),
@@ -1930,7 +1954,8 @@ class VisitorTracker:
                     "path": stats["last_path"],
                     "code": stats["last_code"],
                     "hits": stats["count"],
-                    "device": device
+                    "device": device,
+                    "threat": threat_info
                 })
 
             top_paths = sorted(path_counts.items(), key=lambda x: -x[1])[:8]
@@ -1939,6 +1964,9 @@ class VisitorTracker:
                 "live_connections": len(live_conn_ips),
                 "active_visitors_5m": max(len(live_conn_ips), len(visitors_list)),
                 "active_visitors_15m": len(ip_stats),
+                "threat_count": sum(1 for v in visitors_list if v.get("threat", {}).get("level") in ("threat_high", "threat_med")),
+                "banned_count": len(self.security_shield.banned_ips) if self.security_shield else 0,
+                "banned_ips": self.security_shield.list_banned() if self.security_shield else [],
                 "requests_per_second": round(len(log_entries) / 60.0, 1) if log_entries else round(len(live_conn_ips) * 0.4, 1),
                 "status_codes": status_codes,
                 "top_paths": [{"path": p, "hits": h} for p, h in top_paths],
@@ -2139,6 +2167,457 @@ class BenchmarkEngine:
             return round((time.time() - t0) * 1000.0, 1)
         except Exception:
             return 99.9
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SECURITY SHIELD (1-Click Firewall IP Banning & Threat Detection)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SecurityShield:
+    def __init__(self, cfg, state_dir="/var/lib/health-sentinel"):
+        self.cfg = cfg.get("security_shield", {})
+        self.state_dir = state_dir
+        self.banned_file = os.path.join(state_dir, "banned_ips.json")
+        self.banned_ips = {}
+        self.lock = threading.Lock()
+        self.whitelist = set(self.cfg.get("whitelist_ips", ["127.0.0.1", "::1"]))
+        self._load()
+        self._setup_firewall()
+
+    def _load(self):
+        try:
+            if os.path.isfile(self.banned_file):
+                with open(self.banned_file) as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        self.banned_ips = data
+        except Exception:
+            pass
+
+    def _save(self):
+        try:
+            os.makedirs(os.path.dirname(self.banned_file), exist_ok=True)
+            tmp = self.banned_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.banned_ips, f, indent=2)
+            os.replace(tmp, self.banned_file)
+        except Exception:
+            pass
+
+    def _setup_firewall(self):
+        try:
+            rc, _ = sh(["which", "iptables"], timeout=2)
+            if rc == 0:
+                sh(["iptables", "-N", "SENTINEL_BLOCK"], timeout=2)
+                rc_c, _ = sh(["iptables", "-C", "INPUT", "-j", "SENTINEL_BLOCK"], timeout=2)
+                if rc_c != 0:
+                    sh(["iptables", "-I", "INPUT", "1", "-j", "SENTINEL_BLOCK"], timeout=2)
+                for ip in list(self.banned_ips.keys()):
+                    rc_chk, _ = sh(["iptables", "-C", "SENTINEL_BLOCK", "-s", ip, "-j", "DROP"], timeout=2)
+                    if rc_chk != 0:
+                        sh(["iptables", "-I", "SENTINEL_BLOCK", "-s", ip, "-j", "DROP"], timeout=2)
+        except Exception:
+            pass
+
+    def is_private_ip(self, ip):
+        if not ip:
+            return True
+        if ip.startswith("::ffff:"):
+            ip = ip[7:]
+        if ip in ("127.0.0.1", "::1", "localhost"):
+            return True
+        if ":" in ip:
+            return ip.startswith("fe80") or ip.startswith("fc") or ip.startswith("fd")
+        parts = ip.split(".")
+        if len(parts) != 4:
+            return True
+        try:
+            p0, p1 = int(parts[0]), int(parts[1])
+            if p0 in (10, 127):
+                return True
+            if p0 == 192 and p1 == 168:
+                return True
+            if p0 == 172 and 16 <= p1 <= 31:
+                return True
+        except ValueError:
+            return True
+        return False
+
+    def is_valid_ip(self, ip):
+        if not ip or not isinstance(ip, str):
+            return False
+        ip = ip.strip()
+        if ip.startswith("::ffff:"):
+            ip = ip[7:]
+        try:
+            socket.inet_aton(ip)
+            return ip.count(".") == 3
+        except socket.error:
+            pass
+        try:
+            socket.inet_pton(socket.AF_INET6, ip)
+            return True
+        except (socket.error, AttributeError):
+            pass
+        return False
+
+    def ban_ip(self, ip, reason="Manual ban via Web UI", admin_ip=None):
+        if not ip:
+            return False, "IP address is required."
+        ip = ip.strip()
+        if ip.startswith("::ffff:"):
+            ip = ip[7:]
+        if not self.is_valid_ip(ip):
+            return False, f"Invalid IP address format: {ip}"
+        if self.is_private_ip(ip) or ip in self.whitelist:
+            return False, f"Cannot ban private, loopback or whitelisted IP ({ip})."
+        if admin_ip:
+            if admin_ip.startswith("::ffff:"):
+                admin_ip = admin_ip[7:]
+            if ip == admin_ip:
+                return False, f"Safety lockout prevented: Cannot ban your own active admin IP ({ip})."
+
+        with self.lock:
+            applied = False
+            rc_ipt, _ = sh(["which", "iptables"], timeout=2)
+            if rc_ipt == 0:
+                sh(["iptables", "-N", "SENTINEL_BLOCK"], timeout=2)
+                sh(["iptables", "-C", "INPUT", "-j", "SENTINEL_BLOCK"], timeout=2)
+                rc_c, _ = sh(["iptables", "-C", "INPUT", "-j", "SENTINEL_BLOCK"], timeout=2)
+                if rc_c != 0:
+                    sh(["iptables", "-I", "INPUT", "1", "-j", "SENTINEL_BLOCK"], timeout=2)
+                sh(["iptables", "-I", "SENTINEL_BLOCK", "-s", ip, "-j", "DROP"], timeout=2)
+                applied = True
+            else:
+                rc_ufw, _ = sh(["which", "ufw"], timeout=2)
+                if rc_ufw == 0:
+                    sh(["ufw", "insert", "1", "deny", "from", ip, "to", "any"], timeout=2)
+                    applied = True
+
+            self.banned_ips[ip] = {
+                "ip": ip,
+                "reason": reason,
+                "banned_at": int(time.time()),
+                "date": datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+                "firewall_applied": applied
+            }
+            self._save()
+            return True, f"IP {ip} successfully banned."
+
+    def unban_ip(self, ip):
+        if not ip:
+            return False, "IP address is required."
+        ip = ip.strip()
+        if ip.startswith("::ffff:"):
+            ip = ip[7:]
+
+        with self.lock:
+            sh(["iptables", "-D", "SENTINEL_BLOCK", "-s", ip, "-j", "DROP"], timeout=2)
+            sh(["ufw", "delete", "deny", "from", ip, "to", "any"], timeout=2)
+            if ip in self.banned_ips:
+                del self.banned_ips[ip]
+                self._save()
+                return True, f"IP {ip} successfully unbanned."
+            return False, f"IP {ip} was not in banned list."
+
+    def list_banned(self):
+        with self.lock:
+            return list(self.banned_ips.values())
+
+    def analyze_visitor_threat(self, visitor):
+        ip = visitor.get("ip", "")
+        if ip in self.banned_ips:
+            return {
+                "level": "banned",
+                "label": "⛔ BANNED",
+                "color": "var(--crit)",
+                "reason": self.banned_ips[ip].get("reason", "Blocked in firewall"),
+                "is_banned": True
+            }
+
+        path = (visitor.get("path") or "").lower()
+        hits = visitor.get("hits", 0)
+        code = visitor.get("code", 200)
+
+        wp_patterns = ["/wp-login.php", "/xmlrpc.php", "/wp-admin", "/wp-content/plugins", "/wp-includes"]
+        if any(p in path for p in wp_patterns):
+            return {
+                "level": "threat_high",
+                "label": "🚨 WP Brute Force",
+                "color": "var(--crit)",
+                "reason": f"Probing WordPress auth ({path})",
+                "is_banned": False
+            }
+
+        exploit_patterns = ["/.env", "/.git", "/config.", "/phpmyadmin", "/pma", "/actuator", "/setup.php", "/backup.", "/dump.sql"]
+        if any(p in path for p in exploit_patterns):
+            return {
+                "level": "threat_high",
+                "label": "🚨 Exploit Scanner",
+                "color": "var(--crit)",
+                "reason": f"Scanning sensitive path ({path})",
+                "is_banned": False
+            }
+
+        if hits >= 40:
+            return {
+                "level": "threat_med",
+                "label": "⚠️ High Request Rate",
+                "color": "var(--warn)",
+                "reason": f"{hits} requests in short window",
+                "is_banned": False
+            }
+
+        if code in (401, 403) and hits >= 10:
+            return {
+                "level": "threat_med",
+                "label": "⚠️ Auth Probe Spike",
+                "color": "var(--warn)",
+                "reason": f"Repeated {code} Forbidden/Unauthorized responses",
+                "is_banned": False
+            }
+
+        return {
+            "level": "clean",
+            "label": "🟢 Clean",
+            "color": "var(--ok)",
+            "reason": "Normal browsing activity",
+            "is_banned": False
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MULTI-SITE UPTIME & RESPONSE SPEED MONITOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SiteMonitor:
+    def __init__(self, cfg, state_dir="/var/lib/health-sentinel"):
+        self.cfg = cfg.get("site_monitor", {})
+        self.state_dir = state_dir
+        self.sites_file = os.path.join(state_dir, "monitored_sites.json")
+        self.custom_sites = set(self.cfg.get("custom_sites", []))
+        self.results = {}
+        self.history = {}
+        self.lock = threading.Lock()
+        self.last_check_time = 0.0
+        self._load()
+
+    def _load(self):
+        try:
+            if os.path.isfile(self.sites_file):
+                with open(self.sites_file) as f:
+                    data = json.load(f)
+                    for s in data.get("custom_sites", []):
+                        self.custom_sites.add(s)
+        except Exception:
+            pass
+
+    def _save(self):
+        try:
+            os.makedirs(os.path.dirname(self.sites_file), exist_ok=True)
+            tmp = self.sites_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"custom_sites": list(self.custom_sites)}, f, indent=2)
+            os.replace(tmp, self.sites_file)
+        except Exception:
+            pass
+
+    def discover_local_vhosts(self):
+        discovered = set()
+        plesk_base = "/var/www/vhosts"
+        if os.path.isdir(plesk_base):
+            try:
+                for entry in os.listdir(plesk_base):
+                    if entry in ("system", "chroot", "default", ".skel", "fs", "fs-passwd"):
+                        continue
+                    full = os.path.join(plesk_base, entry)
+                    if os.path.isdir(full) and "." in entry:
+                        discovered.add(f"https://{entry}")
+            except Exception:
+                pass
+
+        for nd in ["/etc/nginx/sites-enabled", "/etc/nginx/conf.d"]:
+            if os.path.isdir(nd):
+                try:
+                    for cf in os.listdir(nd):
+                        p = os.path.join(nd, cf)
+                        if os.path.isfile(p):
+                            try:
+                                with open(p, "r", errors="ignore") as f:
+                                    for m in re.finditer(r'server_name\s+([^;]+);', f.read()):
+                                        for name in m.group(1).split():
+                                            name = name.strip()
+                                            if name and not name.startswith("*") and name not in ("_", "localhost") and "." in name:
+                                                discovered.add(f"https://{name}")
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+        for ad in ["/etc/apache2/sites-enabled", "/etc/httpd/conf.d"]:
+            if os.path.isdir(ad):
+                try:
+                    for cf in os.listdir(ad):
+                        p = os.path.join(ad, cf)
+                        if os.path.isfile(p):
+                            try:
+                                with open(p, "r", errors="ignore") as f:
+                                    for m in re.finditer(r'ServerName\s+([^\s]+)', f.read()):
+                                        name = m.group(1).strip()
+                                        if name and not name.startswith("*") and name not in ("_", "localhost") and "." in name:
+                                            discovered.add(f"https://{name}")
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+        return sorted(list(discovered))[:20]
+
+    def get_all_target_urls(self):
+        all_urls = set(self.custom_sites)
+        if self.cfg.get("auto_discover_local_vhosts", True):
+            for u in self.discover_local_vhosts():
+                all_urls.add(u)
+        return sorted(list(all_urls))
+
+    def _check_single_site(self, url):
+        t0 = time.time()
+        timeout = self.cfg.get("timeout_seconds", 5)
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname or url
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+        ssl_days_left = None
+        if parsed.scheme == "https":
+            try:
+                cctx = ssl.create_default_context()
+                with socket.create_connection((host, port), timeout=timeout) as s:
+                    with cctx.wrap_socket(s, server_hostname=host) as ss:
+                        c = ss.getpeercert()
+                        if c and "notAfter" in c:
+                            expire_dt = datetime.strptime(c["notAfter"], "%b %d %H:%M:%S %Y %Z")
+                            now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+                            ssl_days_left = max(0, (expire_dt - now_dt).days)
+            except Exception:
+                pass
+
+        status_code = 0
+        latency_ms = 0.0
+        is_up = False
+        error_msg = None
+
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": f"HealthSentinel-Uptime/{VERSION}"})
+            ctx = ssl._create_unverified_context()
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                status_code = resp.getcode()
+                latency_ms = round((time.time() - t0) * 1000.0, 1)
+                is_up = status_code < 400 or status_code in (401, 403)
+        except urllib.error.HTTPError as e:
+            status_code = e.code
+            latency_ms = round((time.time() - t0) * 1000.0, 1)
+            is_up = status_code < 500
+            error_msg = f"HTTP {status_code}"
+        except Exception as e:
+            latency_ms = round((time.time() - t0) * 1000.0, 1)
+            is_up = False
+            status_code = 0
+            error_msg = str(e)
+
+        if url not in self.history:
+            self.history[url] = deque(maxlen=30)
+        self.history[url].append(1 if is_up else 0)
+
+        hist = list(self.history[url])
+        uptime_pct = round((sum(hist) / len(hist)) * 100.0, 1) if hist else (100.0 if is_up else 0.0)
+
+        return {
+            "url": url,
+            "domain": host,
+            "scheme": parsed.scheme,
+            "status_code": status_code,
+            "latency_ms": latency_ms,
+            "is_up": is_up,
+            "ssl_days_left": ssl_days_left,
+            "uptime_pct": uptime_pct,
+            "error": error_msg,
+            "is_custom": url in self.custom_sites,
+            "checked_at": datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S")
+        }
+
+    def check_all(self, force=False):
+        now = time.time()
+        if not force and (now - self.last_check_time < 30.0) and self.results:
+            return self.get_summary()
+
+        targets = self.get_all_target_urls()
+        if not targets:
+            return self.get_summary()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(targets), 8)) as ex:
+            future_to_url = {ex.submit(self._check_single_site, url): url for url in targets}
+            for fut in concurrent.futures.as_completed(future_to_url):
+                url = future_to_url[fut]
+                try:
+                    res = fut.result()
+                    with self.lock:
+                        self.results[url] = res
+                except Exception:
+                    pass
+
+        self.last_check_time = time.time()
+        return self.get_summary()
+
+    def get_summary(self):
+        with self.lock:
+            site_list = list(self.results.values())
+
+        up_count = sum(1 for s in site_list if s.get("is_up"))
+        down_count = sum(1 for s in site_list if not s.get("is_up"))
+        slow_count = sum(1 for s in site_list if s.get("is_up") and s.get("latency_ms", 0) > 1200)
+        avg_latency = round(sum(s.get("latency_ms", 0) for s in site_list) / len(site_list), 1) if site_list else 0.0
+
+        return {
+            "total_sites": len(site_list),
+            "up_count": up_count,
+            "down_count": down_count,
+            "slow_count": slow_count,
+            "avg_latency_ms": avg_latency,
+            "sites": sorted(site_list, key=lambda s: (not s.get("is_up"), s.get("latency_ms", 0))),
+            "custom_sites": list(self.custom_sites)
+        }
+
+    def add_site(self, url):
+        if not url:
+            return False, "URL cannot be empty."
+        url = url.strip()
+        if not url.startswith("http://") and not url.startswith("https://"):
+            url = "https://" + url
+        parsed = urllib.parse.urlparse(url)
+        if not parsed.hostname or "." not in parsed.hostname:
+            return False, "Invalid domain name or URL."
+
+        with self.lock:
+            self.custom_sites.add(url)
+            self._save()
+
+        threading.Thread(target=self._check_and_store, args=(url,), daemon=True).start()
+        return True, f"Website {url} added to monitor."
+
+    def _check_and_store(self, url):
+        res = self._check_single_site(url)
+        with self.lock:
+            self.results[url] = res
+
+    def remove_site(self, url):
+        url = url.strip()
+        with self.lock:
+            if url in self.custom_sites:
+                self.custom_sites.remove(url)
+                self._save()
+            if url in self.results:
+                del self.results[url]
+            return True, f"Website {url} removed."
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2501,8 +2980,11 @@ class Engine:
         self.incidents = IncidentRecorder(cfg)
         self.alert_state = {}
         self.healing_history = deque(maxlen=100)
-        self.visitor_tracker = VisitorTracker(cfg)
+        state_dir = os.path.dirname(self.cfg.get("state_file", "/var/lib/health-sentinel/state.json"))
+        self.security_shield = SecurityShield(cfg, state_dir=state_dir)
+        self.visitor_tracker = VisitorTracker(cfg, security_shield=self.security_shield)
         self.benchmark_engine = BenchmarkEngine(cfg)
+        self.site_monitor = SiteMonitor(cfg, state_dir=state_dir)
         self._load_state()
         self.auto_healer = AutoHealer(self)
 
@@ -2518,12 +3000,16 @@ class Engine:
                         self.healing_history.append(ev)
                     self.visitor_tracker.geo_cache = data.get("geo_cache", {})
                     self.benchmark_engine.last_result = data.get("last_benchmark")
+            self.security_shield._load()
+            self.site_monitor._load()
         except Exception:
             pass
 
     def _save_state(self):
         path = self.cfg["state_file"]
         try:
+            self.security_shield._save()
+            self.site_monitor._save()
             try:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
             except OSError:
@@ -3161,6 +3647,7 @@ kbd{font-size:10.5px;padding:1px 5px;border-radius:5px;border:1px solid var(--st
 
  <div class="nav-tabs">
   <button class="tab-btn active" id="tab-overview-btn" onclick="switchTab('overview')"><svg viewBox="0 0 24 24"><path d="M3 12h18M3 6h18M3 18h18"/></svg>📊 System Health</button>
+  <button class="tab-btn" id="tab-sites-btn" onclick="switchTab('sites')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>🌐 Websites &amp; Uptime <span class="tab-badge" id="badge-sites">0</span></button>
   <button class="tab-btn" id="tab-visitors-btn" onclick="switchTab('visitors')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3v18M3 12h18"/></svg>👥 Live Visitors &amp; Geo <span class="tab-badge" id="badge-visitors">0</span></button>
   <button class="tab-btn" id="tab-benchmark-btn" onclick="switchTab('benchmark')"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>⚡ VPS Benchmark <span class="tab-badge" id="badge-bench">Ready</span></button>
   <button class="tab-btn" id="tab-incidents-btn" onclick="switchTab('incidents')"><svg viewBox="0 0 24 24"><path d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>🚨 Culprits &amp; Incidents <span class="tab-badge" id="badge-inc">0</span></button>
@@ -3207,6 +3694,7 @@ kbd{font-size:10.5px;padding:1px 5px;border-radius:5px;border:1px solid var(--st
   </div>
  </div>
 
+ <div id="view-sites" style="display:none;"></div>
  <div id="view-visitors" style="display:none;"></div>
  <div id="view-benchmark" style="display:none;"></div>
  <div id="view-incidents" style="display:none;"></div>
@@ -3236,7 +3724,7 @@ const ICONS = {
  alert:'<path d="M12 3l9.5 17H2.5L12 3z"/><path d="M12 9v5M12 17h.01"/>'
 };
 const CLR={ok:'var(--ok)',warn:'var(--warn)',crit:'var(--crit)',info:'var(--acc)'};
-let REPORT=null, HIST=[], INCIDENTS=[], FILTER='all', AUTO=true, TIMER=null, OPEN=new Set(), ACTIVE_RANGES={cpu:'10m',mem:'10m',load:'10m',disk:'10m'}, VISITORS=null, BENCHMARK=null, DOCTOR=null, CURRENT_TAB='overview';
+let REPORT=null, HIST=[], INCIDENTS=[], FILTER='all', AUTO=true, TIMER=null, OPEN=new Set(), ACTIVE_RANGES={cpu:'10m',mem:'10m',load:'10m',disk:'10m'}, VISITORS=null, BENCHMARK=null, DOCTOR=null, SITES=null, SECURITY=null, CURRENT_TAB='overview';
 
 const $=s=>document.querySelector(s), esc=s=>String(s==null?'':s)
  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -3539,12 +4027,13 @@ function switchTab(tabId){
   const btn = $('#tab-' + tabId + '-btn');
   if(btn) btn.classList.add('active');
 
-  const views = ['overview', 'visitors', 'benchmark', 'incidents'];
+  const views = ['overview', 'sites', 'visitors', 'benchmark', 'incidents'];
   views.forEach(v => {
     const el = $('#view-' + v);
     if(el) el.style.display = (v === tabId) ? 'block' : 'none';
   });
 
+  if(tabId === 'sites' && SITES) renderSites(SITES);
   if(tabId === 'visitors' && VISITORS) renderVisitors(VISITORS);
   if(tabId === 'benchmark' && BENCHMARK) renderBenchmark(BENCHMARK);
   if(tabId === 'incidents') renderIncidentsView();
@@ -3623,6 +4112,7 @@ function renderVisitors(v){
   const pct2 = Math.round((v.status_codes['2xx']||0) / totalHits * 100);
   const pct4 = Math.round((v.status_codes['4xx']||0) / totalHits * 100);
   const pct5 = Math.round((v.status_codes['5xx']||0) / totalHits * 100);
+  const bannedList = (v.banned_ips || (SECURITY ? SECURITY.banned_ips : [])) || [];
 
   view.innerHTML = `
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:20px;">
@@ -3637,9 +4127,9 @@ function renderVisitors(v){
         <div style="font-size:11.5px;color:var(--dim);">Concurrent connections to 80/443</div>
       </div>
       <div class="glass" style="padding:16px;">
-        <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">⚡ Request Rate</span>
-        <div style="font-size:32px;font-weight:800;margin-top:4px;color:var(--acc);">${v.requests_per_second} <small style="font-size:14px;color:var(--mut);">req/s</small></div>
-        <div style="font-size:11.5px;color:var(--dim);">${totalHits} hits captured in window</div>
+        <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">🛡️ Threat Shield</span>
+        <div style="font-size:32px;font-weight:800;margin-top:4px;color:${v.threat_count > 0 ? 'var(--crit)' : 'var(--ok)'};">${v.threat_count || 0}</div>
+        <div style="font-size:11.5px;color:var(--dim);">${bannedList.length} IP(s) currently blocked in firewall</div>
       </div>
       <div class="glass" style="padding:16px;">
         <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">📊 HTTP Status Codes</span>
@@ -3648,13 +4138,13 @@ function renderVisitors(v){
           <span style="font-size:18px;font-weight:700;color:var(--warn);">${pct4}% <small style="font-size:11px;color:var(--dim);">4xx</small></span>
           <span style="font-size:18px;font-weight:700;color:${pct5>0?'var(--crit)':'var(--dim)'};">${pct5}% <small style="font-size:11px;color:var(--dim);">5xx</small></span>
         </div>
-        <div style="font-size:11.5px;color:var(--dim);margin-top:4px;">Web server response health</div>
+        <div style="font-size:11.5px;color:var(--dim);margin-top:4px;">${v.requests_per_second} req/s rate</div>
       </div>
     </div>
 
-    <div style="display:grid;grid-template-columns:2fr 1fr;gap:18px;">
+    <div style="display:grid;grid-template-columns:2fr 1fr;gap:18px;margin-bottom:20px;">
       <div class="glass" style="padding:20px;overflow:hidden;">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px;">
           <h3 style="font-size:15px;display:flex;align-items:center;gap:8px;">🌍 Real-Time Visitors &amp; Geographic Location</h3>
           <span style="font-size:12px;color:var(--dim);">${v.visitors.length} client(s) tracked</span>
         </div>
@@ -3668,25 +4158,38 @@ function renderVisitors(v){
                   <th>ISP / Network</th>
                   <th>Last Requested Path</th>
                   <th>Status</th>
+                  <th>Threat Level</th>
                   <th>Device / Bot</th>
                   <th style="text-align:right;">Hits</th>
+                  <th style="text-align:right;">Action</th>
                 </tr>
               </thead>
               <tbody>
-                ${v.visitors.map(vis => `
+                ${v.visitors.map(vis => {
+                  const thr = vis.threat || {level:'clean',label:'🟢 Clean',color:'var(--ok)',reason:'',is_banned:false};
+                  const isBanned = thr.is_banned;
+                  return `
                   <tr>
                     <td>
                       <span style="font-size:18px;margin-right:6px;">${vis.flag}</span>
                       <b>${esc(vis.city ? vis.city + ', ' + vis.country : vis.country)}</b>
                     </td>
                     <td><code style="font-size:12px;color:var(--acc);">${esc(vis.ip)}</code></td>
-                    <td style="font-size:12px;color:var(--mut);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(vis.isp)}</td>
-                    <td style="font-size:12px;color:var(--txt);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(vis.path)}">${esc(vis.path)}</td>
+                    <td style="font-size:12px;color:var(--mut);max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(vis.isp)}</td>
+                    <td style="font-size:12px;color:var(--txt);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(vis.path)}">${esc(vis.path)}</td>
                     <td><span class="badge" style="font-size:10px;padding:2px 6px;${vis.code>=500?'color:var(--crit);background:rgba(255,85,102,.15)':(vis.code>=400?'color:var(--warn);background:rgba(255,179,64,.15)':'color:var(--ok);background:rgba(37,227,154,.15)')}">${vis.code}</span></td>
+                    <td><span class="badge" title="${esc(thr.reason)}" style="font-size:10px;padding:2px 7px;color:${thr.color};background:color-mix(in srgb,${thr.color} 15%,transparent);border-color:color-mix(in srgb,${thr.color} 30%,transparent);">${esc(thr.label)}</span></td>
                     <td style="font-size:12px;color:var(--dim);">${esc(vis.device)}</td>
                     <td style="text-align:right;font-weight:700;">${vis.hits}</td>
-                  </tr>
-                `).join('')}
+                    <td style="text-align:right;">
+                      ${isBanned ? `
+                        <button class="btn" onclick="unbanIP('${esc(vis.ip)}')" style="height:26px;padding:0 8px;font-size:11px;color:var(--ok);border-color:color-mix(in srgb,var(--ok) 35%,transparent);">✓ Unban</button>
+                      ` : `
+                        <button class="btn" onclick="promptBanIP('${esc(vis.ip)}', '${esc(thr.reason||thr.label)}')" style="height:26px;padding:0 8px;font-size:11px;color:var(--crit);border-color:color-mix(in srgb,var(--crit) 35%,transparent);">🚫 Ban</button>
+                      `}
+                    </td>
+                  </tr>`;
+                }).join('')}
               </tbody>
             </table>
           </div>
@@ -3712,6 +4215,51 @@ function renderVisitors(v){
           </div>
         ` : `<div style="color:var(--dim);font-size:12px;text-align:center;padding:20px 0;">No path data recorded yet.</div>`}
       </div>
+    </div>
+
+    <!-- Blocked IPs Card -->
+    <div class="glass" style="padding:20px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px;">
+        <div>
+          <h3 style="font-size:15px;display:flex;align-items:center;gap:8px;">🛡️ Firewall Shield · Blocked IP Addresses (${bannedList.length})</h3>
+          <span style="font-size:12px;color:var(--dim);">Banned IPs are immediately dropped in iptables/ufw to protect your server.</span>
+        </div>
+        <button class="btn" onclick="promptManualBan()" style="height:30px;font-size:12px;color:var(--crit);border-color:color-mix(in srgb,var(--crit) 35%,transparent);">+ Block Custom IP</button>
+      </div>
+      ${bannedList.length ? `
+        <div style="overflow-x:auto;">
+          <table class="vtable">
+            <thead>
+              <tr>
+                <th>Blocked IP</th>
+                <th>Reason / Trigger</th>
+                <th>Banned Date</th>
+                <th>Firewall Rule</th>
+                <th style="text-align:right;">Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${bannedList.map(b => `
+                <tr>
+                  <td><code style="font-size:13px;font-weight:700;color:var(--crit);">${esc(b.ip)}</code></td>
+                  <td style="font-size:12.5px;color:var(--txt);">${esc(b.reason || 'Manual block')}</td>
+                  <td style="font-size:12px;color:var(--dim);">${esc(b.date || '–')}</td>
+                  <td><span class="badge" style="font-size:10.5px;color:var(--ok);background:rgba(37,227,154,.12);">✓ ACTIVE DROP</span></td>
+                  <td style="text-align:right;">
+                    <button class="btn" onclick="unbanIP('${esc(b.ip)}')" style="height:26px;padding:0 10px;font-size:11.5px;color:var(--ok);border-color:color-mix(in srgb,var(--ok) 35%,transparent);">✓ Unban IP</button>
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      ` : `
+        <div style="padding:24px;text-align:center;color:var(--dim);">
+          <div style="font-size:24px;margin-bottom:6px;">🛡️</div>
+          <b>No IPs are currently blocked in the firewall.</b>
+          <div style="font-size:12px;color:var(--mut);margin-top:2px;">When you click "Ban" on an aggressive bot or scanner, it will appear here and be instantly dropped by iptables.</div>
+        </div>
+      `}
     </div>
   `;
 }
@@ -3844,13 +4392,263 @@ function renderIncidentsView(){
     </div>`;
 }
 
+function renderSites(s){
+  const view = $('#view-sites');
+  if(!view) return;
+  if(!s || !s.total_sites){
+    view.innerHTML = `
+      <div class="glass" style="padding:48px 24px;text-align:center;max-width:700px;margin:30px auto;">
+        <div style="font-size:48px;margin-bottom:12px;">🌐</div>
+        <h2 style="font-size:22px;font-weight:800;margin-bottom:8px;">Multi-Site Uptime &amp; Speed Monitor</h2>
+        <p style="font-size:13.5px;color:var(--mut);margin-bottom:24px;line-height:1.5;">
+          Monitor real-time response times (ms), HTTP status codes (200 OK vs 502 Bad Gateway), and SSL certificate expiration days for all websites hosted on your VPS.
+        </p>
+        <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;">
+          <button class="btn primary" onclick="checkSitesNow()" style="height:42px;padding:0 24px;font-size:14px;">
+            <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 4v5h-5"/></svg> ⚡ Scan Hosted Domains Now
+          </button>
+          <button class="btn" onclick="openAddSiteModal()" style="height:42px;padding:0 20px;font-size:14px;">+ Add Custom Website</button>
+        </div>
+      </div>`;
+    return;
+  }
+
+  const badge = $('#badge-sites');
+  if(badge) badge.textContent = `${s.up_count}/${s.total_sites}`;
+
+  view.innerHTML = `
+    <!-- Summary Stat Cards -->
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:20px;">
+      <div class="glass" style="padding:16px;">
+        <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">🌐 Monitored Websites</span>
+        <div style="font-size:32px;font-weight:800;margin-top:4px;">${s.total_sites}</div>
+        <div style="font-size:11.5px;color:var(--dim);">Hosted vhosts &amp; custom sites</div>
+      </div>
+      <div class="glass" style="padding:16px;">
+        <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">🟢 Online Sites</span>
+        <div style="font-size:32px;font-weight:800;margin-top:4px;color:var(--ok);">${s.up_count}</div>
+        <div style="font-size:11.5px;color:var(--dim);">Returning 200/300/400 OK</div>
+      </div>
+      <div class="glass" style="padding:16px;">
+        <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">🔴 Down or Slow</span>
+        <div style="font-size:32px;font-weight:800;margin-top:4px;color:${s.down_count > 0 ? 'var(--crit)' : (s.slow_count > 0 ? 'var(--warn)' : 'var(--ok)')};">${s.down_count + s.slow_count}</div>
+        <div style="font-size:11.5px;color:var(--dim);">${s.down_count} down · ${s.slow_count} slow (&gt;1200ms)</div>
+      </div>
+      <div class="glass" style="padding:16px;">
+        <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">⚡ Average Latency</span>
+        <div style="font-size:32px;font-weight:800;margin-top:4px;color:var(--acc);">${s.avg_latency_ms} <small style="font-size:14px;color:var(--mut);">ms</small></div>
+        <div style="font-size:11.5px;color:var(--dim);">Round-trip response speed</div>
+      </div>
+    </div>
+
+    <!-- Action Bar -->
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:12px;">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <h3 style="font-size:16px;margin:0;">Hosted Websites &amp; Endpoints</h3>
+        <span style="font-size:12px;color:var(--dim);">Auto-refreshed with health status</span>
+      </div>
+      <div style="display:flex;gap:10px;">
+        <button class="btn" onclick="openAddSiteModal()" style="height:34px;font-size:12.5px;">+ Add Website</button>
+        <button class="btn primary" id="check-sites-btn" onclick="checkSitesNow()" style="height:34px;font-size:12.5px;">
+          <svg viewBox="0 0 24 24" style="width:14px;height:14px;"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 4v5h-5"/></svg> ⚡ Check All Now
+        </button>
+      </div>
+    </div>
+
+    <!-- Sites Grid -->
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;">
+      ${s.sites.map(site => {
+        const isUp = site.is_up;
+        const latColor = site.latency_ms < 400 ? 'var(--ok)' : (site.latency_ms < 1200 ? 'var(--warn)' : 'var(--crit)');
+        return `
+          <div class="glass" style="padding:18px;display:flex;flex-direction:column;justify-content:space-between;gap:14px;border-color:${isUp ? 'var(--stroke)' : 'color-mix(in srgb,var(--crit) 35%,transparent)'};">
+            <div>
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;gap:8px;">
+                <a href="${site.url}" target="_blank" rel="noopener noreferrer" style="font-size:15px;font-weight:700;color:var(--txt);text-decoration:none;display:flex;align-items:center;gap:6px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                  ${site.scheme==='https'?'🔒':'🌐'} ${esc(site.domain)}
+                </a>
+                ${isUp ? `
+                  <span class="badge" style="color:var(--ok);background:rgba(37,227,154,.15);">🟢 ${site.status_code || 200} OK</span>
+                ` : `
+                  <span class="badge" style="color:var(--crit);background:rgba(255,85,102,.15);">🔴 ${site.status_code ? 'HTTP ' + site.status_code : (site.error || 'DOWN')}</span>
+                `}
+              </div>
+
+              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px;">
+                <span class="badge" style="font-size:11px;color:${latColor};background:color-mix(in srgb,${latColor} 14%,transparent);">⚡ ${site.latency_ms} ms</span>
+                ${site.ssl_days_left !== null ? `
+                  <span class="badge" style="font-size:11px;${site.ssl_days_left<14?'color:var(--crit);background:rgba(255,85,102,.15)':(site.ssl_days_left<30?'color:var(--warn);background:rgba(255,179,64,.15)':'color:var(--ok);background:rgba(37,227,154,.15)')}">🔒 SSL: ${site.ssl_days_left}d left</span>
+                ` : `
+                  <span class="badge" style="font-size:11px;color:var(--dim);background:var(--card2);">🔓 No SSL</span>
+                `}
+                <span class="badge" style="font-size:11px;color:var(--dim);background:var(--card2);">📈 ${site.uptime_pct}%</span>
+              </div>
+            </div>
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding-top:10px;border-top:1px solid var(--stroke);font-size:11.5px;color:var(--dim);">
+              <span>Checked: ${esc(site.checked_at || '–')}</span>
+              <div style="display:flex;gap:6px;">
+                <button class="btn" onclick="checkSingleSite('${esc(site.url)}')" style="height:24px;padding:0 8px;font-size:11px;">🔄 Test</button>
+                ${site.is_custom ? `
+                  <button class="btn" onclick="removeSite('${esc(site.url)}')" style="height:24px;padding:0 8px;font-size:11px;color:var(--crit);">🗑️</button>
+                ` : ''}
+              </div>
+            </div>
+          </div>
+        `;
+      }).join('')}
+    </div>
+  `;
+}
+
+async function promptBanIP(ip, defaultReason=''){
+  const reason = prompt(`Block IP ${ip} in server firewall?\nEnter reason for ban:`, defaultReason || 'Aggressive bot traffic');
+  if(reason === null) return;
+  try {
+    const r = await api('/api/security/ban', {
+      method: 'POST',
+      body: JSON.stringify({ip: ip, reason: reason})
+    });
+    if(r.ok){
+      toast('IP Blocked', `IP ${ip} is now blocked in iptables.`, 'ok');
+      if(SECURITY) SECURITY.banned_ips = r.banned_ips;
+      load();
+    } else {
+      toast('Ban Failed', r.message || 'Error banning IP', 'crit');
+    }
+  } catch(e) {
+    toast('Ban Failed', e.message, 'crit');
+  }
+}
+
+async function promptManualBan(){
+  const ip = prompt('Enter IP address to block in firewall (e.g. 198.51.100.4):');
+  if(!ip || !ip.trim()) return;
+  promptBanIP(ip.trim(), 'Manual admin block');
+}
+
+async function unbanIP(ip){
+  if(!confirm(`Are you sure you want to unban IP ${ip}?`)) return;
+  try {
+    const r = await api('/api/security/unban', {
+      method: 'POST',
+      body: JSON.stringify({ip: ip})
+    });
+    if(r.ok){
+      toast('IP Unbanned', `IP ${ip} has been unblocked.`, 'ok');
+      if(SECURITY) SECURITY.banned_ips = r.banned_ips;
+      load();
+    } else {
+      toast('Unban Failed', r.message || 'Error unbanning IP', 'crit');
+    }
+  } catch(e) {
+    toast('Unban Failed', e.message, 'crit');
+  }
+}
+
+async function checkSitesNow(){
+  const b = $('#check-sites-btn');
+  if(b) b.disabled = true;
+  toast('Checking Websites', 'Testing latency and SSL for all hosted sites…', 'info');
+  try {
+    const r = await api('/api/sites/check', {method: 'POST'});
+    if(r.ok && r.sites){
+      SITES = r.sites;
+      renderSites(SITES);
+      toast('Websites Checked', `${SITES.up_count}/${SITES.total_sites} sites online · avg ${SITES.avg_latency_ms}ms`, 'ok');
+    }
+  } catch(e) {
+    toast('Check Failed', e.message, 'crit');
+  } finally {
+    if(b) b.disabled = false;
+  }
+}
+
+async function checkSingleSite(url){
+  toast('Testing Site', `Checking ${url}…`, 'info');
+  try {
+    const r = await api('/api/sites/add', {method:'POST', body:JSON.stringify({url: url})});
+    if(r.sites){
+      SITES = r.sites;
+      renderSites(SITES);
+      toast('Site Checked', `Updated metrics for ${url}`, 'ok');
+    }
+  } catch(e) {
+    toast('Check Failed', e.message, 'crit');
+  }
+}
+
+function openAddSiteModal(){
+  const modal = document.createElement('div');
+  modal.id = 'add-site-modal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:999;backdrop-filter:blur(8px);display:grid;place-items:center;padding:20px;';
+  modal.innerHTML = `
+    <div class="glass" style="max-width:500px;width:100%;padding:24px;background:var(--bg2);">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+        <h2 style="font-size:18px;">+ Add Website to Monitor</h2>
+        <button class="btn" onclick="this.closest('#add-site-modal').remove()">✕</button>
+      </div>
+      <div style="font-size:13px;color:var(--mut);margin-bottom:14px;">
+        Enter a domain name or full URL (e.g. <code>https://myclient.com</code>). Sentinel will track its response speed, HTTP status, and SSL certificate.
+      </div>
+      <input type="text" id="new-site-url" placeholder="https://example.com" style="width:100%;padding:10px 14px;border-radius:10px;border:1px solid var(--stroke);background:var(--card);color:var(--txt);font-size:14px;margin-bottom:16px;">
+      <div style="display:flex;justify-content:flex-end;gap:10px;">
+        <button class="btn" onclick="this.closest('#add-site-modal').remove()">Cancel</button>
+        <button class="btn primary" onclick="submitAddSite()">Add &amp; Test Now</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+  setTimeout(() => { const inp = $('#new-site-url'); if(inp) inp.focus(); }, 50);
+}
+
+async function submitAddSite(){
+  const inp = $('#new-site-url');
+  if(!inp || !inp.value.trim()) return;
+  const url = inp.value.trim();
+  try {
+    const r = await api('/api/sites/add', {
+      method: 'POST',
+      body: JSON.stringify({url: url})
+    });
+    if(r.ok){
+      toast('Site Added', r.message, 'ok');
+      const m = $('#add-site-modal');
+      if(m) m.remove();
+      SITES = r.sites;
+      renderSites(SITES);
+    } else {
+      toast('Error Adding Site', r.message || 'Invalid domain', 'crit');
+    }
+  } catch(e) {
+    toast('Error Adding Site', e.message, 'crit');
+  }
+}
+
+async function removeSite(url){
+  if(!confirm(`Remove ${url} from monitoring?`)) return;
+  try {
+    const r = await api('/api/sites/remove', {
+      method: 'POST',
+      body: JSON.stringify({url: url})
+    });
+    if(r.ok){
+      toast('Site Removed', r.message, 'ok');
+      SITES = r.sites;
+      renderSites(SITES);
+    }
+  } catch(e) {
+    toast('Error Removing Site', e.message, 'crit');
+  }
+}
+
 async function scan(){
   const b=$('#scanBtn');b.disabled=true;$('#scanIco').classList.add('spin');
   try{
     const r=await api('/api/scan',{method:'POST'});
     HIST=r.history||HIST;INCIDENTS=r.incidents||INCIDENTS;
     VISITORS=r.visitors||VISITORS;BENCHMARK=r.benchmark||BENCHMARK;DOCTOR=r.server_doctor||DOCTOR;
-    render(r.report);renderVisitors(VISITORS);renderBenchmark(BENCHMARK);renderServerDoctor(DOCTOR);
+    SITES=r.sites||SITES;SECURITY=r.security||SECURITY;
+    render(r.report);renderSites(SITES);renderVisitors(VISITORS);renderBenchmark(BENCHMARK);renderServerDoctor(DOCTOR);
     if(CURRENT_TAB==='incidents') renderIncidentsView();
     const bad=r.report.counts.crit+r.report.counts.warn;
     toast('Scan complete',bad?`${bad} issue(s) need attention`:'All ten checks healthy',bad?(r.report.counts.crit?'crit':'warn'):'ok');
@@ -3866,7 +4664,8 @@ async function load(){
     const r=await api('/api/health');
     HIST=r.history||[];INCIDENTS=r.incidents||[];
     VISITORS=r.visitors||null;BENCHMARK=r.benchmark||null;DOCTOR=r.server_doctor||null;
-    render(r.report);renderVisitors(VISITORS);renderBenchmark(BENCHMARK);renderServerDoctor(DOCTOR);
+    SITES=r.sites||null;SECURITY=r.security||null;
+    render(r.report);renderSites(SITES);renderVisitors(VISITORS);renderBenchmark(BENCHMARK);renderServerDoctor(DOCTOR);
     if(CURRENT_TAB==='incidents') renderIncidentsView();
   }catch(e){}
 }
@@ -4225,6 +5024,11 @@ class Handler(BaseHTTPRequestHandler):
             "branding": self.cfg.get("branding", {}),
             "visitors": self.engine.visitor_tracker.scan(),
             "benchmark": self.engine.benchmark_engine.last_result,
+            "security": {
+                "banned_count": len(self.engine.security_shield.banned_ips),
+                "banned_ips": self.engine.security_shield.list_banned()
+            },
+            "sites": self.engine.site_monitor.get_summary(),
             "server_doctor": generate_server_doctor(rep)
         }
 
@@ -4249,6 +5053,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, self.engine.visitor_tracker.scan(force=True))
         if path == "/api/benchmark":
             return self._send(200, self.engine.benchmark_engine.last_result or {"status": "none"})
+        if path == "/api/security/banned":
+            return self._send(200, {"banned_ips": self.engine.security_shield.list_banned()})
+        if path == "/api/sites":
+            return self._send(200, self.engine.site_monitor.get_summary())
         if path == "/api/server-doctor":
             with self.engine.lock:
                 rep = self.engine.report or self.engine.scan()
@@ -4297,6 +5105,59 @@ class Handler(BaseHTTPRequestHandler):
             res = self.engine.benchmark_engine.run()
             self.engine._save_state()
             return self._send(200, {"ok": True, "result": res})
+        if path == "/api/security/ban":
+            try:
+                body = json.loads(data_bytes.decode() or "{}")
+            except Exception as e:
+                return self._send(400, {"ok": False, "error": f"Invalid JSON body: {e}"})
+            ip = (body.get("ip") or "").strip()
+            reason = (body.get("reason") or "Manual ban via Web UI").strip()
+            client_ip = self.client_address[0] if hasattr(self, "client_address") else None
+            ok, msg = self.engine.security_shield.ban_ip(ip, reason=reason, admin_ip=client_ip)
+            return self._send(200 if ok else 400, {
+                "ok": ok,
+                "message": msg,
+                "banned_ips": self.engine.security_shield.list_banned()
+            })
+        if path == "/api/security/unban":
+            try:
+                body = json.loads(data_bytes.decode() or "{}")
+            except Exception as e:
+                return self._send(400, {"ok": False, "error": f"Invalid JSON body: {e}"})
+            ip = (body.get("ip") or "").strip()
+            ok, msg = self.engine.security_shield.unban_ip(ip)
+            return self._send(200 if ok else 400, {
+                "ok": ok,
+                "message": msg,
+                "banned_ips": self.engine.security_shield.list_banned()
+            })
+        if path == "/api/sites/check":
+            summary = self.engine.site_monitor.check_all(force=True)
+            return self._send(200, {"ok": True, "sites": summary})
+        if path == "/api/sites/add":
+            try:
+                body = json.loads(data_bytes.decode() or "{}")
+            except Exception as e:
+                return self._send(400, {"ok": False, "error": f"Invalid JSON body: {e}"})
+            url = (body.get("url") or "").strip()
+            ok, msg = self.engine.site_monitor.add_site(url)
+            return self._send(200 if ok else 400, {
+                "ok": ok,
+                "message": msg,
+                "sites": self.engine.site_monitor.get_summary()
+            })
+        if path == "/api/sites/remove":
+            try:
+                body = json.loads(data_bytes.decode() or "{}")
+            except Exception as e:
+                return self._send(400, {"ok": False, "error": f"Invalid JSON body: {e}"})
+            url = (body.get("url") or "").strip()
+            ok, msg = self.engine.site_monitor.remove_site(url)
+            return self._send(200 if ok else 400, {
+                "ok": ok,
+                "message": msg,
+                "sites": self.engine.site_monitor.get_summary()
+            })
         if path == "/api/scan":
             rep = self.engine.scan(force=True)
             if self.alerts:

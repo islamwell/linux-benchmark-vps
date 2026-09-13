@@ -160,5 +160,20 @@
     "auto_run_on_start": false,
     "disk_test_file": "/tmp/sentinel_bench.tmp",
     "disk_test_mb": 64
+  },
+
+  "security_shield": {
+    "enabled": true,
+    "firewall_backend": "auto",
+    "auto_flag_scanners": true,
+    "whitelist_ips": ["127.0.0.1", "::1"]
+  },
+
+  "site_monitor": {
+    "enabled": true,
+    "check_interval_seconds": 60,
+    "timeout_seconds": 5,
+    "auto_discover_local_vhosts": true,
+    "custom_sites": []
   }
 }
