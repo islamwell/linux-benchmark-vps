@@ -39,8 +39,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.1.0"
-UPDATED = "2026-09-13 08:30"
+VERSION = "2.1.1"
+UPDATED = "2026-09-13 08:50"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -143,10 +143,18 @@ DEFAULTS = {
         }
     },
     "branding": {
+        "white_label": False,
+        "app_name": "Health Sentinel",
+        "company_name": "OpsCare Managed Cloud",
         "agency_name": "OpsCare Managed Cloud",
-        "report_title": "Executive Server Health & Performance Audit",
+        "logo_url": "",
+        "primary_color": "#7d9dff",
+        "accent_color": "#b98cff",
+        "support_url": "",
         "support_email": "support@example.com",
-        "client_name": "Production VPS"
+        "client_name": "Production VPS",
+        "report_title": "Executive Server Health & Performance Audit",
+        "custom_footer_text": ""
     },
     "visitors": {
         "enabled": True,
@@ -197,6 +205,27 @@ def load_config(path):
             print(f"[sentinel] warning: failed to parse config file {path}: {e}", file=sys.stderr)
     cfg["hostname"] = cfg["hostname"] or socket.gethostname()
     return cfg
+
+
+def save_config_section(path, section_name, data):
+    """
+    Atomically updates and saves a specific section in config.json.
+    """
+    if not path:
+        return False, "No config path specified"
+    try:
+        current = {}
+        if os.path.exists(path):
+            with open(path, "r") as fh:
+                current = json.load(fh)
+        current[section_name] = data
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w") as fh:
+            json.dump(current, fh, indent=2)
+        os.replace(tmp_path, path)
+        return True, "Configuration saved successfully"
+    except Exception as e:
+        return False, f"Failed to save config: {e}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3215,10 +3244,15 @@ def generate_server_doctor(report):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_executive_html(report, history, branding, healing_history):
-    agency = branding.get("agency_name", "OpsCare Managed Cloud")
+    agency = branding.get("company_name") or branding.get("agency_name") or "OpsCare Managed Cloud"
     title = branding.get("report_title", "Executive Server Health & Performance Audit")
     support_email = branding.get("support_email", "support@example.com")
+    support_url = branding.get("support_url", "")
     client_name = branding.get("client_name", "Production VPS Host")
+    app_name = branding.get("app_name", "Health Sentinel")
+    white_label = bool(branding.get("white_label", False))
+    logo_url = (branding.get("logo_url") or "").strip()
+    primary_color = branding.get("primary_color") or "#0284c7"
 
     score = report.get("score", 100)
     grade_str = report.get("grade", "A+")
@@ -3296,6 +3330,16 @@ def generate_executive_html(report, history, branding, healing_history):
     else:
         ssl_rows = """<tr><td colspan="3" style="padding:12px;text-align:center;color:#64748b;font-size:12.5px;">Standard web SSL certificates valid &amp; protected</td></tr>"""
 
+    logo_markup = f'<img src="{_esc(logo_url)}" style="max-height:44px;max-width:180px;object-fit:contain;margin-bottom:10px;display:block;" alt="{_esc(agency)}">' if logo_url else ''
+
+    if white_label:
+        sig_text = branding.get("custom_footer_text") or f"Certified by <b>{_esc(agency)}</b> · All rights reserved."
+        footer_sub = f'<div>{sig_text} <span style="font-size:11px;color:#94a3b8;margin-left:8px;">v{VERSION}</span></div>'
+    else:
+        footer_sub = f"<div>Certified by <b>{_esc(agency)}</b> · Generated autonomously by {_esc(app_name)} v{VERSION}</div>"
+
+    support_link = f'<a href="{_esc(support_url)}" target="_blank" style="color:{primary_color};text-decoration:none;">{_esc(support_url)}</a> ({_esc(support_email)})' if support_url else f'<a href="mailto:{_esc(support_email)}" style="color:{primary_color};text-decoration:none;">{_esc(support_email)}</a>'
+
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -3306,10 +3350,10 @@ def generate_executive_html(report, history, branding, healing_history):
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f8fafc; color: #0f172a; line-height: 1.5; padding: 32px 20px; }}
   .sheet {{ max-width: 900px; margin: 0 auto; background: #ffffff; border-radius: 16px; border: 1px solid #e2e8f0; box-shadow: 0 10px 30px rgba(0,0,0,0.04); overflow: hidden; }}
-  .top-banner {{ padding: 28px 36px; background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); color: #ffffff; display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 16px; }}
-  .agency-name {{ font-size: 13px; letter-spacing: 1.5px; text-transform: uppercase; color: #38bdf8; font-weight: 700; }}
+  .top-banner {{ padding: 28px 36px; background: linear-gradient(135deg, {primary_color} 0%, #0f172a 100%); color: #ffffff; display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 16px; }}
+  .agency-name {{ font-size: 13px; letter-spacing: 1.5px; text-transform: uppercase; color: #ffffff; opacity: 0.9; font-weight: 700; }}
   .report-title {{ font-size: 22px; font-weight: 800; margin-top: 4px; }}
-  .client-badge {{ display: inline-flex; align-items: center; padding: 4px 12px; border-radius: 999px; background: rgba(255,255,255,0.12); font-size: 12px; margin-top: 8px; }}
+  .client-badge {{ display: inline-flex; align-items: center; padding: 4px 12px; border-radius: 999px; background: rgba(255,255,255,0.15); font-size: 12px; margin-top: 8px; }}
   .content {{ padding: 32px 36px; }}
   .meta-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; background: #f1f5f9; padding: 16px 20px; border-radius: 12px; margin-bottom: 24px; }}
   .meta-item b {{ display: block; font-size: 11px; text-transform: uppercase; color: #64748b; letter-spacing: 0.5px; }}
@@ -3333,7 +3377,7 @@ def generate_executive_html(report, history, branding, healing_history):
   
   /* Print Controls */
   .toolbar {{ position: fixed; bottom: 24px; right: 24px; display: flex; gap: 10px; z-index: 1000; }}
-  .action-btn {{ padding: 12px 20px; border-radius: 999px; background: #0284c7; color: #ffffff; font-weight: 700; font-size: 14px; border: none; cursor: pointer; box-shadow: 0 8px 24px rgba(2,132,199,0.35); display: flex; align-items: center; gap: 8px; transition: transform .15s; }}
+  .action-btn {{ padding: 12px 20px; border-radius: 999px; background: {primary_color}; color: #ffffff; font-weight: 700; font-size: 14px; border: none; cursor: pointer; box-shadow: 0 8px 24px rgba(0,0,0,0.25); display: flex; align-items: center; gap: 8px; transition: transform .15s; }}
   .action-btn:hover {{ transform: translateY(-2px); }}
   .close-btn {{ background: #475569; }}
 
@@ -3359,6 +3403,7 @@ def generate_executive_html(report, history, branding, healing_history):
 <div class="sheet">
   <div class="top-banner">
     <div>
+      {logo_markup}
       <div class="agency-name">{_esc(agency)}</div>
       <div class="report-title">{_esc(title)}</div>
       <div class="client-badge">Client: <b>{_esc(client_name)}</b></div>
@@ -3461,8 +3506,8 @@ def generate_executive_html(report, history, branding, healing_history):
     </table>
 
     <div class="footer-sig">
-      <div>Certified by <b>{_esc(agency)}</b> · Generated autonomously by Linux Health Sentinel v{VERSION}</div>
-      <div>Questions? Contact: <a href="mailto:{_esc(support_email)}" style="color: #0284c7; text-decoration: none;">{_esc(support_email)}</a></div>
+      {footer_sub}
+      <div>Questions? Contact: {support_link}</div>
     </div>
   </div>
 </div>
@@ -4160,14 +4205,15 @@ body.role-viewer .admin-only{display:none!important}
 <div class="wrap">
  <header>
   <div class="brand">
-   <div class="logo"><svg viewBox="0 0 24 24"><path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-4z"/><path d="M8.5 12.5l2.2 2.2 4.8-5"/></svg></div>
-   <div><h1>Health Sentinel <span style="font-size:11px;color:var(--dim);font-weight:600">v__VER__</span> <span id="roleBadge"></span></h1>
+   <div class="logo" id="brandLogoWrap"><svg viewBox="0 0 24 24"><path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-4z"/><path d="M8.5 12.5l2.2 2.2 4.8-5"/></svg></div>
+   <div><h1><span id="brandTitle">Health Sentinel</span> <span style="font-size:11px;color:var(--dim);font-weight:600">v__VER__</span> <span id="roleBadge"></span></h1>
     <div class="sub" id="hostline">loading…</div></div>
   </div>
   <div class="spacer"></div>
   <input class="search" id="q" placeholder="Filter checks…  ( / )">
   <button class="btn" id="autoBtn" onclick="toggleAuto()"><svg viewBox="0 0 24 24"><path d="M12 6v6l4 2"/><circle cx="12" cy="12" r="9"/></svg><span id="autoTxt">Auto</span></button>
   <button class="btn" onclick="toggleTheme()"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg></button>
+  <button class="btn admin-only" onclick="openBrandingModal()"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 6.36 15.36L12 12V3z"/></svg>🎨 Branding</button>
   <button class="btn admin-only" onclick="openQuickActionsModal()"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>⚡ Quick Actions &amp; PHP</button>
   <button class="btn" onclick="openExecutiveReportModal()"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>📄 Executive Report</button>
   <button class="btn admin-only" onclick="testAlert(this)"><svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 10-12 0c0 7-3 8-3 8h18s-3-1-3-8"/><path d="M13.7 21a2 2 0 01-3.4 0"/></svg>Test alert</button>
@@ -4232,7 +4278,9 @@ body.role-viewer .admin-only{display:none!important}
  <footer>
   <span id="chans"></span>
   <span class="ver-badge">v__VER__ (updated __UPDATED__)</span>
+  <span id="footerBrand" style="color:var(--mut);font-size:11.5px;margin-left:12px;"></span>
   <div class="spacer"></div>
+  <span id="footerSupport"></span>
   <span>Shortcuts: <kbd>r</kbd> rescan · <kbd>/</kbd> search · <kbd>e</kbd> expand · <kbd>t</kbd> theme</span>
  </footer>
 </div>
@@ -4254,7 +4302,7 @@ const ICONS = {
  alert:'<path d="M12 3l9.5 17H2.5L12 3z"/><path d="M12 9v5M12 17h.01"/>'
 };
 const CLR={ok:'var(--ok)',warn:'var(--warn)',crit:'var(--crit)',info:'var(--acc)'};
-let REPORT=null, HIST=[], INCIDENTS=[], FILTER='all', AUTO=true, TIMER=null, OPEN=new Set(), ACTIVE_RANGES={cpu:'10m',mem:'10m',load:'10m',disk:'10m'}, VISITORS=null, BENCHMARK=null, CAPACITY_BENCHMARK=null, BENCH_SUBTAB='capacity', CAPACITY_TIMER=null, DOCTOR=null, SITES=null, SECURITY=null, CURRENT_TAB='overview';
+let REPORT=null, HIST=[], INCIDENTS=[], FILTER='all', AUTO=true, TIMER=null, OPEN=new Set(), ACTIVE_RANGES={cpu:'10m',mem:'10m',load:'10m',disk:'10m'}, VISITORS=null, BENCHMARK=null, CAPACITY_BENCHMARK=null, BENCH_SUBTAB='capacity', CAPACITY_TIMER=null, DOCTOR=null, SITES=null, SECURITY=null, CURRENT_TAB='overview', BRANDING=(BOOT&&BOOT.branding)||null;
 
 const $=s=>document.querySelector(s), esc=s=>String(s==null?'':s)
  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -5575,6 +5623,7 @@ async function scan(){
 async function load(){
   try{
     const r=await api('/api/health');
+    if(r.branding) applyBranding(r.branding);
     HIST=r.history||[];INCIDENTS=r.incidents||[];
     VISITORS=r.visitors||null;BENCHMARK=r.benchmark||null;DOCTOR=r.server_doctor||null;
     if(r.capacity_benchmark && r.capacity_benchmark.last_result) CAPACITY_BENCHMARK = r.capacity_benchmark.last_result;
@@ -5701,9 +5750,275 @@ function showAutoHealLog(){
   document.body.appendChild(modal);
 }
 
+function applyBranding(b){
+  if(!b) return;
+  BRANDING = b;
+  const isWhite = !!b.white_label;
+  const appName = b.app_name || (isWhite ? 'Server Sentinel' : 'Health Sentinel');
+  const company = b.company_name || b.agency_name || '';
+
+  const host = (REPORT && REPORT.host) || 'VPS';
+  document.title = `${appName} · ${host}`;
+
+  const bt = $('#brandTitle');
+  if(bt) bt.textContent = appName;
+
+  const lw = $('#brandLogoWrap');
+  if(lw){
+    if(b.logo_url && b.logo_url.trim()){
+      lw.innerHTML = `<img src="${esc(b.logo_url)}" alt="Logo" style="height:32px;max-width:140px;object-fit:contain;border-radius:6px;" onerror="this.outerHTML='<svg viewBox=\\'0 0 24 24\\'><path d=\\'M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-4z\\'/><path d=\\'M8.5 12.5l2.2 2.2 4.8-5\\'/></svg>'">`;
+    } else {
+      lw.innerHTML = `<svg viewBox="0 0 24 24"><path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-4z"/><path d="M8.5 12.5l2.2 2.2 4.8-5"/></svg>`;
+    }
+  }
+
+  if(b.primary_color && /^#[0-9a-fA-F]{6}$/.test(b.primary_color)){
+    document.documentElement.style.setProperty('--acc', b.primary_color);
+  }
+  if(b.accent_color && /^#[0-9a-fA-F]{6}$/.test(b.accent_color)){
+    document.documentElement.style.setProperty('--acc2', b.accent_color);
+  }
+
+  const fb = $('#footerBrand');
+  if(fb){
+    if(b.custom_footer_text){
+      fb.innerHTML = esc(b.custom_footer_text);
+    } else if(company){
+      fb.innerHTML = `· Powered by <b>${esc(company)}</b>`;
+    } else {
+      fb.innerHTML = '';
+    }
+  }
+
+  const fs = $('#footerSupport');
+  if(fs){
+    if(b.support_url){
+      fs.innerHTML = `<a href="${esc(b.support_url)}" target="_blank" rel="noopener" style="color:var(--acc);margin-right:12px;text-decoration:none;font-size:11.5px;">🎧 Helpdesk</a>`;
+    } else if(b.support_email){
+      fs.innerHTML = `<a href="mailto:${esc(b.support_email)}" style="color:var(--acc);margin-right:12px;text-decoration:none;font-size:11.5px;">✉️ Support</a>`;
+    } else {
+      fs.innerHTML = '';
+    }
+  }
+}
+
+function openBrandingModal(){
+  const b = BRANDING || {};
+  const modal = document.createElement('div');
+  modal.id = 'branding-modal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:999;backdrop-filter:blur(8px);display:grid;place-items:center;padding:20px;';
+  
+  const whiteLabelChecked = b.white_label ? 'checked' : '';
+  const appName = b.app_name !== undefined ? b.app_name : 'Health Sentinel';
+  const companyName = b.company_name || b.agency_name || 'OpsCare Managed Cloud';
+  const logoUrl = b.logo_url || '';
+  const primaryColor = b.primary_color || '#7d9dff';
+  const accentColor = b.accent_color || '#b98cff';
+  const supportEmail = b.support_email || 'support@example.com';
+  const supportUrl = b.support_url || '';
+  const clientName = b.client_name || 'Production VPS';
+  const reportTitle = b.report_title || 'Executive Server Health & Performance Audit';
+  const customFooter = b.custom_footer_text || '';
+
+  modal.innerHTML = `
+  <div class="glass" style="max-width:760px;width:100%;max-height:88vh;overflow-y:auto;padding:24px;background:var(--bg2);">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;border-bottom:1px solid var(--stroke);padding-bottom:14px;">
+      <div>
+        <h2 style="font-size:18px;display:flex;align-items:center;gap:8px;">🎨 Custom Branding &amp; White-Label Platform</h2>
+        <div style="font-size:12.5px;color:var(--mut);">Rebrand Health Sentinel for client delivery, MSPs, or hosting agencies.</div>
+      </div>
+      <button class="btn" onclick="closeBrandingModal()">✕</button>
+    </div>
+
+    <!-- White Label Mode Callout -->
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 18px;background:var(--card);border-radius:12px;border:1px solid var(--stroke);margin-bottom:18px;">
+      <div>
+        <div style="font-size:13.5px;font-weight:700;display:flex;align-items:center;gap:8px;">
+          🏷️ White-Label Mode
+          <span style="font-size:10.5px;padding:2px 7px;border-radius:6px;background:rgba(125,157,255,.15);color:var(--acc);font-weight:700;">PRO</span>
+        </div>
+        <div style="font-size:12px;color:var(--mut);margin-top:2px;">Eliminates all vendor mentions of "Health Sentinel" across dashboard, reports, and headers.</div>
+      </div>
+      <label style="display:flex;align-items:center;cursor:pointer;gap:8px;">
+        <input type="checkbox" id="brand-white-label" ${whiteLabelChecked} style="width:18px;height:18px;cursor:pointer;accent-color:var(--acc);">
+        <span style="font-size:12.5px;font-weight:600;">Enable</span>
+      </label>
+    </div>
+
+    <!-- Brand Identity Grid -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px;">
+      <div>
+        <label style="font-size:11.5px;color:var(--dim);display:block;margin-bottom:4px;">APPLICATION NAME</label>
+        <input id="brand-app-name" class="search" style="width:100%;" value="${esc(appName)}" placeholder="e.g. Health Sentinel or OpsGuardian">
+      </div>
+      <div>
+        <label style="font-size:11.5px;color:var(--dim);display:block;margin-bottom:4px;">COMPANY / AGENCY NAME</label>
+        <input id="brand-company-name" class="search" style="width:100%;" value="${esc(companyName)}" placeholder="e.g. Acme Managed Hosting">
+      </div>
+    </div>
+
+    <!-- Logo and Preview -->
+    <div style="margin-bottom:16px;">
+      <label style="font-size:11.5px;color:var(--dim);display:block;margin-bottom:4px;">CUSTOM LOGO URL (HTTPS OR DATA URI)</label>
+      <div style="display:flex;gap:10px;align-items:center;">
+        <input id="brand-logo-url" class="search" style="flex:1;" value="${esc(logoUrl)}" placeholder="https://example.com/logo.png" oninput="previewBrandLogo()">
+        <div id="brand-logo-preview" style="min-width:120px;height:38px;padding:2px 10px;border-radius:9px;background:var(--card);border:1px dashed var(--stroke);display:flex;align-items:center;justify-content:center;">
+          ${logoUrl ? `<img src="${esc(logoUrl)}" style="max-height:28px;max-width:100px;object-fit:contain;" onerror="this.parentElement.innerHTML='<span style=\\'font-size:11px;color:var(--crit);\\'>Invalid URL</span>'">` : '<span style="font-size:11px;color:var(--dim);">No logo</span>'}
+        </div>
+      </div>
+    </div>
+
+    <!-- Theme Colors -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px;padding:14px;background:var(--card);border-radius:12px;border:1px solid var(--stroke);">
+      <div>
+        <label style="font-size:11.5px;color:var(--dim);display:block;margin-bottom:6px;">PRIMARY BRAND COLOR</label>
+        <div style="display:flex;align-items:center;gap:10px;">
+          <input type="color" id="brand-primary-color" value="${esc(primaryColor)}" oninput="liveThemePreview()" style="width:44px;height:36px;border:none;border-radius:8px;background:transparent;cursor:pointer;">
+          <input id="brand-primary-hex" class="search" style="flex:1;" value="${esc(primaryColor)}" oninput="$('#brand-primary-color').value=this.value;liveThemePreview()">
+        </div>
+      </div>
+      <div>
+        <label style="font-size:11.5px;color:var(--dim);display:block;margin-bottom:6px;">ACCENT GRADIENT COLOR</label>
+        <div style="display:flex;align-items:center;gap:10px;">
+          <input type="color" id="brand-accent-color" value="${esc(accentColor)}" oninput="liveThemePreview()" style="width:44px;height:36px;border:none;border-radius:8px;background:transparent;cursor:pointer;">
+          <input id="brand-accent-hex" class="search" style="flex:1;" value="${esc(accentColor)}" oninput="$('#brand-accent-color').value=this.value;liveThemePreview()">
+        </div>
+      </div>
+    </div>
+
+    <!-- Support & Helpdesk -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px;">
+      <div>
+        <label style="font-size:11.5px;color:var(--dim);display:block;margin-bottom:4px;">SUPPORT EMAIL</label>
+        <input id="brand-support-email" class="search" style="width:100%;" value="${esc(supportEmail)}" placeholder="support@yourcompany.com">
+      </div>
+      <div>
+        <label style="font-size:11.5px;color:var(--dim);display:block;margin-bottom:4px;">HELPDESK / PORTAL URL</label>
+        <input id="brand-support-url" class="search" style="width:100%;" value="${esc(supportUrl)}" placeholder="https://portal.yourcompany.com">
+      </div>
+    </div>
+
+    <!-- Executive Reports & Footer -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px;">
+      <div>
+        <label style="font-size:11.5px;color:var(--dim);display:block;margin-bottom:4px;">DEFAULT CLIENT / PROJECT NAME</label>
+        <input id="brand-client-name" class="search" style="width:100%;" value="${esc(clientName)}" placeholder="Production VPS Host">
+      </div>
+      <div>
+        <label style="font-size:11.5px;color:var(--dim);display:block;margin-bottom:4px;">EXECUTIVE AUDIT REPORT TITLE</label>
+        <input id="brand-report-title" class="search" style="width:100%;" value="${esc(reportTitle)}" placeholder="Executive Server Health & Performance Audit">
+      </div>
+    </div>
+
+    <div style="margin-bottom:20px;">
+      <label style="font-size:11.5px;color:var(--dim);display:block;margin-bottom:4px;">CUSTOM FOOTER COPYRIGHT / NOTICE</label>
+      <input id="brand-custom-footer" class="search" style="width:100%;" value="${esc(customFooter)}" placeholder="Leave blank to use 'Powered by &lt;Company Name&gt;' or enter custom text">
+    </div>
+
+    <!-- Modal Actions -->
+    <div style="display:flex;justify-content:space-between;align-items:center;border-top:1px solid var(--stroke);padding-top:16px;">
+      <button class="btn" onclick="resetBrandDefaults()" style="color:var(--warn);border-color:color-mix(in srgb,var(--warn) 35%,transparent);">↺ Reset Defaults</button>
+      <div style="display:flex;gap:10px;">
+        <button class="btn" onclick="closeBrandingModal()">Cancel</button>
+        <button class="btn primary" id="save-brand-btn" onclick="saveBrandingSettings()">💾 Save Branding</button>
+      </div>
+    </div>
+  </div>`;
+  
+  document.body.appendChild(modal);
+}
+
+function closeBrandingModal(){
+  const m = $('#branding-modal');
+  if(m) m.remove();
+  if(BRANDING){
+    if(BRANDING.primary_color) document.documentElement.style.setProperty('--acc', BRANDING.primary_color);
+    if(BRANDING.accent_color) document.documentElement.style.setProperty('--acc2', BRANDING.accent_color);
+  }
+}
+
+function previewBrandLogo(){
+  const url = ($('#brand-logo-url').value || '').trim();
+  const box = $('#brand-logo-preview');
+  if(!box) return;
+  if(!url){
+    box.innerHTML = '<span style="font-size:11px;color:var(--dim);">No logo</span>';
+  } else {
+    box.innerHTML = `<img src="${esc(url)}" style="max-height:28px;max-width:100px;object-fit:contain;" onerror="this.parentElement.innerHTML='<span style=\\'font-size:11px;color:var(--crit);\\'>Invalid URL</span>'">`;
+  }
+}
+
+function liveThemePreview(){
+  const p = $('#brand-primary-color').value;
+  const a = $('#brand-accent-color').value;
+  if($('#brand-primary-hex')) $('#brand-primary-hex').value = p;
+  if($('#brand-accent-hex')) $('#brand-accent-hex').value = a;
+  document.documentElement.style.setProperty('--acc', p);
+  document.documentElement.style.setProperty('--acc2', a);
+}
+
+function resetBrandDefaults(){
+  $('#brand-white-label').checked = false;
+  $('#brand-app-name').value = 'Health Sentinel';
+  $('#brand-company-name').value = 'OpsCare Managed Cloud';
+  $('#brand-logo-url').value = '';
+  $('#brand-primary-color').value = '#7d9dff';
+  $('#brand-primary-hex').value = '#7d9dff';
+  $('#brand-accent-color').value = '#b98cff';
+  $('#brand-accent-hex').value = '#b98cff';
+  $('#brand-support-email').value = 'support@example.com';
+  $('#brand-support-url').value = '';
+  $('#brand-client-name').value = 'Production VPS';
+  $('#brand-report-title').value = 'Executive Server Health & Performance Audit';
+  $('#brand-custom-footer').value = '';
+  previewBrandLogo();
+  liveThemePreview();
+}
+
+async function saveBrandingSettings(){
+  const btn = $('#save-brand-btn');
+  if(btn) btn.disabled = true;
+  try{
+    const payload = {
+      white_label: $('#brand-white-label').checked,
+      app_name: ($('#brand-app-name').value || '').trim() || 'Health Sentinel',
+      company_name: ($('#brand-company-name').value || '').trim(),
+      agency_name: ($('#brand-company-name').value || '').trim(),
+      logo_url: ($('#brand-logo-url').value || '').trim(),
+      primary_color: $('#brand-primary-color').value || '#7d9dff',
+      accent_color: $('#brand-accent-color').value || '#b98cff',
+      support_email: ($('#brand-support-email').value || '').trim(),
+      support_url: ($('#brand-support-url').value || '').trim(),
+      client_name: ($('#brand-client-name').value || '').trim(),
+      report_title: ($('#brand-report-title').value || '').trim(),
+      custom_footer_text: ($('#brand-custom-footer').value || '').trim()
+    };
+    
+    toast('Saving Branding', 'Updating white-label and brand configurations…', 'info', 2000);
+    const res = await api('/api/branding', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+    
+    if(res.ok){
+      BRANDING = res.branding || payload;
+      applyBranding(BRANDING);
+      toast('Branding Saved', 'White-label identity and theme updated successfully', 'ok', 4000);
+      const m = $('#branding-modal');
+      if(m) m.remove();
+    } else {
+      toast('Save Failed', res.error || res.message || 'Failed to save branding', 'crit', 5000);
+    }
+  }catch(e){
+    toast('Branding Error', e.message, 'crit', 5000);
+  }finally{
+    if(btn) btn.disabled = false;
+  }
+}
+
 function openExecutiveReportModal(){
-  const agency = (REPORT && REPORT.branding && REPORT.branding.agency_name) || 'OpsCare Managed Cloud';
-  const client = (REPORT && REPORT.branding && REPORT.branding.client_name) || (REPORT ? REPORT.host : 'Production VPS');
+  const agency = (REPORT && REPORT.branding && REPORT.branding.agency_name) || (BRANDING && (BRANDING.company_name || BRANDING.agency_name)) || 'OpsCare Managed Cloud';
+  const client = (REPORT && REPORT.branding && REPORT.branding.client_name) || (BRANDING && BRANDING.client_name) || (REPORT ? REPORT.host : 'Production VPS');
   const modal = document.createElement('div');
   modal.id = 'report-modal';
   modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:999;backdrop-filter:blur(8px);display:grid;place-items:center;padding:20px;';
@@ -5743,9 +6058,12 @@ function openExecutiveReportModal(){
 }
 
 function launchExecutiveReport(){
-  const ag = encodeURIComponent($('#rep-agency').value || 'OpsCare Managed Cloud');
-  const cl = encodeURIComponent($('#rep-client').value || 'Production VPS');
-  const url = `/api/report/html?agency=${ag}&client=${cl}${URL_TOKEN ? '&token=' + encodeURIComponent(URL_TOKEN) : ''}`;
+  const ag = encodeURIComponent($('#rep-agency').value || (BRANDING && (BRANDING.company_name || BRANDING.agency_name)) || 'OpsCare Managed Cloud');
+  const cl = encodeURIComponent($('#rep-client').value || (BRANDING && BRANDING.client_name) || 'Production VPS');
+  const ti = encodeURIComponent((BRANDING && BRANDING.report_title) || '');
+  let url = `/api/report/html?agency=${ag}&client=${cl}`;
+  if(ti) url += `&title=${ti}`;
+  if(URL_TOKEN) url += `&token=${encodeURIComponent(URL_TOKEN)}`;
   window.open(url, '_blank');
 }
 
@@ -5877,6 +6195,7 @@ if(BOOT.role === 'viewer'){
 } else if(BOOT.token || BOOT.role === 'admin') {
  const rb=$('#roleBadge');if(rb)rb.innerHTML='<span class="badge" style="background:rgba(16,185,129,0.15);color:var(--ok);border:1px solid rgba(16,185,129,0.3);font-size:11px;font-weight:700;margin-left:8px;">⚡ Admin</span>';
 }
+if(BOOT.branding) applyBranding(BOOT.branding);
 $('#chans').innerHTML=BOOT.channels.length
  ? 'Active Alert Channels: '+BOOT.channels.map(c=>`<span class="ch2 on">${esc(c)}</span>`).join(' ')
  : '<span class="ch2">No alert channel enabled — configure in config.json</span>';
@@ -5897,6 +6216,7 @@ class Handler(BaseHTTPRequestHandler):
     engine: Engine = None
     alerts: AlertManager = None
     cfg: dict = None
+    cfg_path: str = None
 
     def log_message(self, *a):
         pass
@@ -6015,9 +6335,12 @@ class Handler(BaseHTTPRequestHandler):
             boot = {"interval": self.cfg["scan_interval"],
                     "role": role,
                     "token": self.cfg["web"].get("token", ""),
-                    "channels": channels}
+                    "channels": channels,
+                    "branding": self.cfg.get("branding", {})}
             page = HTML_PAGE.replace("__BOOTSTRAP__", json.dumps(boot)).replace("__VER__", VERSION).replace("__UPDATED__", UPDATED)
             return self._send(200, page, "text/html; charset=utf-8")
+        if path == "/api/branding":
+            return self._send(200, self.cfg.get("branding", {}))
         if path == "/api/health":
             return self._send(200, self._payload(role=role))
         if path == "/api/visitors":
@@ -6080,6 +6403,32 @@ class Handler(BaseHTTPRequestHandler):
             data_bytes = self.rfile.read(n)
         except Exception:
             pass
+        if path == "/api/branding":
+            try:
+                body = json.loads(data_bytes.decode() or "{}")
+            except Exception as e:
+                return self._send(400, {"ok": False, "error": f"Invalid JSON body: {e}"})
+            current_branding = dict(self.cfg.get("branding", {}))
+            for key in ("white_label", "app_name", "company_name", "agency_name", "logo_url",
+                        "primary_color", "accent_color", "support_url", "support_email",
+                        "client_name", "report_title", "custom_footer_text"):
+                if key in body:
+                    if key == "white_label":
+                        current_branding[key] = bool(body[key])
+                    else:
+                        current_branding[key] = str(body[key]).strip()
+            if "company_name" in body and "agency_name" not in body:
+                current_branding["agency_name"] = current_branding["company_name"]
+            elif "agency_name" in body and "company_name" not in body:
+                current_branding["company_name"] = current_branding["agency_name"]
+            self.cfg["branding"] = current_branding
+            cfg_file = self.cfg_path or os.environ.get("SENTINEL_CONFIG", "/etc/health-sentinel/config.json")
+            ok, msg = save_config_section(cfg_file, "branding", current_branding)
+            return self._send(200 if ok else 500, {
+                "ok": ok,
+                "message": msg,
+                "branding": current_branding
+            })
         if path == "/api/benchmark/run":
             res = self.engine.benchmark_engine.run()
             self.engine._save_state()
@@ -6373,7 +6722,7 @@ def main():
         except KeyboardInterrupt:
             return 0
 
-    Handler.engine, Handler.alerts, Handler.cfg = engine, alerts, cfg
+    Handler.engine, Handler.alerts, Handler.cfg, Handler.cfg_path = engine, alerts, cfg, args.config
     srv = ThreadingHTTPServer((cfg["web"]["bind"], cfg["web"]["port"]), Handler)
     url = f"http://{cfg['web']['bind']}:{cfg['web']['port']}"
     if cfg["web"].get("token"):

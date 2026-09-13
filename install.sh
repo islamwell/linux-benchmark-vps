@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — Automated Installer & Service Manager
-# Version: 2.1.0 (updated 2026-09-13 08:30)
+# Version: 2.1.1 (updated 2026-09-13 08:50)
 # ==============================================================================
 
 set -euo pipefail
 
-VERSION="2.1.0"
-UPDATED="2026-09-13 08:30"
+VERSION="2.1.1"
+UPDATED="2026-09-13 08:50"
 
 # Target installation paths
 INSTALL_DIR="/opt/health-sentinel"
@@ -25,6 +25,10 @@ BIND=""
 TOKEN=""
 ADMIN_TOKEN=""
 VIEW_TOKEN=""
+WHITE_LABEL=false
+APP_NAME=""
+COMPANY_NAME=""
+BRAND_COLOR=""
 AUTO_CONFIRM=false
 ENABLE_SLOWLOG=false
 ENABLE_TIMER=false
@@ -59,6 +63,22 @@ while [[ $# -gt 0 ]]; do
             VIEW_TOKEN="$2"
             shift 2
             ;;
+        --white-label)
+            WHITE_LABEL=true
+            shift
+            ;;
+        --app-name)
+            APP_NAME="$2"
+            shift 2
+            ;;
+        --company|--agency)
+            COMPANY_NAME="$2"
+            shift 2
+            ;;
+        --brand-color)
+            BRAND_COLOR="$2"
+            shift 2
+            ;;
         -y|--yes|--non-interactive)
             AUTO_CONFIRM=true
             shift
@@ -86,6 +106,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --admin-token <token>     Admin authentication token (full control, auto-generated if omitted)"
             echo "  --view-token <token>      View-Only token for clients/staff (read-only, auto-generated if omitted)"
             echo "  --token <token>           Legacy alias for --admin-token"
+            echo "  --white-label             Enable white-label mode (removes vendor branding)"
+            echo "  --app-name <name>         Custom application title (default: Health Sentinel)"
+            echo "  --company <name>          Custom company/agency provider name"
+            echo "  --brand-color <hex>       Custom primary brand hex color (default: #7d9dff)"
             echo "  -y, --yes                 Non-interactive mode (auto-install missing dependencies)"
             echo "  --enable-php-slowlog      Safely configure PHP-FPM / Plesk slow logging (5s threshold)"
             echo "  --enable-timer            Also enable 5-minute systemd timer (sentinel-cron.timer)"
@@ -271,7 +295,7 @@ if [ ! -f "${CONFIG_FILE}" ]; then
 fi
 
 # Safely update config using Python with sys.argv
-python3 - "${CONFIG_FILE}" "${BIND}" "${PORT}" "${TOKEN}" "${ADMIN_TOKEN}" "${VIEW_TOKEN}" <<'PYEOF'
+python3 - "${CONFIG_FILE}" "${BIND}" "${PORT}" "${TOKEN}" "${ADMIN_TOKEN}" "${VIEW_TOKEN}" "${WHITE_LABEL}" "${APP_NAME}" "${COMPANY_NAME}" "${BRAND_COLOR}" <<'PYEOF'
 import sys
 import json
 import secrets
@@ -282,6 +306,10 @@ arg_port = sys.argv[3]
 arg_token = sys.argv[4]
 arg_admin = sys.argv[5]
 arg_view = sys.argv[6]
+arg_white_label = sys.argv[7]
+arg_app_name = sys.argv[8]
+arg_company = sys.argv[9]
+arg_color = sys.argv[10]
 
 with open(cfg_path, 'r') as f:
     cfg = json.load(f)
@@ -322,6 +350,19 @@ if arg_bind:
     cfg['web']['bind'] = arg_bind
 if arg_port:
     cfg['web']['port'] = int(arg_port)
+
+# Configure branding options
+if 'branding' not in cfg:
+    cfg['branding'] = {}
+if arg_white_label == 'true':
+    cfg['branding']['white_label'] = True
+if arg_app_name:
+    cfg['branding']['app_name'] = arg_app_name
+if arg_company:
+    cfg['branding']['company_name'] = arg_company
+    cfg['branding']['agency_name'] = arg_company
+if arg_color:
+    cfg['branding']['primary_color'] = arg_color
 
 with open(cfg_path, 'w') as f:
     json.dump(cfg, f, indent=2)

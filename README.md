@@ -2,6 +2,7 @@
 
 A **production-ready**, **zero-dependency** (pure Python 3 stdlib) Linux server health platform, capacity benchmark, and forensics monitor featuring:
 
+* **🎨 Custom Branding & White-Label Platform**: Rebrand Sentinel for client delivery, MSPs, or hosting agencies. Features a 1-click **White-Label Mode** (removes all vendor mentions), custom application name, company/agency name, custom logo URL, live primary/accent theme colors (`--acc`, `--acc2`), executive report titles, support email/helpdesk links, and custom footer copyrights. Accessible via the in-dashboard **`🎨 Branding`** admin modal or automated CLI installation flags.
 * **👥 Safe Visitor Traffic Capacity & Stress Benchmark**: Safely tests how many simultaneous active visitors and requests/second your server can sustain. Features progressive concurrency ramping (5 → 15 → 30 → 50 → 150), real-time RPS/latency telemetry, and an **auto-abort circuit breaker** that halts immediately if load &ge; 4.5 or available RAM &lt; 120MB to guarantee zero downtime.
 * **🔐 Dual-Token Role-Based Access Control (RBAC)**: Distinct credentials for **Admin** (`admin_token` with full server control, PHP recycle, 1-click firewall bans, and benchmarks) and **View-Only** (`view_token` for clients, marketing, and staff showing real-time metrics and reports while blocking all mutations with HTTP 403).
 * **🛡️ Security Shield & Anti-Brute-Force Rate Limiter**: Sliding-window rate limiter (5 failed token attempts in 60s → 15-minute lockout with HTTP 429), constant-time `hmac.compare_digest` token validation, security headers (`X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`), and native `iptables` & RHEL `firewalld` rich rule support.
@@ -20,7 +21,7 @@ A **production-ready**, **zero-dependency** (pure Python 3 stdlib) Linux server 
 
 ## 🚀 1-Command Universal Auto-Update or Install
 
-To install Sentinel or upgrade an existing installation to the latest release (**v2.1.0**), simply run:
+To install Sentinel or upgrade an existing installation to the latest release (**v2.1.1**), simply run:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/islamwell/linux-benchmark-vps/master/update.sh | sudo bash
@@ -378,9 +379,47 @@ sudo /opt/health-sentinel/deploy/optimize-io-memory.sh
 
 *You can also trigger this optimization with a single click from the **`⚡ Quick Actions`** dashboard modal.*
 
+## 🎨 Custom Branding & White-Label Platform
+
+Linux Health Sentinel includes native white-label capabilities designed specifically for agencies, Managed Service Providers (MSPs), hosting resellers, and system administrators delivering managed infrastructure services to clients.
+
+### 🌟 White-Label Capabilities:
+* **Vendor Neutrality**: Enable **White-Label Mode** to eliminate all references to "Health Sentinel" across the web dashboard, page title, favicon, and generated PDF reports.
+* **Custom Platform Identity**: Set your own Application Name (e.g. *CloudGuardian* or *Acme Server Monitor*) and Company/Agency Name.
+* **Custom Logo**: Display your company's logo in the dashboard header and executive client audits (supports HTTPS URLs and base64 data URIs).
+* **Dynamic Brand Colors**: Customize Primary (`--acc`) and Accent (`--acc2`) theme colors with live real-time CSS variable updating and interactive color pickers.
+* **Support & Helpdesk Links**: Configure direct links to your ticketing portal or support email directly in the dashboard footer and report signatures.
+* **Executive Client Audits**: Generate branded executive PDF health reports stamped with `Certified by <Your Agency>` and client project tags.
+
+### ⚙️ Managing Branding:
+1. **From Dashboard (Admin)**: Click the **`🎨 Branding`** button in the header to open the live customization modal. Tweak colors, preview logos in real time, and persist directly to disk.
+2. **From Installer CLI**: Deploy with preconfigured branding non-interactively:
+   ```bash
+   sudo bash install.sh --white-label \
+     --app-name "Acme Sentinel" \
+     --company "Acme Managed Hosting" \
+     --brand-color "#0ea5e9"
+   ```
+3. **From `config.json`**:
+   ```json
+   "branding": {
+     "white_label": true,
+     "app_name": "CloudOps Monitor",
+     "company_name": "Acme Cloud Services",
+     "logo_url": "https://example.com/logo.png",
+     "primary_color": "#0ea5e9",
+     "accent_color": "#6366f1",
+     "support_url": "https://help.acme.com",
+     "support_email": "ops@acme.com",
+     "client_name": "Acme Production Cluster",
+     "report_title": "Executive Infrastructure Health Audit",
+     "custom_footer_text": "Managed 24/7 by Acme Cloud Services © 2026"
+   }
+   ```
+
 ---
 
 ## 📜 Versioning
-Current Version: **v2.1.0 (updated 2026-09-13 08:30)**
+Current Version: **v2.1.1 (updated 2026-09-13 08:50)**
 
 

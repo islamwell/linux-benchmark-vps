@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — 1-Command Universal Auto-Updater
-# Version: 2.1.0 (updated 2026-09-13 08:30)
+# Version: 2.1.1 (updated 2026-09-13 08:50)
 # ==============================================================================
 
 set -euo pipefail
@@ -117,7 +117,7 @@ IFS='|' read -r CFG_BIND CFG_PORT CFG_ADMIN_TOKEN CFG_VIEW_TOKEN <<< "${ACCESS_I
 PUBLIC_IP=$(curl -s -m 2 https://api.ipify.org 2>/dev/null || curl -s -m 2 https://icanhazip.com 2>/dev/null || echo "${CFG_BIND}")
 
 echo -e "\n${C_GREEN}╔════════════════════════════════════════════════════════════════════════════╗${C_RESET}"
-echo -e "${C_GREEN}║  ${C_BOLD}✓  UPDATE SUCCESSFUL — LINUX HEALTH SENTINEL v2.1.0                    ${C_RESET}${C_GREEN}║${C_RESET}"
+echo -e "${C_GREEN}║  ${C_BOLD}✓  UPDATE SUCCESSFUL — LINUX HEALTH SENTINEL v2.1.1                    ${C_RESET}${C_GREEN}║${C_RESET}"
 echo -e "${C_GREEN}╚════════════════════════════════════════════════════════════════════════════╝${C_RESET}\n"
 
 echo -e "  ▸ Service Status: ${C_GREEN}active (running)${C_RESET}"

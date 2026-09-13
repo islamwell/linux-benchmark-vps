@@ -140,10 +140,18 @@
   },
 
   "branding": {
+    "white_label": false,
+    "app_name": "Health Sentinel",
+    "company_name": "OpsCare Managed Cloud",
     "agency_name": "OpsCare Managed Cloud",
-    "report_title": "Executive Server Health & Performance Audit",
+    "logo_url": "",
+    "primary_color": "#7d9dff",
+    "accent_color": "#b98cff",
+    "support_url": "",
     "support_email": "support@example.com",
-    "client_name": "Production VPS"
+    "client_name": "Production VPS",
+    "report_title": "Executive Server Health & Performance Audit",
+    "custom_footer_text": ""
   },
 
   "visitors": {
