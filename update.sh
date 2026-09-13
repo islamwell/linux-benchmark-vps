@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — 1-Command Universal Auto-Updater
-# Version: 2.1.1 (updated 2026-09-13 08:50)
+# Version: 2.2.0 (updated 2026-09-13 13:25)
 # ==============================================================================
 
 set -euo pipefail
@@ -67,6 +67,14 @@ fi
 if [ -f "${TMP_DIR}/deploy/enable-plesk-php-slowlog.sh" ]; then
     cp "${TMP_DIR}/deploy/enable-plesk-php-slowlog.sh" "${INSTALL_DIR}/deploy/"
     chmod +x "${INSTALL_DIR}/deploy/enable-plesk-php-slowlog.sh"
+fi
+if [ -f "${TMP_DIR}/deploy/setup-ssl.sh" ]; then
+    cp "${TMP_DIR}/deploy/setup-ssl.sh" "${INSTALL_DIR}/deploy/"
+    chmod +x "${INSTALL_DIR}/deploy/setup-ssl.sh"
+fi
+if [ -f "${TMP_DIR}/deploy/generate-license.py" ]; then
+    cp "${TMP_DIR}/deploy/generate-license.py" "${INSTALL_DIR}/deploy/"
+    chmod +x "${INSTALL_DIR}/deploy/generate-license.py"
 fi
 chmod +x "${INSTALL_DIR}/sentinel.py" "${INSTALL_DIR}/install.sh" "${INSTALL_DIR}/update.sh"
 

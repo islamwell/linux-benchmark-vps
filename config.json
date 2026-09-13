@@ -185,5 +185,17 @@
     "timeout_seconds": 5,
     "auto_discover_local_vhosts": true,
     "custom_sites": []
+  },
+
+  "fleet": {
+    "enabled": true,
+    "poll_interval_seconds": 60,
+    "timeout_seconds": 4,
+    "nodes": []
+  },
+
+  "license": {
+    "key": "",
+    "tier": "community"
   }
 }

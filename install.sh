@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — Automated Installer & Service Manager
-# Version: 2.1.1 (updated 2026-09-13 08:50)
+# Version: 2.2.0 (updated 2026-09-13 13:25)
 # ==============================================================================
 
 set -euo pipefail
 
-VERSION="2.1.1"
-UPDATED="2026-09-13 08:50"
+VERSION="2.2.0"
+UPDATED="2026-09-13 13:25"
 
 # Target installation paths
 INSTALL_DIR="/opt/health-sentinel"
@@ -32,6 +32,8 @@ BRAND_COLOR=""
 AUTO_CONFIRM=false
 ENABLE_SLOWLOG=false
 ENABLE_TIMER=false
+ENABLE_SSL=false
+LICENSE_KEY=""
 UNINSTALL=false
 
 # Colors
@@ -91,6 +93,14 @@ while [[ $# -gt 0 ]]; do
             ENABLE_TIMER=true
             shift
             ;;
+        --ssl)
+            ENABLE_SSL=true
+            shift
+            ;;
+        --license-key)
+            LICENSE_KEY="$2"
+            shift 2
+            ;;
         --uninstall)
             UNINSTALL=true
             shift
@@ -113,6 +123,8 @@ while [[ $# -gt 0 ]]; do
             echo "  -y, --yes                 Non-interactive mode (auto-install missing dependencies)"
             echo "  --enable-php-slowlog      Safely configure PHP-FPM / Plesk slow logging (5s threshold)"
             echo "  --enable-timer            Also enable 5-minute systemd timer (sentinel-cron.timer)"
+            echo "  --ssl                     Deploy automated SSL/TLS reverse proxy (Caddy / Nginx / Certbot)"
+            echo "  --license-key <key>       Activate commercial Pro or Agency license key"
             echo "  --uninstall               Stop service and remove Sentinel from system"
             echo "  -h, --help                Show this help message"
             echo ""
@@ -285,6 +297,14 @@ fi
 if [ -f "${SOURCE_DIR}/deploy/sentinel-cron.timer" ]; then
     cp "${SOURCE_DIR}/deploy/sentinel-cron.timer" "${INSTALL_DIR}/deploy/"
 fi
+if [ -f "${SOURCE_DIR}/deploy/setup-ssl.sh" ]; then
+    cp "${SOURCE_DIR}/deploy/setup-ssl.sh" "${INSTALL_DIR}/deploy/"
+    chmod 755 "${INSTALL_DIR}/deploy/setup-ssl.sh"
+fi
+if [ -f "${SOURCE_DIR}/deploy/generate-license.py" ]; then
+    cp "${SOURCE_DIR}/deploy/generate-license.py" "${INSTALL_DIR}/deploy/"
+    chmod 755 "${INSTALL_DIR}/deploy/generate-license.py"
+fi
 
 # 5. Handle Configuration
 echo -e "${C_BOLD}[4/6] Configuring Sentinel security and thresholds...${C_RESET}"
@@ -425,6 +445,20 @@ if [ "$ENABLE_SLOWLOG" = true ]; then
 else
     echo -e "    ${C_DIM}PHP slowlog auto-config skipped (opt-in). Run anytime with:${C_RESET}"
     echo -e "    ${C_BLUE}sudo bash ${INSTALL_DIR}/deploy/enable-plesk-php-slowlog.sh 5s 20${C_RESET}"
+fi
+
+# Optional Commercial License Activation
+if [ -n "$LICENSE_KEY" ]; then
+    echo -e "${C_BOLD}Activating Sentinel commercial license...${C_RESET}"
+    python3 "${INSTALL_DIR}/sentinel.py" -c "${CONFIG_FILE}" --activate-license "${LICENSE_KEY}" || echo -e "    ${C_WARN}[!] License activation failed; check key format.${C_RESET}"
+fi
+
+# Optional SSL/TLS Reverse Proxy Setup
+if [ "$ENABLE_SSL" = true ]; then
+    echo -e "${C_BOLD}Deploying automated SSL/TLS reverse proxy...${C_RESET}"
+    if [ -f "${INSTALL_DIR}/deploy/setup-ssl.sh" ]; then
+        bash "${INSTALL_DIR}/deploy/setup-ssl.sh" || echo -e "    ${C_WARN}[!] SSL setup exited with notice.${C_RESET}"
+    fi
 fi
 
 # Server IP detection

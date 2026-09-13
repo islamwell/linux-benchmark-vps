@@ -2,6 +2,9 @@
 
 A **production-ready**, **zero-dependency** (pure Python 3 stdlib) Linux server health platform, capacity benchmark, and forensics monitor featuring:
 
+* **🌐 Multi-Server Fleet Hub**: Centralized agency dashboard monitoring all connected client VPS nodes in real time. Features multi-threaded parallel polling, aggregated fleet health grades, per-node resource vitals, and one-click drill-downs.
+* **🔑 Cryptographic Licensing Engine**: Pure Python stdlib HMAC-SHA256 signature verification supporting Free Open-Core, Pro ($89/yr), and Agency ($199 lifetime) tiers. Includes offline key validator and standalone `deploy/generate-license.py` key issuer for store owners.
+* **🔒 Automated SSL/TLS Reverse Proxy Deployer**: 1-click HTTPS provisioning (`deploy/setup-ssl.sh` & `install.sh --ssl`) supporting Caddy (automatic Let's Encrypt certificates), Nginx, and OpenSSL self-signed setups.
 * **🎨 Custom Branding & White-Label Platform**: Rebrand Sentinel for client delivery, MSPs, or hosting agencies. Features a 1-click **White-Label Mode** (removes all vendor mentions), custom application name, company/agency name, custom logo URL, live primary/accent theme colors (`--acc`, `--acc2`), executive report titles, support email/helpdesk links, and custom footer copyrights. Accessible via the in-dashboard **`🎨 Branding`** admin modal or automated CLI installation flags.
 * **👥 Safe Visitor Traffic Capacity & Stress Benchmark**: Safely tests how many simultaneous active visitors and requests/second your server can sustain. Features progressive concurrency ramping (5 → 15 → 30 → 50 → 150), real-time RPS/latency telemetry, and an **auto-abort circuit breaker** that halts immediately if load &ge; 4.5 or available RAM &lt; 120MB to guarantee zero downtime.
 * **🔐 Dual-Token Role-Based Access Control (RBAC)**: Distinct credentials for **Admin** (`admin_token` with full server control, PHP recycle, 1-click firewall bans, and benchmarks) and **View-Only** (`view_token` for clients, marketing, and staff showing real-time metrics and reports while blocking all mutations with HTTP 403).
@@ -21,7 +24,7 @@ A **production-ready**, **zero-dependency** (pure Python 3 stdlib) Linux server 
 
 ## 🚀 1-Command Universal Auto-Update or Install
 
-To install Sentinel or upgrade an existing installation to the latest release (**v2.1.1**), simply run:
+To install Sentinel or upgrade an existing installation to the latest release (**v2.2.0**), simply run:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/islamwell/linux-benchmark-vps/master/update.sh | sudo bash
@@ -419,7 +422,84 @@ Linux Health Sentinel includes native white-label capabilities designed specific
 
 ---
 
+## 🌐 Multi-Server Fleet Hub (Agency Edition)
+
+The **Multi-Server Fleet Hub** connects all your client VPS instances and droplets into a single unified control room.
+
+* **Concurrent Parallel Polling**: Scans dozens of servers in parallel using Python thread workers without blocking your main dashboard.
+* **Real-Time Node Telemetry**: Instantly see CPU load, RAM usage %, Disk usage %, uptime, active alerts, and composite health grade (A+ through F) per VPS.
+* **Instant Drill-Down**: 1-click jumps directly to individual node dashboards or opens diagnostic drills.
+* **Adding Nodes**: From the dashboard **`🌐 Fleet Hub`** tab, click **`+ Add VPS Node`** and provide the node name, URL, and security token. Alternatively, configure directly in `config.json`:
+  ```json
+  "fleet": {
+    "poll_interval_seconds": 60,
+    "timeout_seconds": 4.0,
+    "nodes": [
+      {
+        "id": "node_nyc",
+        "name": "Acme Client - NYC Droplet",
+        "url": "https://sentinel.client1.com:8686",
+        "token": "admin-token-here",
+        "group": "Production"
+      }
+    ]
+  }
+  ```
+
+---
+
+## 🔑 Cryptographic Licensing Engine
+
+Linux Health Sentinel uses pure-stdlib HMAC-SHA256 digital signature validation. Key validation requires **zero external network requests** or phone-home telemetry.
+
+### Feature Matrix:
+| Feature | Community (Free) | Pro ($89/yr) | Agency Fleet ($199 Lifetime) |
+| :--- | :---: | :---: | :---: |
+| Top-10 Linux Diagnostics | ✅ | ✅ | ✅ |
+| Incident Snapshot Preservation | ✅ | ✅ | ✅ |
+| Dual-Token RBAC Security | ✅ | ✅ | ✅ |
+| Safe Visitor Capacity Benchmark | ❌ | ✅ | ✅ |
+| Plesk PHP-FPM Slowlog Tracing | ❌ | ✅ | ✅ |
+| 1-Click Autonomous Self-Healing | ❌ | ✅ | ✅ |
+| Multi-Server Fleet Hub | ❌ | ❌ | ✅ (Unlimited Nodes) |
+| White-Label & Custom Branding | ❌ | ❌ | ✅ |
+| Executive PDF Client Audits | Basic | Full | White-Labeled |
+
+### Issuing Licenses (Store Owner CLI):
+Generate cryptographically signed license keys using `deploy/generate-license.py`:
+```bash
+# Generate Agency Lifetime key:
+python3 deploy/generate-license.py --tier agency --email client@agency.com --nodes 50 --days 365
+
+# Output format:
+# HS-AGENCY-ey...-A1B2C3D4E5F6
+```
+
+### Activating Licenses:
+* **From Web Dashboard**: Click the **`🔑 License`** button in the top navigation header and paste your key.
+* **From CLI**: `sudo python3 sentinel.py --activate-license "HS-AGENCY-..."`
+* **During Installation**: `sudo bash install.sh --license-key "HS-AGENCY-..."`
+
+---
+
+## 🔒 Automated SSL/TLS Reverse Proxy Deployer
+
+Deploy production-grade HTTPS with automated SSL renewal in under 60 seconds:
+```bash
+sudo bash deploy/setup-ssl.sh
+```
+Or during initial installation:
+```bash
+sudo bash install.sh --ssl
+```
+Supported proxy engines:
+1. **Caddy (Recommended)**: Fully automatic Let's Encrypt certificates with HTTP→HTTPS redirect and HTTP/2 + HTTP/3 support.
+2. **Nginx + Certbot**: Automated virtual host configuration with reverse proxy headers.
+3. **OpenSSL Self-Signed**: Instant local TLS encryption for private intranet or IP-only environments.
+
+---
+
 ## 📜 Versioning
-Current Version: **v2.1.1 (updated 2026-09-13 08:50)**
+Current Version: **v2.2.0 (updated 2026-09-13 13:25)**
 
 

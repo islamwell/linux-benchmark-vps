@@ -13,13 +13,16 @@
 """
 
 import argparse
+import base64
 import concurrent.futures
 import glob
+import hashlib
 import hmac
 import json
 import os
 import pwd
 import re
+import secrets
 import shutil
 import smtplib
 import socket
@@ -39,8 +42,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.1.1"
-UPDATED = "2026-09-13 08:50"
+VERSION = "2.2.0"
+UPDATED = "2026-09-13 13:25"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -184,6 +187,16 @@ DEFAULTS = {
         "timeout_seconds": 5,
         "auto_discover_local_vhosts": True,
         "custom_sites": []
+    },
+    "fleet": {
+        "enabled": True,
+        "poll_interval_seconds": 60,
+        "timeout_seconds": 4,
+        "nodes": []
+    },
+    "license": {
+        "key": "",
+        "tier": "community"
     }
 }
 
@@ -3240,6 +3253,338 @@ def generate_server_doctor(report):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  COMMERCIAL LICENSING & MULTI-SERVER FLEET HUB
+# ─────────────────────────────────────────────────────────────────────────────
+
+DEFAULT_LICENSE_SECRET = "hs_master_sec_2026_x89a_prod_sentinel_signing_root"
+
+class LicenseManager:
+    """
+    Cryptographic license verification and feature tier management for Sentinel.
+    Pure stdlib: uses hmac, hashlib, base64, json.
+    Tiers:
+      - 'community': free open-core (top 10 checks, basic CLI, single node)
+      - 'pro': single/multi VPS, visitor capacity bench, IP ban shield, PHP slowlog trace
+      - 'agency': unlimited nodes, multi-server fleet hub, white-label mode, executive PDF reports
+    """
+    def __init__(self, cfg, secret=DEFAULT_LICENSE_SECRET):
+        self.cfg = cfg
+        self.secret = os.environ.get("SENTINEL_LICENSE_SECRET", secret)
+        self.lock = threading.Lock()
+
+    def verify_key(self, key_str):
+        if not key_str or not isinstance(key_str, str):
+            return {"valid": False, "error": "No license key provided", "tier": "community"}
+        key_str = key_str.strip()
+        parts = key_str.split("-")
+        if len(parts) < 4 or parts[0] != "HS":
+            return {"valid": False, "error": "Invalid license key format", "tier": "community"}
+        tier = parts[1].lower()
+        if tier not in ("pro", "agency"):
+            return {"valid": False, "error": f"Unknown tier: {tier}", "tier": "community"}
+        payload_b64 = parts[2]
+        provided_sig = parts[3].upper()
+
+        expected_sig = hmac.new(self.secret.encode(), f"{tier}.{payload_b64}".encode(), hashlib.sha256).hexdigest()[:16].upper()
+        if not hmac.compare_digest(provided_sig, expected_sig):
+            return {"valid": False, "error": "Cryptographic signature mismatch (invalid key)", "tier": "community"}
+
+        try:
+            rem = len(payload_b64) % 4
+            padded = payload_b64 + ('=' * ((4 - rem) % 4))
+            payload = json.loads(base64.urlsafe_b64decode(padded.encode()).decode())
+        except Exception as e:
+            return {"valid": False, "error": f"Malformed payload: {e}", "tier": "community"}
+
+        expires = payload.get("expires")
+        if expires:
+            try:
+                exp_dt = datetime.strptime(expires, "%Y-%m-%d").date()
+                if datetime.now(timezone.utc).date() > exp_dt:
+                    return {"valid": False, "error": f"License expired on {expires}", "tier": "community", "expired": True}
+            except Exception:
+                pass
+
+        return {
+            "valid": True,
+            "id": payload.get("id", "HS-LICENSE"),
+            "email": payload.get("email", "licensed-user"),
+            "tier": tier,
+            "nodes": payload.get("nodes", 1),
+            "created": payload.get("created"),
+            "expires": expires or "Lifetime (Never)"
+        }
+
+    def get_status(self):
+        lic_cfg = self.cfg.get("license", {})
+        key = lic_cfg.get("key", "").strip()
+        if not key:
+            return {
+                "tier": "community",
+                "tier_label": "Community Edition",
+                "valid": True,
+                "licensed": False,
+                "features": {
+                    "visitor_bench": False,
+                    "security_shield": True,
+                    "php_trace": True,
+                    "white_label": False,
+                    "fleet_hub": False,
+                    "executive_reports": True
+                },
+                "email": None,
+                "expires": None,
+                "nodes": 1,
+                "key_preview": ""
+            }
+
+        v = self.verify_key(key)
+        if not v.get("valid"):
+            return {
+                "tier": "community",
+                "tier_label": "Community (Invalid / Expired Key)",
+                "valid": False,
+                "licensed": False,
+                "error": v.get("error"),
+                "features": {
+                    "visitor_bench": False,
+                    "security_shield": True,
+                    "php_trace": True,
+                    "white_label": False,
+                    "fleet_hub": False,
+                    "executive_reports": True
+                },
+                "key_preview": key[:12] + "..." if len(key) > 12 else key
+            }
+
+        tier = v["tier"]
+        return {
+            "tier": tier,
+            "tier_label": "Agency Fleet" if tier == "agency" else "Professional",
+            "valid": True,
+            "licensed": True,
+            "id": v.get("id"),
+            "email": v.get("email"),
+            "nodes": v.get("nodes", 1),
+            "expires": v.get("expires"),
+            "features": {
+                "visitor_bench": True,
+                "security_shield": True,
+                "php_trace": True,
+                "white_label": (tier == "agency"),
+                "fleet_hub": (tier == "agency"),
+                "executive_reports": True
+            },
+            "key_preview": key[:12] + "..." + key[-4:] if len(key) > 16 else key
+        }
+
+    def activate(self, key_str, cfg_path=None):
+        v = self.verify_key(key_str)
+        if not v.get("valid"):
+            return False, v.get("error", "Invalid license key")
+        self.cfg["license"] = {
+            "key": key_str.strip(),
+            "tier": v["tier"]
+        }
+        if cfg_path:
+            save_config_section(cfg_path, "license", self.cfg["license"])
+        return True, f"Successfully activated Sentinel {v['tier'].upper()} license ({v.get('email')})"
+
+
+class FleetManager:
+    """
+    Central Multi-Server Fleet Hub for Sentinel.
+    Polls remote VPS nodes concurrently, aggregates fleet health, and manages node endpoints.
+    """
+    def __init__(self, cfg, cfg_path=None):
+        self.cfg = cfg
+        self.cfg_path = cfg_path
+        self.lock = threading.Lock()
+        self.poll_interval = int(cfg.get("fleet", {}).get("poll_interval_seconds", 60))
+        self.timeout = float(cfg.get("fleet", {}).get("timeout_seconds", 4))
+        self.last_summary = None
+        self.last_poll_time = 0.0
+
+    @property
+    def nodes(self):
+        return self.cfg.get("fleet", {}).get("nodes", [])
+
+    def _poll_single_node(self, node):
+        url = (node.get("url") or "").rstrip("/")
+        name = node.get("name") or url
+        token = node.get("token") or ""
+        group = node.get("group") or "Production"
+        nid = node.get("id") or hashlib.md5(url.encode()).hexdigest()[:8]
+
+        result = {
+            "id": nid,
+            "name": name,
+            "url": url,
+            "group": group,
+            "online": False,
+            "score": 0,
+            "grade": "OFFLINE",
+            "grade_label": "Unreachable",
+            "status": "crit",
+            "load": "—",
+            "mem_pct": 0,
+            "disk_pct": 0,
+            "uptime": "—",
+            "alert_count": 0,
+            "last_seen": None,
+            "error": None
+        }
+
+        try:
+            req_url = f"{url}/api/health"
+            if token:
+                req_url += f"?token={urllib.parse.quote(token)}"
+            req = urllib.request.Request(req_url, headers={"User-Agent": f"Sentinel-Fleet/{VERSION}", "X-Auth-Token": token})
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode())
+                    rep = data.get("report", {})
+                    checks = {c["id"]: c for c in rep.get("checks", [])}
+                    
+                    mem_val = checks.get("memory", {}).get("metrics", {}).get("used_pct", 0)
+                    disk_val = checks.get("disk", {}).get("metrics", {}).get("worst_pct", 0)
+                    load_val = checks.get("load", {}).get("value", 0)
+
+                    result.update({
+                        "online": True,
+                        "score": rep.get("score", 100),
+                        "grade": rep.get("grade", "A+"),
+                        "grade_label": rep.get("grade_label", "Healthy"),
+                        "status": rep.get("status", "ok"),
+                        "load": f"{load_val:.2f}" if isinstance(load_val, (int, float)) else str(load_val),
+                        "mem_pct": round(mem_val, 1) if isinstance(mem_val, (int, float)) else 0,
+                        "disk_pct": round(disk_val, 1) if isinstance(disk_val, (int, float)) else 0,
+                        "uptime": rep.get("uptime", "up"),
+                        "host": rep.get("host", ""),
+                        "alert_count": len([c for c in rep.get("checks", []) if c.get("status") in ("warn", "crit")]),
+                        "last_seen": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
+                        "error": None
+                    })
+                else:
+                    result["error"] = f"HTTP {resp.status}"
+        except Exception as e:
+            result["error"] = str(e)
+
+        return result
+
+    def poll_all(self, force=False):
+        now = time.time()
+        with self.lock:
+            if not force and self.last_summary and (now - self.last_poll_time < self.poll_interval):
+                return self.last_summary
+
+            current_nodes = list(self.nodes)
+            if not current_nodes:
+                self.last_summary = {
+                    "total_nodes": 0,
+                    "online_nodes": 0,
+                    "offline_nodes": 0,
+                    "avg_score": 100,
+                    "status": "ok",
+                    "nodes": []
+                }
+                self.last_poll_time = now
+                return self.last_summary
+
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(12, max(1, len(current_nodes)))) as ex:
+            futs = [ex.submit(self._poll_single_node, n) for n in current_nodes]
+            for f in concurrent.futures.as_completed(futs):
+                try:
+                    results.append(f.result())
+                except Exception:
+                    pass
+
+        results.sort(key=lambda x: x.get("name", ""))
+
+        online_count = sum(1 for n in results if n.get("online"))
+        offline_count = len(results) - online_count
+        scores = [n["score"] for n in results if n.get("online")]
+        avg_score = round(sum(scores) / len(scores), 1) if scores else 0
+
+        fleet_status = "ok"
+        if any(n.get("status") == "crit" or not n.get("online") for n in results):
+            fleet_status = "crit"
+        elif any(n.get("status") == "warn" for n in results):
+            fleet_status = "warn"
+
+        summary = {
+            "total_nodes": len(results),
+            "online_nodes": online_count,
+            "offline_nodes": offline_count,
+            "avg_score": avg_score,
+            "status": fleet_status,
+            "nodes": results,
+            "poll_time": datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+        }
+
+        with self.lock:
+            self.last_summary = summary
+            self.last_poll_time = now
+
+        return summary
+
+    def get_summary(self):
+        with self.lock:
+            if self.last_summary:
+                return self.last_summary
+        return self.poll_all(force=True)
+
+    def add_node(self, name, url, token="", group="Production", cfg_path=None):
+        url = (url or "").strip().rstrip("/")
+        name = (name or "").strip() or url
+        if not url.startswith("http://") and not url.startswith("https://"):
+            return False, "URL must start with http:// or https://"
+
+        with self.lock:
+            nodes = list(self.cfg.get("fleet", {}).get("nodes", []))
+            for n in nodes:
+                if n.get("url", "").rstrip("/") == url:
+                    return False, f"Server node with URL {url} is already registered"
+
+            nid = "node_" + secrets.token_hex(4)
+            new_node = {
+                "id": nid,
+                "name": name,
+                "url": url,
+                "token": token.strip(),
+                "group": (group or "Production").strip()
+            }
+            nodes.append(new_node)
+            if "fleet" not in self.cfg:
+                self.cfg["fleet"] = {}
+            self.cfg["fleet"]["nodes"] = nodes
+            target_cfg = cfg_path or self.cfg_path
+            if target_cfg:
+                save_config_section(target_cfg, "fleet", self.cfg["fleet"])
+
+        self.poll_all(force=True)
+        return True, f"Node '{name}' added successfully"
+
+    def remove_node(self, node_id_or_url, cfg_path=None):
+        node_id_or_url = (node_id_or_url or "").strip()
+        with self.lock:
+            nodes = list(self.cfg.get("fleet", {}).get("nodes", []))
+            initial_len = len(nodes)
+            nodes = [n for n in nodes if n.get("id") != node_id_or_url and n.get("url", "").rstrip("/") != node_id_or_url.rstrip("/")]
+            if len(nodes) == initial_len:
+                return False, f"Node '{node_id_or_url}' not found"
+
+            self.cfg["fleet"]["nodes"] = nodes
+            target_cfg = cfg_path or self.cfg_path
+            if target_cfg:
+                save_config_section(target_cfg, "fleet", self.cfg["fleet"])
+
+        self.poll_all(force=True)
+        return True, "Node removed successfully"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  EXECUTIVE CLIENT REPORT GENERATOR (PDF & White-Label HTML Digest)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -3529,8 +3874,9 @@ def grade(score):
 
 
 class Engine:
-    def __init__(self, cfg):
+    def __init__(self, cfg, cfg_path=None):
         self.cfg = cfg
+        self.cfg_path = cfg_path
         self.sampler = Sampler()
         self.history = deque(maxlen=cfg.get("history_points", 5760))
         self.report = None
@@ -3547,6 +3893,8 @@ class Engine:
         self.benchmark_engine = BenchmarkEngine(cfg)
         self.capacity_benchmark = CapacityBenchmark(cfg)
         self.site_monitor = SiteMonitor(cfg, state_dir=state_dir)
+        self.license_manager = LicenseManager(cfg)
+        self.fleet_manager = FleetManager(cfg, cfg_path=cfg_path)
         self._load_state()
         self.auto_healer = AutoHealer(self)
 
@@ -4206,13 +4554,14 @@ body.role-viewer .admin-only{display:none!important}
  <header>
   <div class="brand">
    <div class="logo" id="brandLogoWrap"><svg viewBox="0 0 24 24"><path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-4z"/><path d="M8.5 12.5l2.2 2.2 4.8-5"/></svg></div>
-   <div><h1><span id="brandTitle">Health Sentinel</span> <span style="font-size:11px;color:var(--dim);font-weight:600">v__VER__</span> <span id="roleBadge"></span></h1>
+   <div><h1><span id="brandTitle">Health Sentinel</span> <span style="font-size:11px;color:var(--dim);font-weight:600">v__VER__</span> <span id="roleBadge"></span><span id="licenseBadge" style="cursor:pointer;" onclick="openLicenseModal()"></span></h1>
     <div class="sub" id="hostline">loading…</div></div>
   </div>
   <div class="spacer"></div>
   <input class="search" id="q" placeholder="Filter checks…  ( / )">
   <button class="btn" id="autoBtn" onclick="toggleAuto()"><svg viewBox="0 0 24 24"><path d="M12 6v6l4 2"/><circle cx="12" cy="12" r="9"/></svg><span id="autoTxt">Auto</span></button>
   <button class="btn" onclick="toggleTheme()"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg></button>
+  <button class="btn" id="licenseBtn" onclick="openLicenseModal()"><svg viewBox="0 0 24 24"><path d="M12 2a5 5 0 00-5 5v3H6a2 2 0 00-2 2v8a2 2 0 002 2h12a2 2 0 002-2v-8a2 2 0 00-2-2h-1V7a5 5 0 00-5-5zm-3 5a3 3 0 016 0v3H9V7z"/></svg><span id="licenseBtnText">🔑 License</span></button>
   <button class="btn admin-only" onclick="openBrandingModal()"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 6.36 15.36L12 12V3z"/></svg>🎨 Branding</button>
   <button class="btn admin-only" onclick="openQuickActionsModal()"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>⚡ Quick Actions &amp; PHP</button>
   <button class="btn" onclick="openExecutiveReportModal()"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>📄 Executive Report</button>
@@ -4223,6 +4572,7 @@ body.role-viewer .admin-only{display:none!important}
 
  <div class="nav-tabs">
   <button class="tab-btn active" id="tab-overview-btn" onclick="switchTab('overview')"><svg viewBox="0 0 24 24"><path d="M3 12h18M3 6h18M3 18h18"/></svg>📊 System Health</button>
+  <button class="tab-btn" id="tab-fleet-btn" onclick="switchTab('fleet')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/><circle cx="12" cy="12" r="3"/></svg>🌐 Fleet Hub <span class="tab-badge" id="badge-fleet">0</span></button>
   <button class="tab-btn" id="tab-sites-btn" onclick="switchTab('sites')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>🌐 Websites &amp; Uptime <span class="tab-badge" id="badge-sites">0</span></button>
   <button class="tab-btn" id="tab-visitors-btn" onclick="switchTab('visitors')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3v18M3 12h18"/></svg>👥 Live Visitors &amp; Geo <span class="tab-badge" id="badge-visitors">0</span></button>
   <button class="tab-btn" id="tab-benchmark-btn" onclick="switchTab('benchmark')"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>⚡ VPS Benchmark <span class="tab-badge" id="badge-bench">Ready</span></button>
@@ -4270,6 +4620,7 @@ body.role-viewer .admin-only{display:none!important}
   </div>
  </div>
 
+ <div id="view-fleet" style="display:none;"></div>
  <div id="view-sites" style="display:none;"></div>
  <div id="view-visitors" style="display:none;"></div>
  <div id="view-benchmark" style="display:none;"></div>
@@ -4302,7 +4653,7 @@ const ICONS = {
  alert:'<path d="M12 3l9.5 17H2.5L12 3z"/><path d="M12 9v5M12 17h.01"/>'
 };
 const CLR={ok:'var(--ok)',warn:'var(--warn)',crit:'var(--crit)',info:'var(--acc)'};
-let REPORT=null, HIST=[], INCIDENTS=[], FILTER='all', AUTO=true, TIMER=null, OPEN=new Set(), ACTIVE_RANGES={cpu:'10m',mem:'10m',load:'10m',disk:'10m'}, VISITORS=null, BENCHMARK=null, CAPACITY_BENCHMARK=null, BENCH_SUBTAB='capacity', CAPACITY_TIMER=null, DOCTOR=null, SITES=null, SECURITY=null, CURRENT_TAB='overview', BRANDING=(BOOT&&BOOT.branding)||null;
+let REPORT=null, HIST=[], INCIDENTS=[], FILTER='all', AUTO=true, TIMER=null, OPEN=new Set(), ACTIVE_RANGES={cpu:'10m',mem:'10m',load:'10m',disk:'10m'}, VISITORS=null, BENCHMARK=null, CAPACITY_BENCHMARK=null, BENCH_SUBTAB='capacity', CAPACITY_TIMER=null, DOCTOR=null, SITES=null, SECURITY=null, CURRENT_TAB='overview', BRANDING=(BOOT&&BOOT.branding)||null, FLEET=null, LICENSE=(BOOT&&BOOT.license)||null;
 
 const $=s=>document.querySelector(s), esc=s=>String(s==null?'':s)
  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -4613,12 +4964,13 @@ function switchTab(tabId){
   const btn = $('#tab-' + tabId + '-btn');
   if(btn) btn.classList.add('active');
 
-  const views = ['overview', 'sites', 'visitors', 'benchmark', 'incidents'];
+  const views = ['overview', 'fleet', 'sites', 'visitors', 'benchmark', 'incidents'];
   views.forEach(v => {
     const el = $('#view-' + v);
     if(el) el.style.display = (v === tabId) ? 'block' : 'none';
   });
 
+  if(tabId === 'fleet') renderFleet(FLEET);
   if(tabId === 'sites' && SITES) renderSites(SITES);
   if(tabId === 'visitors' && VISITORS) renderVisitors(VISITORS);
   if(tabId === 'benchmark') renderBenchmark(BENCHMARK);
@@ -5352,6 +5704,321 @@ function renderIncidentsView(){
     </div>`;
 }
 
+function updateLicenseBadge(lic){
+  LICENSE = lic;
+  const badge = $('#licenseBadge');
+  const btnTxt = $('#licenseBtnText');
+  if(!badge) return;
+  const tier = (lic && lic.tier) || 'community';
+  if(tier === 'agency'){
+    badge.innerHTML = `<span style="display:inline-block;padding:2px 8px;border-radius:6px;font-size:10px;font-weight:700;background:rgba(147,51,234,0.18);color:#c084fc;border:1px solid rgba(147,51,234,0.35);margin-left:6px;vertical-align:middle;">👑 AGENCY</span>`;
+    if(btnTxt) btnTxt.textContent = '👑 Agency';
+  } else if(tier === 'pro'){
+    badge.innerHTML = `<span style="display:inline-block;padding:2px 8px;border-radius:6px;font-size:10px;font-weight:700;background:rgba(14,165,233,0.18);color:#38bdf8;border:1px solid rgba(14,165,233,0.35);margin-left:6px;vertical-align:middle;">⭐ PRO</span>`;
+    if(btnTxt) btnTxt.textContent = '⭐ Pro';
+  } else {
+    badge.innerHTML = `<span style="display:inline-block;padding:2px 8px;border-radius:6px;font-size:10px;font-weight:700;background:rgba(148,163,184,0.12);color:var(--mut);border:1px solid var(--stroke2);margin-left:6px;vertical-align:middle;">FREE CORE</span>`;
+    if(btnTxt) btnTxt.textContent = '🔑 License';
+  }
+}
+
+function openLicenseModal(){
+  const lic = LICENSE || (BOOT && BOOT.license) || {tier:'community', licensed:false};
+  const modal = document.createElement('div');
+  modal.id = 'license-modal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:999;backdrop-filter:blur(8px);display:grid;place-items:center;padding:20px;';
+  modal.innerHTML = `
+    <div class="glass" style="max-width:540px;width:100%;padding:26px;background:var(--bg2);border-radius:var(--r);">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+        <div style="display:flex;align-items:center;gap:10px;">
+          <div style="font-size:24px;">🔑</div>
+          <div>
+            <h2 style="font-size:18px;margin:0;">Sentinel Commercial License</h2>
+            <div style="font-size:12px;color:var(--mut);">Cryptographic license activation and tier management.</div>
+          </div>
+        </div>
+        <button class="btn" onclick="this.closest('#license-modal').remove()">Close</button>
+      </div>
+
+      <div style="margin-bottom:18px;padding:14px;border-radius:12px;background:var(--card);border:1px solid var(--stroke);">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <span style="font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;">Active Tier</span>
+          <span class="badge" style="background:${lic.tier === 'agency' ? 'rgba(147,51,234,0.2)' : (lic.tier === 'pro' ? 'rgba(14,165,233,0.2)' : 'rgba(148,163,184,0.12)')};color:${lic.tier === 'agency' ? '#c084fc' : (lic.tier === 'pro' ? '#38bdf8' : 'var(--mut)')};">
+            ${esc(lic.tier_label || (lic.tier ? lic.tier.toUpperCase() : 'COMMUNITY'))}
+          </span>
+        </div>
+        ${lic.licensed ? `
+          <div style="font-size:12.5px;color:var(--txt);margin-bottom:4px;"><b>Licensed To:</b> ${esc(lic.email || 'Registered User')}</div>
+          <div style="font-size:12px;color:var(--mut);margin-bottom:4px;"><b>Expires:</b> ${esc(lic.expires || 'Never')}</div>
+          <div style="font-size:12px;color:var(--dim);font-family:monospace;"><b>Key:</b> ${esc(lic.key_preview || 'Active')}</div>
+        ` : `
+          <div style="font-size:12.5px;color:var(--mut);line-height:1.5;">
+            You are running the free open-core Sentinel. Activate a Pro or Agency license key to unlock Multi-Server Fleet Hub, White-Label branding, and VPS Capacity load testing.
+          </div>
+        `}
+      </div>
+
+      <div class="admin-only" style="margin-bottom:18px;">
+        <label style="display:block;font-size:12px;font-weight:600;margin-bottom:6px;color:var(--txt);">Enter License Key:</label>
+        <div style="display:flex;gap:8px;">
+          <input type="text" id="licenseKeyInput" placeholder="HS-AGENCY-ey...-A1B2C3D4" style="flex:1;padding:8px 12px;font-size:12.5px;background:var(--card);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);font-family:monospace;">
+          <button class="btn primary" id="btnActivateLic" onclick="activateLicenseKey()">Activate</button>
+        </div>
+        <div style="font-size:11px;color:var(--dim);margin-top:6px;">Format: HS-[PRO|AGENCY]-[BASE64_PAYLOAD]-[SIGNATURE]</div>
+      </div>
+
+      <div style="display:flex;justify-content:space-between;align-items:center;padding-top:12px;border-top:1px solid var(--stroke);font-size:12px;">
+        <span style="color:var(--dim);">Offline stdlib cryptographic signature verification</span>
+        <button class="btn" onclick="this.closest('#license-modal').remove()">Done</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+}
+
+async function activateLicenseKey(){
+  const inp = $('#licenseKeyInput');
+  const btn = $('#btnActivateLic');
+  const key = inp ? inp.value.trim() : '';
+  if(!key){ toast('License Error','Please enter a valid license key string','crit'); return; }
+  btn.disabled = true;
+  try{
+    const res = await api('/api/license/activate',{method:'POST',body:JSON.stringify({key})});
+    if(res.ok){
+      toast('License Activated', res.message, 'ok');
+      updateLicenseBadge(res.license);
+      if($('#license-modal')) $('#license-modal').remove();
+      load();
+    } else {
+      toast('Activation Failed', res.error || res.message || 'Invalid key', 'crit');
+    }
+  }catch(e){
+    toast('Activation Failed', e.message, 'crit');
+  }finally{
+    btn.disabled = false;
+  }
+}
+
+function renderFleet(f){
+  const el = $('#view-fleet');
+  if(!el) return;
+  const nodes = (f && f.nodes) || [];
+  $('#badge-fleet').textContent = nodes.length;
+
+  const lic = LICENSE || (BOOT && BOOT.license) || {};
+  const isAgency = (lic.tier === 'agency');
+
+  if(!isAgency){
+    el.innerHTML = `
+      <div class="bench-card" style="text-align:center;padding:48px 24px;background:radial-gradient(ellipse at center, rgba(14,165,233,0.1) 0%, var(--card) 70%);border:1px dashed var(--stroke2);">
+        <div style="font-size:42px;margin-bottom:12px;">🌐</div>
+        <h2 style="font-size:20px;font-weight:700;margin-bottom:8px;">Central Multi-Server Fleet Hub</h2>
+        <p style="max-width:540px;margin:0 auto 20px;color:var(--mut);font-size:13.5px;line-height:1.6;">
+          Monitor, benchmark, and auto-heal all your client VPS servers and droplets from one unified agency dashboard. Instant uptime visibility, cross-node load metrics, and one-click health drills.
+        </p>
+        <div style="display:flex;justify-content:center;gap:12px;">
+          <button class="btn primary" onclick="openLicenseModal()" style="padding:8px 20px;font-size:13px;">Unlock Agency Tier</button>
+        </div>
+      </div>`;
+    return;
+  }
+
+  const total = (f && f.total_nodes) || nodes.length || 0;
+  const online = (f && f.online_nodes) || 0;
+  const offline = (f && f.offline_nodes) || 0;
+  const avg = (f && f.avg_score) || 100;
+  const statColor = (f && f.status === 'crit') ? 'var(--crit)' : ((f && f.status === 'warn') ? 'var(--warn)' : 'var(--ok)');
+
+  let html = `
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:18px;">
+      <div>
+        <h2 style="font-size:18px;display:flex;align-items:center;gap:8px;">🌐 Multi-Server Fleet Hub <span class="badge" style="background:${statColor}22;color:${statColor};">${esc(f && f.status ? f.status.toUpperCase() : 'OK')}</span></h2>
+        <div style="font-size:12.5px;color:var(--mut);">Central agency overview monitoring all connected customer nodes in real time.</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <button class="btn" onclick="pollFleetNow()"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 4v5h-5"/></svg>Poll All Nodes</button>
+        <button class="btn primary admin-only" onclick="openAddNodeModal()"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>+ Add VPS Node</button>
+      </div>
+    </div>
+
+    <div class="kpis" style="margin-bottom:20px;">
+      <div class="kpi-card"><div class="kpi-l">Connected Nodes</div><div class="kpi-v">${total}</div><div class="kpi-s">Multi-VPS Fleet</div></div>
+      <div class="kpi-card"><div class="kpi-l">Nodes Online</div><div class="kpi-v" style="color:var(--ok);">${online}</div><div class="kpi-s">Responding &lt;4s</div></div>
+      <div class="kpi-card"><div class="kpi-l">Offline / Unhealthy</div><div class="kpi-v" style="color:${offline > 0 ? 'var(--crit)' : 'var(--mut)'};">${offline}</div><div class="kpi-s">${offline > 0 ? 'Action Needed' : 'All Clear'}</div></div>
+      <div class="kpi-card"><div class="kpi-l">Average Fleet Health</div><div class="kpi-v" style="color:${avg >= 85 ? 'var(--ok)' : (avg >= 65 ? 'var(--warn)' : 'var(--crit)')};">${avg}<small style="font-size:14px;">/100</small></div><div class="kpi-s">Composite Score</div></div>
+    </div>`;
+
+  if(!nodes.length){
+    html += `
+      <div class="bench-card" style="text-align:center;padding:40px 20px;border:1px dashed var(--stroke2);">
+        <div style="font-size:36px;margin-bottom:10px;">🛰️</div>
+        <h3 style="font-size:16px;margin-bottom:6px;">No Remote VPS Nodes Added Yet</h3>
+        <p style="color:var(--mut);font-size:13px;max-width:460px;margin:0 auto 16px;">
+          Add the URL and access token of your client VPS instances running Health Sentinel to monitor them centrally.
+        </p>
+        <button class="btn primary admin-only" onclick="openAddNodeModal()">+ Add Your First Remote Node</button>
+      </div>`;
+  } else {
+    html += `
+      <div class="bench-card" style="padding:0;overflow:hidden;">
+        <table class="vtable">
+          <thead>
+            <tr>
+              <th>Node Name / Group</th>
+              <th>Endpoint URL</th>
+              <th>Status</th>
+              <th>Score &amp; Grade</th>
+              <th>Load</th>
+              <th>RAM</th>
+              <th>Disk</th>
+              <th>Uptime</th>
+              <th>Alerts</th>
+              <th style="text-align:right;">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${nodes.map(n => {
+              const sc = n.online ? (n.score >= 85 ? 'var(--ok)' : (n.score >= 65 ? 'var(--warn)' : 'var(--crit)')) : 'var(--crit)';
+              const badgeBg = n.online ? (n.status === 'crit' ? 'rgba(239,68,68,0.12)' : (n.status === 'warn' ? 'rgba(245,158,11,0.12)' : 'rgba(16,185,129,0.12)')) : 'rgba(239,68,68,0.12)';
+              const badgeTxt = n.online ? (n.status === 'crit' ? 'var(--crit)' : (n.status === 'warn' ? 'var(--warn)' : 'var(--ok)')) : 'var(--crit)';
+              return `
+                <tr>
+                  <td>
+                    <b style="font-size:13.5px;color:var(--txt);">${esc(n.name)}</b>
+                    <div style="font-size:11px;color:var(--mut);">${esc(n.group || 'Production')}</div>
+                  </td>
+                  <td>
+                    <a href="${esc(n.url)}" target="_blank" style="color:var(--acc);font-family:monospace;font-size:12px;text-decoration:none;">${esc(n.url)}</a>
+                  </td>
+                  <td>
+                    <span style="display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border-radius:6px;font-size:11px;font-weight:700;background:${badgeBg};color:${badgeTxt};">
+                      <span class="dot" style="background:${badgeTxt};color:${badgeTxt};"></span>
+                      ${n.online ? (n.status === 'ok' ? 'ONLINE' : n.status.toUpperCase()) : 'OFFLINE'}
+                    </span>
+                    ${n.error ? `<div style="font-size:10px;color:var(--crit);max-width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(n.error)}</div>` : ''}
+                  </td>
+                  <td>
+                    <b style="font-size:14px;color:${sc};">${n.online ? n.score + '/100' : '—'}</b>
+                    <span style="font-size:11px;color:var(--dim);margin-left:4px;">${n.online ? esc(n.grade) : ''}</span>
+                  </td>
+                  <td><span style="font-family:monospace;font-size:12px;">${esc(n.load || '—')}</span></td>
+                  <td>
+                    <div style="font-size:12px;font-weight:600;">${n.online ? n.mem_pct + '%' : '—'}</div>
+                  </td>
+                  <td>
+                    <div style="font-size:12px;font-weight:600;">${n.online ? n.disk_pct + '%' : '—'}</div>
+                  </td>
+                  <td><span style="font-size:11.5px;color:var(--dim);">${esc(n.uptime || '—')}</span></td>
+                  <td>
+                    <span style="font-size:11px;font-weight:700;color:${n.alert_count > 0 ? 'var(--warn)' : 'var(--ok)'};">
+                      ${n.alert_count > 0 ? n.alert_count + ' issues' : '✓ 0 issues'}
+                    </span>
+                  </td>
+                  <td style="text-align:right;">
+                    <div style="display:inline-flex;gap:6px;">
+                      <a href="${esc(n.url)}" target="_blank" class="chip-btn" style="text-decoration:none;">Open UI ↗</a>
+                      <button class="chip-btn admin-only" style="color:var(--crit);" onclick="deleteFleetNode('${esc(n.id)}')">Remove</button>
+                    </div>
+                  </td>
+                </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>`;
+  }
+  el.innerHTML = html;
+}
+
+function openAddNodeModal(){
+  const modal = document.createElement('div');
+  modal.id = 'add-node-modal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:999;backdrop-filter:blur(8px);display:grid;place-items:center;padding:20px;';
+  modal.innerHTML = `
+    <div class="glass" style="max-width:480px;width:100%;padding:24px;background:var(--bg2);border-radius:var(--r);">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+        <h2 style="font-size:17px;margin:0;">🛰️ Connect Remote VPS Node</h2>
+        <button class="btn" onclick="this.closest('#add-node-modal').remove()">Close</button>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:12px;margin-bottom:18px;">
+        <div>
+          <label style="font-size:12px;font-weight:600;display:block;margin-bottom:4px;">Node Label / Client Name:</label>
+          <input type="text" id="nodeNameInput" placeholder="e.g. Acme Client - US East Droplet" style="width:100%;padding:8px 12px;font-size:12.5px;background:var(--card);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);">
+        </div>
+        <div>
+          <label style="font-size:12px;font-weight:600;display:block;margin-bottom:4px;">Endpoint URL:</label>
+          <input type="text" id="nodeUrlInput" placeholder="https://sentinel.client.com:8080" style="width:100%;padding:8px 12px;font-size:12.5px;background:var(--card);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);font-family:monospace;">
+        </div>
+        <div>
+          <label style="font-size:12px;font-weight:600;display:block;margin-bottom:4px;">Access Token (if token auth enabled):</label>
+          <input type="text" id="nodeTokenInput" placeholder="Optional security token" style="width:100%;padding:8px 12px;font-size:12.5px;background:var(--card);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);font-family:monospace;">
+        </div>
+        <div>
+          <label style="font-size:12px;font-weight:600;display:block;margin-bottom:4px;">Server Group / Cluster:</label>
+          <input type="text" id="nodeGroupInput" placeholder="e.g. Production / Client Sites / Staging" value="Production" style="width:100%;padding:8px 12px;font-size:12.5px;background:var(--card);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);">
+        </div>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:10px;">
+        <button class="btn" onclick="this.closest('#add-node-modal').remove()">Cancel</button>
+        <button class="btn primary" id="btnSubmitAddNode" onclick="submitAddFleetNode()">Connect Node</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+}
+
+async function submitAddFleetNode(){
+  const name = ($('#nodeNameInput').value || '').trim();
+  const url = ($('#nodeUrlInput').value || '').trim();
+  const token = ($('#nodeTokenInput').value || '').trim();
+  const group = ($('#nodeGroupInput').value || '').trim();
+  if(!url){ toast('Validation Error','URL is required','crit'); return; }
+  const btn = $('#btnSubmitAddNode');
+  btn.disabled = true;
+  try{
+    const res = await api('/api/fleet/add',{method:'POST',body:JSON.stringify({name,url,token,group})});
+    if(res.ok){
+      toast('Node Added', res.message, 'ok');
+      FLEET = res.fleet;
+      renderFleet(FLEET);
+      if($('#add-node-modal')) $('#add-node-modal').remove();
+    } else {
+      toast('Error', res.error || res.message, 'crit');
+    }
+  }catch(e){
+    toast('Error', e.message, 'crit');
+  }finally{
+    btn.disabled = false;
+  }
+}
+
+async function deleteFleetNode(id){
+  if(!confirm('Remove this remote VPS node from the Fleet Hub?')) return;
+  try{
+    const res = await api('/api/fleet/remove',{method:'POST',body:JSON.stringify({id})});
+    if(res.ok){
+      toast('Node Removed', res.message, 'ok');
+      FLEET = res.fleet;
+      renderFleet(FLEET);
+    } else {
+      toast('Error', res.error || res.message, 'crit');
+    }
+  }catch(e){
+    toast('Error', e.message, 'crit');
+  }
+}
+
+async function pollFleetNow(){
+  toast('Polling Fleet','Contacting all remote nodes...','info',2000);
+  try{
+    const res = await api('/api/fleet/poll',{method:'POST'});
+    if(res.ok){
+      FLEET = res.fleet;
+      renderFleet(FLEET);
+      toast('Fleet Updated', `Polled ${FLEET.total_nodes} nodes (${FLEET.online_nodes} online)`, 'ok');
+    }
+  }catch(e){
+    toast('Poll Error', e.message, 'crit');
+  }
+}
+
 function renderSites(s){
   const view = $('#view-sites');
   if(!view) return;
@@ -5624,11 +6291,13 @@ async function load(){
   try{
     const r=await api('/api/health');
     if(r.branding) applyBranding(r.branding);
+    if(r.license) updateLicenseBadge(r.license);
     HIST=r.history||[];INCIDENTS=r.incidents||[];
     VISITORS=r.visitors||null;BENCHMARK=r.benchmark||null;DOCTOR=r.server_doctor||null;
     if(r.capacity_benchmark && r.capacity_benchmark.last_result) CAPACITY_BENCHMARK = r.capacity_benchmark.last_result;
     SITES=r.sites||null;SECURITY=r.security||null;
-    render(r.report);renderSites(SITES);renderVisitors(VISITORS);renderBenchmark(BENCHMARK);renderServerDoctor(DOCTOR);
+    FLEET=r.fleet||null;
+    render(r.report);renderFleet(FLEET);renderSites(SITES);renderVisitors(VISITORS);renderBenchmark(BENCHMARK);renderServerDoctor(DOCTOR);
     if(CURRENT_TAB==='incidents') renderIncidentsView();
   }catch(e){}
 }
@@ -6196,6 +6865,7 @@ if(BOOT.role === 'viewer'){
  const rb=$('#roleBadge');if(rb)rb.innerHTML='<span class="badge" style="background:rgba(16,185,129,0.15);color:var(--ok);border:1px solid rgba(16,185,129,0.3);font-size:11px;font-weight:700;margin-left:8px;">⚡ Admin</span>';
 }
 if(BOOT.branding) applyBranding(BOOT.branding);
+if(BOOT.license) updateLicenseBadge(BOOT.license);
 $('#chans').innerHTML=BOOT.channels.length
  ? 'Active Alert Channels: '+BOOT.channels.map(c=>`<span class="ch2 on">${esc(c)}</span>`).join(' ')
  : '<span class="ch2">No alert channel enabled — configure in config.json</span>';
@@ -6314,6 +6984,8 @@ class Handler(BaseHTTPRequestHandler):
                 "banned_ips": self.engine.security_shield.list_banned()
             },
             "sites": self.engine.site_monitor.get_summary(),
+            "license": self.engine.license_manager.get_status(),
+            "fleet": self.engine.fleet_manager.get_summary(),
             "server_doctor": generate_server_doctor(rep)
         }
 
@@ -6336,11 +7008,16 @@ class Handler(BaseHTTPRequestHandler):
                     "role": role,
                     "token": self.cfg["web"].get("token", ""),
                     "channels": channels,
-                    "branding": self.cfg.get("branding", {})}
+                    "branding": self.cfg.get("branding", {}),
+                    "license": self.engine.license_manager.get_status()}
             page = HTML_PAGE.replace("__BOOTSTRAP__", json.dumps(boot)).replace("__VER__", VERSION).replace("__UPDATED__", UPDATED)
             return self._send(200, page, "text/html; charset=utf-8")
         if path == "/api/branding":
             return self._send(200, self.cfg.get("branding", {}))
+        if path == "/api/license":
+            return self._send(200, self.engine.license_manager.get_status())
+        if path == "/api/fleet":
+            return self._send(200, self.engine.fleet_manager.get_summary())
         if path == "/api/health":
             return self._send(200, self._payload(role=role))
         if path == "/api/visitors":
@@ -6557,6 +7234,51 @@ class Handler(BaseHTTPRequestHandler):
             results = self.alerts.test_dispatch(rep)
             any_ok = any(v.get("ok") for v in results.values())
             return self._send(200, {"ok": any_ok, "results": results, "detail": ", ".join(f"{k}: {'ok' if v.get('ok') else 'err'}" for k, v in results.items())})
+        if path == "/api/license/activate":
+            try:
+                body = json.loads(data_bytes.decode() or "{}")
+            except Exception as e:
+                return self._send(400, {"ok": False, "error": f"Invalid JSON body: {e}"})
+            key = (body.get("key") or "").strip()
+            cfg_file = self.cfg_path or os.environ.get("SENTINEL_CONFIG", "/etc/health-sentinel/config.json")
+            ok, msg = self.engine.license_manager.activate(key, cfg_path=cfg_file)
+            return self._send(200 if ok else 400, {
+                "ok": ok,
+                "message": msg,
+                "license": self.engine.license_manager.get_status()
+            })
+        if path == "/api/fleet/add":
+            try:
+                body = json.loads(data_bytes.decode() or "{}")
+            except Exception as e:
+                return self._send(400, {"ok": False, "error": f"Invalid JSON body: {e}"})
+            name = (body.get("name") or "").strip()
+            url = (body.get("url") or "").strip()
+            token = (body.get("token") or "").strip()
+            group = (body.get("group") or "Production").strip()
+            cfg_file = self.cfg_path or os.environ.get("SENTINEL_CONFIG", "/etc/health-sentinel/config.json")
+            ok, msg = self.engine.fleet_manager.add_node(name=name, url=url, token=token, group=group, cfg_path=cfg_file)
+            return self._send(200 if ok else 400, {
+                "ok": ok,
+                "message": msg,
+                "fleet": self.engine.fleet_manager.get_summary()
+            })
+        if path == "/api/fleet/remove":
+            try:
+                body = json.loads(data_bytes.decode() or "{}")
+            except Exception as e:
+                return self._send(400, {"ok": False, "error": f"Invalid JSON body: {e}"})
+            node_id = (body.get("id") or body.get("url") or "").strip()
+            cfg_file = self.cfg_path or os.environ.get("SENTINEL_CONFIG", "/etc/health-sentinel/config.json")
+            ok, msg = self.engine.fleet_manager.remove_node(node_id, cfg_path=cfg_file)
+            return self._send(200 if ok else 400, {
+                "ok": ok,
+                "message": msg,
+                "fleet": self.engine.fleet_manager.get_summary()
+            })
+        if path == "/api/fleet/poll":
+            summary = self.engine.fleet_manager.poll_all(force=True)
+            return self._send(200, {"ok": True, "fleet": summary})
         return self._send(404, {"error": "not found"})
 
 
@@ -6667,11 +7389,22 @@ def main():
     ap.add_argument("--quiet", action="store_true", help="with --once: no per-finding detail")
     ap.add_argument("--no-alerts", action="store_true")
     ap.add_argument("--test-alerts", action="store_true", help="send sample alerts and report status per channel")
+    ap.add_argument("--activate-license", metavar="KEY", help="activate Sentinel Pro or Agency license key")
     ap.add_argument("--bind"), ap.add_argument("--port", type=int)
     ap.add_argument("--interval", type=int)
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    if args.activate_license:
+        lic = LicenseManager(cfg)
+        ok, msg = lic.activate(args.activate_license, cfg_path=args.config)
+        if ok:
+            print(f"\033[38;5;42m✓\033[0m {msg}")
+            return 0
+        else:
+            print(f"\033[38;5;203m✗\033[0m License activation failed: {msg}", file=sys.stderr)
+            return 1
+
     if args.bind:
         cfg["web"]["bind"] = args.bind
     if args.port:
@@ -6681,7 +7414,7 @@ def main():
     if args.no_alerts:
         cfg["alerts"]["enabled"] = False
 
-    engine = Engine(cfg)
+    engine = Engine(cfg, cfg_path=args.config)
     alerts = AlertManager(engine) if cfg["alerts"]["enabled"] else None
     if alerts:
         engine.auto_healer.set_alert_manager(alerts)
