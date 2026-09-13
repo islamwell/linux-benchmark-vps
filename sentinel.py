@@ -49,8 +49,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.2.5"
-UPDATED = "2026-09-13 19:10"
+VERSION = "2.2.6"
+UPDATED = "2026-09-13 21:14"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -301,6 +301,220 @@ def save_config_section(path, section_name, data):
         return True, "Configuration saved successfully"
     except Exception as e:
         return False, f"Failed to save config: {e}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ALERT SECRETS & UPDATE MANAGEMENT HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+SECRET_MASK = "••••••••"
+SECRET_ALERT_KEYS = {"bot_token", "apikey", "password", "token"}
+
+
+def mask_secret(val):
+    if val and isinstance(val, str) and val.strip():
+        return SECRET_MASK
+    return val
+
+
+def get_masked_alerts_config(alerts_cfg):
+    """Deep-copies alerts_cfg and masks sensitive credentials."""
+    import copy
+    masked = copy.deepcopy(alerts_cfg or {})
+    for channel, conf in masked.items():
+        if isinstance(conf, dict):
+            for k, v in conf.items():
+                if k in SECRET_ALERT_KEYS and isinstance(v, str) and v:
+                    conf[k] = SECRET_MASK
+            if channel == "webhook" and isinstance(conf.get("headers"), dict):
+                for hk in list(conf["headers"].keys()):
+                    if any(s in hk.lower() for s in ("auth", "token", "secret", "key")):
+                        conf["headers"][hk] = SECRET_MASK
+    return masked
+
+
+def unmask_and_merge_alerts_config(current_alerts, new_alerts):
+    """
+    Merges new_alerts into current_alerts, preserving secret fields if masked with SECRET_MASK.
+    Validates structure, types, and values safely.
+    """
+    import copy
+    merged = copy.deepcopy(current_alerts or {})
+
+    # Global alerts fields
+    for k in ("enabled", "notify_recovery"):
+        if k in new_alerts:
+            merged[k] = bool(new_alerts[k])
+    if "min_severity" in new_alerts:
+        val = str(new_alerts["min_severity"]).lower().strip()
+        if val in ("crit", "warn", "info"):
+            merged["min_severity"] = val
+    if "consecutive" in new_alerts:
+        try:
+            merged["consecutive"] = max(1, min(100, int(new_alerts["consecutive"])))
+        except (ValueError, TypeError):
+            pass
+    if "cooldown_minutes" in new_alerts:
+        try:
+            merged["cooldown_minutes"] = max(1, min(10080, int(new_alerts["cooldown_minutes"])))
+        except (ValueError, TypeError):
+            pass
+
+    # Channels
+    for chan in ("telegram", "whatsapp", "email", "slack", "ntfy", "webhook", "desktop"):
+        if chan not in new_alerts or not isinstance(new_alerts[chan], dict):
+            continue
+        cur_chan = merged.setdefault(chan, {})
+        new_chan = new_alerts[chan]
+
+        for k, v in new_chan.items():
+            if k in SECRET_ALERT_KEYS:
+                # If masked, retain current secret
+                if str(v).strip() == SECRET_MASK:
+                    continue
+                cur_chan[k] = str(v).strip()
+            elif k == "enabled":
+                cur_chan[k] = bool(v)
+            elif k == "port":
+                try:
+                    cur_chan[k] = max(1, min(65535, int(v)))
+                except (ValueError, TypeError):
+                    pass
+            elif k in ("tls", "ssl"):
+                cur_chan[k] = bool(v)
+            elif k == "to":
+                if isinstance(v, list):
+                    cur_chan[k] = [str(x).strip() for x in v if str(x).strip()]
+                elif isinstance(v, str):
+                    cur_chan[k] = [x.strip() for x in v.split(",") if x.strip()]
+            elif k == "headers":
+                if isinstance(v, dict):
+                    cur_hdrs = cur_chan.setdefault("headers", {})
+                    for hk, hv in v.items():
+                        if str(hv).strip() == SECRET_MASK and hk in cur_hdrs:
+                            continue
+                        cur_hdrs[hk] = str(hv).strip()
+                elif isinstance(v, str):
+                    try:
+                        parsed_h = json.loads(v)
+                        if isinstance(parsed_h, dict):
+                            cur_hdrs = cur_chan.setdefault("headers", {})
+                            for hk, hv in parsed_h.items():
+                                if str(hv).strip() == SECRET_MASK and hk in cur_hdrs:
+                                    continue
+                                cur_hdrs[hk] = str(hv).strip()
+                    except Exception:
+                        pass
+            else:
+                if isinstance(v, (str, int, float, bool)):
+                    cur_chan[k] = v
+
+    return merged
+
+
+def parse_ver(v_str):
+    """Parses semantic version string like '2.2.6' into tuple (2, 2, 6)."""
+    try:
+        parts = [int(p) for p in re.findall(r"\d+", str(v_str))]
+        while len(parts) < 3:
+            parts.append(0)
+        return tuple(parts[:3])
+    except Exception:
+        return (0, 0, 0)
+
+
+def check_for_updates():
+    """
+    Fetches the latest version of sentinel.py from GitHub repository.
+    Returns release status dictionary.
+    """
+    url = "https://raw.githubusercontent.com/islamwell/linux-benchmark-vps/master/sentinel.py"
+    res = {
+        "ok": True,
+        "current_version": VERSION,
+        "current_updated": UPDATED,
+        "latest_version": VERSION,
+        "latest_updated": UPDATED,
+        "update_available": False,
+        "release_notes_url": "https://github.com/islamwell/linux-benchmark-vps/releases",
+        "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "error": None
+    }
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": f"health-sentinel/{VERSION} (update-check)",
+                "Range": "bytes=0-8192"
+            }
+        )
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=6, context=ctx) as resp:
+            content = resp.read(8192).decode("utf-8", errors="replace")
+
+        m_ver = re.search(r'VERSION\s*=\s*["\']([^"\']+)["\']', content)
+        m_upd = re.search(r'UPDATED\s*=\s*["\']([^"\']+)["\']', content)
+        if m_ver:
+            latest_v = m_ver.group(1).strip()
+            res["latest_version"] = latest_v
+            if m_upd:
+                res["latest_updated"] = m_upd.group(1).strip()
+
+            cur_tuple = parse_ver(VERSION)
+            lat_tuple = parse_ver(latest_v)
+            if lat_tuple > cur_tuple:
+                res["update_available"] = True
+        else:
+            res["error"] = "Could not parse version from remote repository."
+    except Exception as e:
+        res["error"] = f"Update check failed: {e}"
+
+    return res
+
+
+def execute_system_update():
+    """
+    Executes update.sh or git pull in a background detached thread with a short delay
+    so the HTTP response can be sent cleanly to the caller before daemon restarts.
+    """
+    update_script = "/opt/health-sentinel/update.sh"
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    local_update = os.path.join(base_dir, "update.sh")
+
+    if os.path.isfile(update_script) and os.access(update_script, os.X_OK):
+        cmd = ["/bin/bash", update_script]
+    elif os.path.isfile(local_update) and os.access(local_update, os.X_OK):
+        cmd = ["/bin/bash", local_update]
+    elif os.path.isdir(os.path.join(base_dir, ".git")):
+        cmd = ["git", "-C", base_dir, "pull", "origin", "master"]
+    else:
+        return False, "Neither /opt/health-sentinel/update.sh nor a git repository was found to execute update."
+
+    def _run_detached():
+        time.sleep(1.2)
+        try:
+            env = {
+                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "HOME": "/root",
+                "DEBIAN_FRONTEND": "noninteractive"
+            }
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                env=env
+            )
+        except Exception as e:
+            try:
+                syslog.syslog(syslog.LOG_ERR, f"[sentinel] Update invocation error: {e}")
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_run_detached, daemon=True)
+    t.start()
+    return True, "Update initiated. The service will download the latest release and restart automatically."
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4865,6 +5079,9 @@ kbd{font-size:10.5px;padding:1px 5px;border-radius:5px;border:1px solid var(--st
 .cap-bar-fill{height:100%;background:linear-gradient(90deg,var(--acc),var(--ok));border-radius:999px;transition:width .3s ease}
 .chip-btn{padding:4px 10px;border-radius:8px;font-size:11px;background:var(--card);border:1px solid var(--stroke2);color:var(--mut);cursor:pointer;transition:.15s}
 .chip-btn:hover{color:var(--txt);border-color:var(--acc)}
+.alert-tab-btn{padding:7px 14px;border-radius:8px;border:1px solid var(--stroke2);background:var(--card);color:var(--mut);font-size:12px;font-weight:600;cursor:pointer;transition:.15s}
+.alert-tab-btn:hover{color:var(--txt);border-color:var(--acc)}
+.alert-tab-btn.active{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;border-color:transparent;box-shadow:0 4px 14px -4px var(--acc)}
 body.role-viewer .admin-only{display:none!important}
 </style></head><body>
 <div class="wrap">
@@ -4878,10 +5095,11 @@ body.role-viewer .admin-only{display:none!important}
   <button class="btn" id="autoBtn" onclick="toggleAuto()"><svg viewBox="0 0 24 24"><path d="M12 6v6l4 2"/><circle cx="12" cy="12" r="9"/></svg><span id="autoTxt">Auto</span></button>
   <button class="btn" onclick="toggleTheme()"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg></button>
   <button class="btn" id="licenseBtn" onclick="openLicenseModal()"><svg viewBox="0 0 24 24"><path d="M12 2a5 5 0 00-5 5v3H6a2 2 0 00-2 2v8a2 2 0 002 2h12a2 2 0 002-2v-8a2 2 0 00-2-2h-1V7a5 5 0 00-5-5zm-3 5a3 3 0 016 0v3H9V7z"/></svg><span id="licenseBtnText">🔑 License</span></button>
+  <button class="btn" id="updateBtn" onclick="openUpdateModal()"><svg viewBox="0 0 24 24"><path d="M12 2v10m0 0l3-3m-3 3l-3-3"/><path d="M4 14v4a2 2 0 002 2h12a2 2 0 002-2v-4"/></svg>🚀 Updates <span id="updateBadge" style="display:none;background:var(--acc);color:#fff;padding:2px 6px;border-radius:10px;font-size:10px;font-weight:700;margin-left:4px;">NEW</span></button>
+  <button class="btn admin-only" id="alertsBtn" onclick="openAlertsModal()"><svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 10-12 0c0 7-3 8-3 8h18s-3-1-3-8"/><path d="M13.7 21a2 2 0 01-3.4 0"/></svg>🔔 Notifications</button>
   <button class="btn admin-only" onclick="openBrandingModal()"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 6.36 15.36L12 12V3z"/></svg>🎨 Branding</button>
   <button class="btn admin-only" onclick="openQuickActionsModal()"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>⚡ Quick Actions &amp; PHP</button>
   <button class="btn" onclick="openExecutiveReportModal()"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>📄 Executive Report</button>
-  <button class="btn admin-only" onclick="testAlert(this)"><svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 10-12 0c0 7-3 8-3 8h18s-3-1-3-8"/><path d="M13.7 21a2 2 0 01-3.4 0"/></svg>Test alert</button>
   <button class="btn" onclick="dl()"><svg viewBox="0 0 24 24"><path d="M12 3v12M7 11l5 5 5-5M4 20h16"/></svg>JSON</button>
   <button class="btn primary" id="scanBtn" onclick="scan()"><svg viewBox="0 0 24 24" id="scanIco"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 4v5h-5"/></svg>Scan now</button>
  </header>
@@ -4980,7 +5198,8 @@ const IS_VIEWER = (BOOT.role === 'viewer');
 const api=(p,o={})=>{
  const sep = p.includes('?') ? '&' : '?';
  const url = URL_TOKEN ? `${p}${sep}token=${encodeURIComponent(URL_TOKEN)}` : p;
- return fetch(url,{headers:{'X-Auth-Token':URL_TOKEN},...o}).then(async r=>{
+ const headers = {'X-Auth-Token': URL_TOKEN, ...(o.headers || {})};
+ return fetch(url,{...o, headers}).then(async r=>{
   if(r.status === 401) throw new Error('Unauthorized - Invalid or missing token');
   if(r.status === 403) {
     const err = await r.json().catch(()=>({error:'Forbidden: View-Only user cannot execute administrative actions'}));
@@ -6658,6 +6877,7 @@ async function load(){
     render(r.report);renderFleet(FLEET);renderSites(SITES);renderVisitors(VISITORS);renderBenchmark(BENCHMARK);renderServerDoctor(DOCTOR);
     if(CURRENT_TAB==='incidents') renderIncidentsView();
   }catch(e){}
+  checkUpdatesSilent();
 }
 async function testAlert(b){b.disabled=true;
  try{const r=await api('/api/test-alert',{method:'POST'});
@@ -6665,6 +6885,564 @@ async function testAlert(b){b.disabled=true;
   const summary = Object.entries(r.results||{}).map(([k,v])=>`${k}: ${v.ok?'✓':'✗'}`).join(' · ');
   toast(anyOk?'Test Alert Delivered':'Alert Notice',summary||r.detail,anyOk?'ok':'crit',7000)}
  finally{b.disabled=false}}
+
+/* ── Sentinel Update Manager ── */
+let UPDATE_INFO = null;
+
+async function checkUpdatesSilent(){
+  try{
+    const r = await api('/api/system/update-check');
+    UPDATE_INFO = r;
+    const badge = $('#updateBadge');
+    if(badge && r.update_available){
+      badge.style.display = 'inline-block';
+      badge.textContent = `v${r.latest_version}`;
+    }
+  }catch(e){}
+}
+
+async function openUpdateModal(){
+  const modal = document.createElement('div');
+  modal.id = 'update-modal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:999;backdrop-filter:blur(8px);display:grid;place-items:center;padding:20px;';
+  modal.innerHTML = `
+    <div class="glass" style="max-width:580px;width:100%;padding:26px;background:var(--bg2);border-radius:var(--r);">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+        <div style="display:flex;align-items:center;gap:10px;">
+          <div style="font-size:24px;">🚀</div>
+          <div>
+            <h2 style="font-size:18px;margin:0;">Sentinel Updates &amp; Releases</h2>
+            <div style="font-size:12px;color:var(--mut);">Check for new releases and install updates with 1 click.</div>
+          </div>
+        </div>
+        <button class="btn" onclick="this.closest('#update-modal').remove()">Close</button>
+      </div>
+
+      <div id="update-modal-body">
+        <div style="text-align:center;padding:30px 10px;color:var(--mut);">
+          <div class="spin" style="display:inline-block;font-size:24px;margin-bottom:8px;">🔄</div>
+          <div>Checking GitHub for Sentinel updates…</div>
+        </div>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+  await refreshUpdateModalView();
+}
+
+async function refreshUpdateModalView(){
+  const body = $('#update-modal-body');
+  if(!body) return;
+  try{
+    const r = await api('/api/system/update-check');
+    UPDATE_INFO = r;
+    const badge = $('#updateBadge');
+    if(badge){
+      badge.style.display = r.update_available ? 'inline-block' : 'none';
+      if(r.update_available) badge.textContent = `v${r.latest_version}`;
+    }
+
+    let html = `
+      <div style="margin-bottom:18px;padding:14px;border-radius:12px;background:var(--card);border:1px solid var(--stroke);">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+          <div>
+            <div style="font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;">Installed Version</div>
+            <div style="font-size:16px;font-weight:700;color:var(--txt);">v${esc(r.current_version)} <span style="font-size:11px;font-weight:400;color:var(--mut);">(${esc(r.current_updated)})</span></div>
+          </div>
+          <div style="text-align:right;">
+            <div style="font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;">Latest Available</div>
+            <div style="font-size:16px;font-weight:700;color:${r.update_available ? 'var(--ok)' : 'var(--txt)'};">v${esc(r.latest_version)}</div>
+          </div>
+        </div>
+        <div style="font-size:11.5px;color:var(--dim);border-top:1px solid var(--stroke2);padding-top:8px;">Last checked: ${esc(r.checked_at)}</div>
+      </div>`;
+
+    if(r.error){
+      html += `
+        <div style="margin-bottom:16px;padding:12px;border-radius:10px;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.3);color:var(--crit);font-size:12.5px;">
+          <b>Notice:</b> ${esc(r.error)}
+        </div>`;
+    } else if(r.update_available){
+      html += `
+        <div style="margin-bottom:18px;padding:14px;border-radius:12px;background:rgba(23,201,100,0.12);border:1px solid rgba(23,201,100,0.3);">
+          <div style="display:flex;align-items:center;gap:8px;color:var(--ok);font-weight:700;margin-bottom:6px;">
+            <span>✨</span> A new version (v${esc(r.latest_version)}) is ready to install!
+          </div>
+          <div style="font-size:12px;color:var(--txt);line-height:1.4;margin-bottom:12px;">
+            The universal updater will fetch the latest verified release, apply code updates, and restart Sentinel seamlessly.
+          </div>
+          <div style="display:flex;gap:10px;align-items:center;">
+            <button class="btn primary admin-only" id="btnRunUpdate" onclick="installUpdateNow()" style="background:var(--ok);border-color:var(--ok);color:#000;font-weight:700;">
+              🚀 Install Update Now
+            </button>
+            <a href="${esc(r.release_notes_url)}" target="_blank" rel="noopener" class="btn" style="font-size:12px;text-decoration:none;">
+              📋 View Releases
+            </a>
+          </div>
+        </div>`;
+    } else {
+      html += `
+        <div style="margin-bottom:18px;padding:14px;border-radius:12px;background:rgba(23,201,100,0.08);border:1px solid var(--stroke);display:flex;align-items:center;gap:12px;">
+          <div style="font-size:24px;color:var(--ok);">✓</div>
+          <div>
+            <div style="font-size:13.5px;font-weight:700;color:var(--txt);">Your Sentinel installation is up to date!</div>
+            <div style="font-size:12px;color:var(--mut);">You are currently running the latest production build of Linux Health Sentinel.</div>
+          </div>
+        </div>`;
+    }
+
+    html += `
+      <div style="display:flex;justify-content:space-between;align-items:center;padding-top:14px;border-top:1px solid var(--stroke);">
+        <button class="btn" onclick="refreshUpdateModalView()"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 4v5h-5"/></svg>Check Again</button>
+        <button class="btn" onclick="this.closest('#update-modal').remove()">Done</button>
+      </div>`;
+
+    body.innerHTML = html;
+  }catch(e){
+    body.innerHTML = `
+      <div style="padding:20px;text-align:center;color:var(--crit);">
+        <div style="font-size:14px;font-weight:700;margin-bottom:6px;">Failed to fetch update status</div>
+        <div style="font-size:12px;margin-bottom:14px;">${esc(e.message)}</div>
+        <button class="btn" onclick="refreshUpdateModalView()">Retry</button>
+      </div>`;
+  }
+}
+
+async function installUpdateNow(){
+  if(!confirm('Are you sure you want to download and install the update now? Sentinel will restart automatically.')) return;
+  const btn = $('#btnRunUpdate');
+  if(btn) { btn.disabled = true; btn.textContent = 'Initiating update…'; }
+  const body = $('#update-modal-body');
+
+  try{
+    const res = await api('/api/system/update-run', {method:'POST'});
+    if(res.ok){
+      body.innerHTML = `
+        <div style="text-align:center;padding:30px 10px;">
+          <div class="spin" style="display:inline-block;font-size:32px;margin-bottom:12px;">🔄</div>
+          <h3 style="font-size:16px;margin:0 0 6px 0;">Applying Update &amp; Restarting Service…</h3>
+          <div style="font-size:12.5px;color:var(--mut);max-width:400px;margin:0 auto 16px auto;">
+            The update script has been initiated. Sentinel will momentarily restart. This page will automatically reconnect and reload as soon as the service is back online.
+          </div>
+          <div id="update-poll-status" style="font-size:12px;font-weight:600;color:var(--dim);">Waiting for service restart…</div>
+        </div>`;
+
+      let attempts = 0;
+      const pollInterval = setInterval(async () => {
+        attempts++;
+        const stElem = $('#update-poll-status');
+        if(stElem) stElem.textContent = `Reconnecting… (attempt ${attempts})`;
+        try{
+          const check = await fetch('/api/health?token=' + encodeURIComponent(URL_TOKEN), {cache: 'no-store'});
+          if(check.ok){
+            clearInterval(pollInterval);
+            if(stElem) stElem.textContent = 'Service is online! Reloading…';
+            setTimeout(() => { window.location.reload(); }, 1200);
+          }
+        }catch(err){}
+        if(attempts > 30){
+          clearInterval(pollInterval);
+          if(stElem) stElem.innerHTML = 'Restart timed out. <a href="javascript:location.reload()" style="color:var(--acc)">Click here to reload</a>';
+        }
+      }, 2000);
+
+    } else {
+      toast('Update Failed', res.message || 'Could not initiate update', 'crit');
+      if(btn) { btn.disabled = false; btn.textContent = '🚀 Install Update Now'; }
+    }
+  }catch(e){
+    toast('Update Error', e.message, 'crit');
+    if(btn) { btn.disabled = false; btn.textContent = '🚀 Install Update Now'; }
+  }
+}
+
+/* ── Sentinel Notifications & Alerts Modal ── */
+let ALERTS_CONFIG = null;
+let CURRENT_ALERT_TAB = 'telegram';
+
+function switchAlertsTab(tab){
+  CURRENT_ALERT_TAB = tab;
+  document.querySelectorAll('.alert-tab-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.tab === tab);
+  });
+  document.querySelectorAll('.alert-tab-pane').forEach(pane => {
+    pane.style.display = (pane.dataset.tab === tab) ? 'block' : 'none';
+  });
+}
+
+async function openAlertsModal(){
+  const modal = document.createElement('div');
+  modal.id = 'alerts-modal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:999;backdrop-filter:blur(8px);display:grid;place-items:center;padding:20px;';
+  modal.innerHTML = `
+    <div class="glass" style="max-width:760px;width:100%;max-height:88vh;overflow-y:auto;padding:26px;background:var(--bg2);border-radius:var(--r);">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+        <div style="display:flex;align-items:center;gap:10px;">
+          <div style="font-size:24px;">🔔</div>
+          <div>
+            <h2 style="font-size:18px;margin:0;">Notification &amp; Alert Settings</h2>
+            <div style="font-size:12px;color:var(--mut);">Configure automated multi-channel alerts and test delivery in real time.</div>
+          </div>
+        </div>
+        <button class="btn" onclick="this.closest('#alerts-modal').remove()">Close</button>
+      </div>
+
+      <div id="alerts-modal-content">
+        <div style="text-align:center;padding:30px 10px;color:var(--mut);">
+          <div class="spin" style="display:inline-block;font-size:24px;margin-bottom:8px;">🔄</div>
+          <div>Loading alert configurations…</div>
+        </div>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+
+  try{
+    const r = await api('/api/alerts/config');
+    if(r.ok){
+      ALERTS_CONFIG = r.alerts || {};
+      renderAlertsModalContent();
+    } else {
+      $('#alerts-modal-content').innerHTML = `<div style="color:var(--crit);padding:20px;text-align:center;">${esc(r.error||'Failed to load alert settings')}</div>`;
+    }
+  }catch(e){
+    $('#alerts-modal-content').innerHTML = `<div style="color:var(--crit);padding:20px;text-align:center;">${esc(e.message)}</div>`;
+  }
+}
+
+function renderAlertsModalContent(){
+  const container = $('#alerts-modal-content');
+  if(!container) return;
+  const a = ALERTS_CONFIG || {};
+  const tg = a.telegram || {};
+  const wa = a.whatsapp || {};
+  const em = a.email || {};
+  const sl = a.slack || {};
+  const nt = a.ntfy || {};
+  const wh = a.webhook || {};
+
+  const chStatus = (c) => c && c.enabled ? '<span style="color:var(--ok);margin-left:4px;">●</span>' : '';
+
+  container.innerHTML = `
+    <!-- Global Alert Settings Card -->
+    <div style="margin-bottom:20px;padding:16px;border-radius:12px;background:var(--card);border:1px solid var(--stroke);">
+      <div style="font-size:13px;font-weight:700;margin-bottom:12px;color:var(--txt);display:flex;align-items:center;justify-content:space-between;">
+        <span>⚙️ Global Alert Engine Settings</span>
+        <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;cursor:pointer;font-weight:600;color:var(--txt);">
+          <input type="checkbox" id="alerts-enabled" ${a.enabled ? 'checked' : ''} style="width:16px;height:16px;accent-color:var(--acc);">
+          Enable Alert Dispatcher
+        </label>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(200px, 1fr));gap:14px;font-size:12px;">
+        <div>
+          <label style="display:block;margin-bottom:4px;color:var(--mut);">Minimum Severity:</label>
+          <select id="alerts-min-severity" style="width:100%;padding:7px 10px;background:var(--bg2);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);">
+            <option value="warn" ${a.min_severity === 'warn' ? 'selected' : ''}>⚠️ Warning &amp; Critical</option>
+            <option value="crit" ${a.min_severity === 'crit' ? 'selected' : ''}>🔴 Critical Only</option>
+          </select>
+        </div>
+        <div>
+          <label style="display:block;margin-bottom:4px;color:var(--mut);">Anti-Flap Consecutive Scans:</label>
+          <input type="number" id="alerts-consecutive" value="${a.consecutive || 2}" min="1" max="20" style="width:100%;padding:7px 10px;background:var(--bg2);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);">
+        </div>
+        <div>
+          <label style="display:block;margin-bottom:4px;color:var(--mut);">Repeat Cooldown (Minutes):</label>
+          <input type="number" id="alerts-cooldown" value="${a.cooldown_minutes || 60}" min="1" max="1440" style="width:100%;padding:7px 10px;background:var(--bg2);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);">
+        </div>
+      </div>
+      <div style="margin-top:12px;display:flex;align-items:center;gap:8px;font-size:12px;color:var(--mut);">
+        <input type="checkbox" id="alerts-recovery" ${a.notify_recovery !== false ? 'checked' : ''} style="accent-color:var(--ok);">
+        <label for="alerts-recovery" style="cursor:pointer;">Send notification when an issue recovers to Healthy (🟢 RECOVERED)</label>
+      </div>
+    </div>
+
+    <!-- Multi-Channel Navigation Tabs -->
+    <div style="display:flex;gap:6px;flex-wrap:wrap;border-bottom:1px solid var(--stroke);padding-bottom:8px;margin-bottom:16px;">
+      <button type="button" class="btn alert-tab-btn ${CURRENT_ALERT_TAB==='telegram'?'active':''}" data-tab="telegram" onclick="switchAlertsTab('telegram')" style="padding:6px 12px;font-size:12px;">📱 Telegram ${chStatus(tg)}</button>
+      <button type="button" class="btn alert-tab-btn ${CURRENT_ALERT_TAB==='whatsapp'?'active':''}" data-tab="whatsapp" onclick="switchAlertsTab('whatsapp')" style="padding:6px 12px;font-size:12px;">💬 WhatsApp ${chStatus(wa)}</button>
+      <button type="button" class="btn alert-tab-btn ${CURRENT_ALERT_TAB==='email'?'active':''}" data-tab="email" onclick="switchAlertsTab('email')" style="padding:6px 12px;font-size:12px;">✉️ Email (SMTP) ${chStatus(em)}</button>
+      <button type="button" class="btn alert-tab-btn ${CURRENT_ALERT_TAB==='slack'?'active':''}" data-tab="slack" onclick="switchAlertsTab('slack')" style="padding:6px 12px;font-size:12px;">💬 Slack / Discord ${chStatus(sl)}</button>
+      <button type="button" class="btn alert-tab-btn ${CURRENT_ALERT_TAB==='ntfy'?'active':''}" data-tab="ntfy" onclick="switchAlertsTab('ntfy')" style="padding:6px 12px;font-size:12px;">🔔 ntfy.sh ${chStatus(nt)}</button>
+      <button type="button" class="btn alert-tab-btn ${CURRENT_ALERT_TAB==='webhook'?'active':''}" data-tab="webhook" onclick="switchAlertsTab('webhook')" style="padding:6px 12px;font-size:12px;">🌐 Webhook ${chStatus(wh)}</button>
+    </div>
+
+    <!-- Channels Panes -->
+    <div style="margin-bottom:20px;">
+      <!-- Telegram Pane -->
+      <div class="alert-tab-pane" data-tab="telegram" style="display:${CURRENT_ALERT_TAB==='telegram'?'block':'none'};">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+          <b style="font-size:13.5px;">Telegram Bot Dispatcher</b>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;"><input type="checkbox" id="alerts-tg-enabled" ${tg.enabled?'checked':''} style="accent-color:var(--acc);"> Enabled</label>
+        </div>
+        <div style="display:grid;gap:12px;font-size:12px;">
+          <div>
+            <label style="display:block;color:var(--mut);margin-bottom:4px;">Telegram Bot Token:</label>
+            <input type="text" id="alerts-tg-token" value="${esc(tg.bot_token||'')}" placeholder="e.g. 123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ" style="width:100%;padding:8px 10px;background:var(--card);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);font-family:monospace;">
+            <div style="font-size:11px;color:var(--dim);margin-top:3px;">Create a bot using @BotFather on Telegram. Existing tokens masked with •••••••• are preserved on save.</div>
+          </div>
+          <div>
+            <label style="display:block;color:var(--mut);margin-bottom:4px;">Target Chat ID or Channel ID:</label>
+            <input type="text" id="alerts-tg-chat" value="${esc(tg.chat_id||'')}" placeholder="e.g. 987654321 or -1001234567890" style="width:100%;padding:8px 10px;background:var(--card);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);font-family:monospace;">
+            <div style="font-size:11px;color:var(--dim);margin-top:3px;">Get your ID by messaging @userinfobot or adding your bot to a group.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- WhatsApp Pane -->
+      <div class="alert-tab-pane" data-tab="whatsapp" style="display:${CURRENT_ALERT_TAB==='whatsapp'?'block':'none'};">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+          <b style="font-size:13.5px;">WhatsApp Dispatcher</b>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;"><input type="checkbox" id="alerts-wa-enabled" ${wa.enabled?'checked':''} style="accent-color:var(--acc);"> Enabled</label>
+        </div>
+        <div style="display:grid;gap:12px;font-size:12px;">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+            <div>
+              <label style="display:block;color:var(--mut);margin-bottom:4px;">Provider:</label>
+              <select id="alerts-wa-provider" style="width:100%;padding:8px 10px;background:var(--card);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);">
+                <option value="callmebot" ${(wa.provider||'callmebot')==='callmebot'?'selected':''}>CallMeBot (Free Gateway)</option>
+                <option value="webhook" ${wa.provider==='webhook'?'selected':''}>Custom Webhook Gateway</option>
+              </select>
+            </div>
+            <div>
+              <label style="display:block;color:var(--mut);margin-bottom:4px;">Phone Number (International Format):</label>
+              <input type="text" id="alerts-wa-phone" value="${esc(wa.phone||'')}" placeholder="+4794441171" style="width:100%;padding:8px 10px;background:var(--card);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);">
+            </div>
+          </div>
+          <div>
+            <label style="display:block;color:var(--mut);margin-bottom:4px;">CallMeBot API Key:</label>
+            <input type="text" id="alerts-wa-apikey" value="${esc(wa.apikey||'')}" placeholder="e.g. 123456" style="width:100%;padding:8px 10px;background:var(--card);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);font-family:monospace;">
+            <div style="font-size:11px;color:var(--dim);margin-top:3px;">Instructions: Send <code>I allow callmebot to send me messages</code> to <code>+34 644 44 24 37</code> on WhatsApp to obtain your API key.</div>
+          </div>
+          <div>
+            <label style="display:block;color:var(--mut);margin-bottom:4px;">Custom Webhook URL (if provider = Webhook):</label>
+            <input type="text" id="alerts-wa-webhook" value="${esc(wa.webhook_url||'')}" placeholder="https://api.yourgateway.com/send-whatsapp" style="width:100%;padding:8px 10px;background:var(--card);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);">
+          </div>
+        </div>
+      </div>
+
+      <!-- Email (SMTP) Pane -->
+      <div class="alert-tab-pane" data-tab="email" style="display:${CURRENT_ALERT_TAB==='email'?'block':'none'};">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+          <b style="font-size:13.5px;">Email SMTP Dispatcher</b>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;"><input type="checkbox" id="alerts-em-enabled" ${em.enabled?'checked':''} style="accent-color:var(--acc);"> Enabled</label>
+        </div>
+        <div style="display:grid;gap:12px;font-size:12px;">
+          <div style="display:grid;grid-template-columns:2fr 1fr 1fr;gap:12px;">
+            <div>
+              <label style="display:block;color:var(--mut);margin-bottom:4px;">SMTP Host:</label>
+              <input type="text" id="alerts-em-host" value="${esc(em.host||'localhost')}" placeholder="smtp.gmail.com" style="width:100%;padding:8px 10px;background:var(--card);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);">
+            </div>
+            <div>
+              <label style="display:block;color:var(--mut);margin-bottom:4px;">Port:</label>
+              <input type="number" id="alerts-em-port" value="${em.port||587}" style="width:100%;padding:8px 10px;background:var(--card);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);">
+            </div>
+            <div style="display:flex;flex-direction:column;justify-content:center;gap:4px;">
+              <label style="display:flex;align-items:center;gap:6px;cursor:pointer;"><input type="checkbox" id="alerts-em-tls" ${em.tls!==false?'checked':''} style="accent-color:var(--acc);"> STARTTLS</label>
+              <label style="display:flex;align-items:center;gap:6px;cursor:pointer;"><input type="checkbox" id="alerts-em-ssl" ${em.ssl?'checked':''} style="accent-color:var(--acc);"> SSL</label>
+            </div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+            <div>
+              <label style="display:block;color:var(--mut);margin-bottom:4px;">Username / Login:</label>
+              <input type="text" id="alerts-em-user" value="${esc(em.user||'')}" placeholder="alerts@domain.com" style="width:100%;padding:8px 10px;background:var(--card);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);">
+            </div>
+            <div>
+              <label style="display:block;color:var(--mut);margin-bottom:4px;">Password / App Password:</label>
+              <input type="password" id="alerts-em-password" value="${esc(em.password||'')}" placeholder="••••••••" style="width:100%;padding:8px 10px;background:var(--card);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);">
+            </div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+            <div>
+              <label style="display:block;color:var(--mut);margin-bottom:4px;">From Address:</label>
+              <input type="text" id="alerts-em-from" value="${esc(em.from||'Sentinel <alerts@localhost>')}" placeholder="Sentinel &lt;alerts@domain.com&gt;" style="width:100%;padding:8px 10px;background:var(--card);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);">
+            </div>
+            <div>
+              <label style="display:block;color:var(--mut);margin-bottom:4px;">Recipient(s) (comma separated):</label>
+              <input type="text" id="alerts-em-to" value="${esc((em.to||[]).join(', '))}" placeholder="admin@domain.com, devops@domain.com" style="width:100%;padding:8px 10px;background:var(--card);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);">
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Slack / Discord Pane -->
+      <div class="alert-tab-pane" data-tab="slack" style="display:${CURRENT_ALERT_TAB==='slack'?'block':'none'};">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+          <b style="font-size:13.5px;">Slack &amp; Discord Incoming Webhook</b>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;"><input type="checkbox" id="alerts-sl-enabled" ${sl.enabled?'checked':''} style="accent-color:var(--acc);"> Enabled</label>
+        </div>
+        <div style="display:grid;gap:12px;font-size:12px;">
+          <div>
+            <label style="display:block;color:var(--mut);margin-bottom:4px;">Webhook URL:</label>
+            <input type="text" id="alerts-sl-url" value="${esc(sl.webhook_url||'')}" placeholder="https://hooks.slack.com/services/... or https://discord.com/api/webhooks/..." style="width:100%;padding:8px 10px;background:var(--card);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);">
+            <div style="font-size:11px;color:var(--dim);margin-top:3px;">Works with Slack Incoming Webhooks and Discord Webhook URLs.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ntfy.sh Pane -->
+      <div class="alert-tab-pane" data-tab="ntfy" style="display:${CURRENT_ALERT_TAB==='ntfy'?'block':'none'};">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+          <b style="font-size:13.5px;">ntfy.sh Push Notifications</b>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;"><input type="checkbox" id="alerts-nt-enabled" ${nt.enabled?'checked':''} style="accent-color:var(--acc);"> Enabled</label>
+        </div>
+        <div style="display:grid;gap:12px;font-size:12px;">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+            <div>
+              <label style="display:block;color:var(--mut);margin-bottom:4px;">ntfy Server:</label>
+              <input type="text" id="alerts-nt-server" value="${esc(nt.server||'https://ntfy.sh')}" placeholder="https://ntfy.sh" style="width:100%;padding:8px 10px;background:var(--card);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);">
+            </div>
+            <div>
+              <label style="display:block;color:var(--mut);margin-bottom:4px;">Topic Name:</label>
+              <input type="text" id="alerts-nt-topic" value="${esc(nt.topic||'')}" placeholder="e.g. my-vps-alerts-x9k2" style="width:100%;padding:8px 10px;background:var(--card);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);">
+            </div>
+          </div>
+          <div>
+            <label style="display:block;color:var(--mut);margin-bottom:4px;">Access Token (Optional for private topics):</label>
+            <input type="password" id="alerts-nt-token" value="${esc(nt.token||'')}" placeholder="Optional token" style="width:100%;padding:8px 10px;background:var(--card);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);">
+          </div>
+        </div>
+      </div>
+
+      <!-- Webhook Pane -->
+      <div class="alert-tab-pane" data-tab="webhook" style="display:${CURRENT_ALERT_TAB==='webhook'?'block':'none'};">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+          <b style="font-size:13.5px;">Generic JSON Webhook</b>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;"><input type="checkbox" id="alerts-wh-enabled" ${wh.enabled?'checked':''} style="accent-color:var(--acc);"> Enabled</label>
+        </div>
+        <div style="display:grid;gap:12px;font-size:12px;">
+          <div>
+            <label style="display:block;color:var(--mut);margin-bottom:4px;">Webhook Endpoint URL:</label>
+            <input type="text" id="alerts-wh-url" value="${esc(wh.url||'')}" placeholder="https://api.yourdomain.com/v1/sentinel-webhook" style="width:100%;padding:8px 10px;background:var(--card);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);">
+          </div>
+          <div>
+            <label style="display:block;color:var(--mut);margin-bottom:4px;">Custom Headers (JSON Object):</label>
+            <textarea id="alerts-wh-headers" rows="3" placeholder='{"Authorization": "Bearer YOUR_SECRET_TOKEN"}' style="width:100%;padding:8px 10px;background:var(--card);border:1px solid var(--stroke2);border-radius:8px;color:var(--txt);font-family:monospace;font-size:11.5px;">${esc(wh.headers ? JSON.stringify(wh.headers, null, 2) : '')}</textarea>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Live Test Alert Status Box -->
+    <div id="test-alert-results" style="min-height:28px;margin-bottom:16px;font-size:12px;display:flex;align-items:center;flex-wrap:wrap;gap:6px;"></div>
+
+    <!-- Bottom Actions -->
+    <div style="display:flex;justify-content:space-between;align-items:center;padding-top:14px;border-top:1px solid var(--stroke);flex-wrap:wrap;gap:10px;">
+      <button class="btn admin-only" id="btnTestInModal" onclick="testAlertInModal(this)" style="display:flex;align-items:center;gap:6px;">
+        🧪 Send Test Alert
+      </button>
+      <div style="display:flex;gap:10px;">
+        <button class="btn" onclick="this.closest('#alerts-modal').remove()">Cancel</button>
+        <button class="btn primary admin-only" id="btnSaveAlerts" onclick="saveAlertsConfig(this)" style="display:flex;align-items:center;gap:6px;">
+          💾 Save Notification Settings
+        </button>
+      </div>
+    </div>
+  `;
+}
+
+async function saveAlertsConfig(btn){
+  if(btn) btn.disabled = true;
+  try{
+    const payload = {
+      enabled: $('#alerts-enabled').checked,
+      min_severity: $('#alerts-min-severity').value,
+      consecutive: parseInt($('#alerts-consecutive').value, 10) || 2,
+      cooldown_minutes: parseInt($('#alerts-cooldown').value, 10) || 60,
+      notify_recovery: $('#alerts-recovery').checked,
+      telegram: {
+        enabled: $('#alerts-tg-enabled').checked,
+        bot_token: $('#alerts-tg-token').value.trim(),
+        chat_id: $('#alerts-tg-chat').value.trim()
+      },
+      whatsapp: {
+        enabled: $('#alerts-wa-enabled').checked,
+        provider: $('#alerts-wa-provider').value,
+        phone: $('#alerts-wa-phone').value.trim(),
+        apikey: $('#alerts-wa-apikey').value.trim(),
+        webhook_url: ($('#alerts-wa-webhook') ? $('#alerts-wa-webhook').value.trim() : '')
+      },
+      email: {
+        enabled: $('#alerts-em-enabled').checked,
+        host: $('#alerts-em-host').value.trim(),
+        port: parseInt($('#alerts-em-port').value, 10) || 587,
+        tls: $('#alerts-em-tls').checked,
+        ssl: $('#alerts-em-ssl').checked,
+        user: $('#alerts-em-user').value.trim(),
+        password: $('#alerts-em-password').value.trim(),
+        from: $('#alerts-em-from').value.trim(),
+        to: $('#alerts-em-to').value.split(',').map(s=>s.trim()).filter(Boolean)
+      },
+      slack: {
+        enabled: $('#alerts-sl-enabled').checked,
+        webhook_url: $('#alerts-sl-url').value.trim()
+      },
+      ntfy: {
+        enabled: $('#alerts-nt-enabled').checked,
+        server: $('#alerts-nt-server').value.trim(),
+        topic: $('#alerts-nt-topic').value.trim(),
+        token: $('#alerts-nt-token').value.trim()
+      },
+      webhook: {
+        enabled: $('#alerts-wh-enabled').checked,
+        url: $('#alerts-wh-url').value.trim(),
+        headers: {}
+      }
+    };
+
+    const hdrsRaw = ($('#alerts-wh-headers').value || '').trim();
+    if(hdrsRaw){
+      try{
+        payload.webhook.headers = JSON.parse(hdrsRaw);
+      }catch(e){
+        toast('Invalid JSON', 'Webhook headers must be valid JSON', 'crit');
+        if(btn) btn.disabled = false;
+        return;
+      }
+    }
+
+    const res = await api('/api/alerts/config', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+
+    if(res.ok){
+      ALERTS_CONFIG = res.alerts;
+      toast('Alerts Config Saved', 'Notification channels and rules saved successfully', 'ok');
+      const m = $('#alerts-modal');
+      if(m) m.remove();
+    } else {
+      toast('Save Failed', res.message || 'Error saving alert configuration', 'crit');
+    }
+  }catch(e){
+    toast('Error Saving Alerts', e.message, 'crit');
+  }finally{
+    if(btn) btn.disabled = false;
+  }
+}
+
+async function testAlertInModal(btn){
+  btn.disabled = true;
+  const statusDiv = $('#test-alert-results');
+  if(statusDiv){
+    statusDiv.innerHTML = '<span class="spin" style="display:inline-block;margin-right:6px;">🔄</span> Dispatching test alert to enabled channels…';
+  }
+  try{
+    const r = await api('/api/test-alert', {method:'POST'});
+    const anyOk = Object.values(r.results||{}).some(v=>v.ok);
+    const badges = Object.entries(r.results||{}).map(([ch, v]) => `
+      <span class="badge" style="background:${v.ok ? 'rgba(23,201,100,0.15)' : 'rgba(239,68,68,0.15)'};color:${v.ok ? 'var(--ok)' : 'var(--crit)'};margin-right:6px;padding:3px 8px;font-size:11px;">
+        ${esc(ch)}: ${v.ok ? '✓ Sent' : '✗ ' + esc(v.detail||'Failed')}
+      </span>
+    `).join('');
+    if(statusDiv){
+      statusDiv.innerHTML = (badges || `<span style="color:var(--warn);">${esc(r.detail||'No channels enabled')}</span>`);
+    }
+    toast(anyOk ? 'Test Alert Delivered' : 'Alert Notice', r.detail || 'Test completed', anyOk ? 'ok' : 'crit', 6000);
+  }catch(e){
+    if(statusDiv) statusDiv.innerHTML = `<span style="color:var(--crit);">Error: ${esc(e.message)}</span>`;
+    toast('Test Failed', e.message, 'crit');
+  }finally{
+    btn.disabled = false;
+  }
+}
 
 function showIncidents(){
  if(!INCIDENTS.length){toast('No Incidents','No high-load spikes or warnings recorded yet.','ok');return;}
@@ -7259,7 +8037,8 @@ class Handler(BaseHTTPRequestHandler):
         "/api/fleet", "/api/health", "/api/visitors", "/api/benchmark",
         "/api/benchmark/capacity", "/api/security/banned", "/api/sites",
         "/api/server-doctor", "/api/report/html", "/api/auto-heal",
-        "/api/history", "/api/incidents", "/api/php-services", "/metrics"
+        "/api/history", "/api/incidents", "/api/php-services", "/metrics",
+        "/api/system/update-check", "/api/alerts/config"
     }
 
     ALLOWED_POST_ROUTES = {
@@ -7268,7 +8047,8 @@ class Handler(BaseHTTPRequestHandler):
         "/api/sites/check", "/api/sites/add", "/api/sites/remove", "/api/scan",
         "/api/auto-heal/toggle", "/api/php-action", "/api/system-action",
         "/api/test-alert", "/api/license/activate", "/api/fleet/add",
-        "/api/fleet/remove", "/api/fleet/poll"
+        "/api/fleet/remove", "/api/fleet/poll", "/api/system/update-run",
+        "/api/alerts/config"
     }
 
     def log_message(self, *a):
@@ -7493,6 +8273,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"services": detect_php_services()})
         if norm_path == "/metrics":
             return self._send(200, prometheus(self.engine), "text/plain; version=0.0.4")
+        if norm_path == "/api/system/update-check":
+            res = check_for_updates()
+            return self._send(200, res)
+        if norm_path == "/api/alerts/config":
+            if role != "admin":
+                return self._send(403, {"ok": False, "error": "Forbidden: View-only role cannot access notification configuration."})
+            return self._send(200, {"ok": True, "alerts": get_masked_alerts_config(self.cfg.get("alerts", {}))})
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -7738,6 +8525,28 @@ class Handler(BaseHTTPRequestHandler):
         if norm_path == "/api/fleet/poll":
             summary = self.engine.fleet_manager.poll_all(force=True)
             return self._send(200, {"ok": True, "fleet": summary})
+        if norm_path == "/api/system/update-run":
+            ok, msg = execute_system_update()
+            return self._send(200 if ok else 500, {"ok": ok, "message": msg})
+        if norm_path == "/api/alerts/config":
+            try:
+                body = json.loads(data_bytes.decode() or "{}")
+            except Exception as e:
+                return self._send(400, {"ok": False, "error": f"Invalid JSON body: {e}"})
+            if not isinstance(body, dict):
+                return self._send(400, {"ok": False, "error": "Body must be a JSON object"})
+            current_alerts = self.cfg.get("alerts", {})
+            merged = unmask_and_merge_alerts_config(current_alerts, body)
+            self.cfg["alerts"] = merged
+            if self.alerts:
+                self.alerts.cfg = merged
+            cfg_file = self.cfg_path or os.environ.get("SENTINEL_CONFIG", "/etc/health-sentinel/config.json")
+            ok, msg = save_config_section(cfg_file, "alerts", merged)
+            return self._send(200 if ok else 500, {
+                "ok": ok,
+                "message": msg,
+                "alerts": get_masked_alerts_config(merged)
+            })
         return self._send(404, {"error": "not found"})
 
 
