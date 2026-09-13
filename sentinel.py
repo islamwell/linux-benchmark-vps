@@ -42,8 +42,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.2.2"
-UPDATED = "2026-09-13 14:58"
+VERSION = "2.2.3"
+UPDATED = "2026-09-13 15:02"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -3625,7 +3625,7 @@ def generate_executive_html(report, history, branding, healing_history):
     mem_used_pct = mem_c.get("metrics", {}).get("used_pct", 0)
     disk_worst = disk_c.get("metrics", {}).get("worst_pct", 0)
 
-    score_col = "#16a34a" if score >= 85 else ("#d97706" if score >= 65 else "#dc2626")
+    score_col = "#16a34a" if score >= 75 else ("#d97706" if score >= 60 else "#dc2626")
 
     # Healing entries
     heal_rows = ""
@@ -4862,7 +4862,8 @@ function renderCardChart(key, color, unit, rangeKey='10m', isModal=false){
 /* ── render ── */
 function render(r){
  REPORT=r;
- const col=CLR[r.status] || CLR.ok;
+ const isGood = (r.grade === 'A+' || r.grade === 'A' || r.grade === 'B' || (r.score >= 75 && (!r.counts || !r.counts.crit)));
+ const col = isGood ? CLR.ok : (r.counts && r.counts.crit ? CLR.crit : (CLR[r.status] || (r.score >= 50 ? CLR.warn : CLR.crit)));
  $('#hostline').textContent=`${r.host} · ${r.os} · kernel ${r.kernel} · ${r.cores} cores · up ${r.uptime}`;
  document.title=`${r.score.toFixed(0)}/100 · ${r.host} · Sentinel`;
 
@@ -5960,7 +5961,7 @@ function renderFleet(f){
           </thead>
           <tbody>
             ${nodes.map(n => {
-              const sc = n.online ? (n.score >= 85 ? 'var(--ok)' : (n.score >= 65 ? 'var(--warn)' : 'var(--crit)')) : 'var(--crit)';
+              const sc = n.online ? (n.score >= 75 ? 'var(--ok)' : (n.score >= 60 ? 'var(--warn)' : 'var(--crit)')) : 'var(--crit)';
               const badgeBg = n.online ? (n.status === 'crit' ? 'rgba(239,68,68,0.12)' : (n.status === 'warn' ? 'rgba(245,158,11,0.12)' : 'rgba(16,185,129,0.12)')) : 'rgba(239,68,68,0.12)';
               const badgeTxt = n.online ? (n.status === 'crit' ? 'var(--crit)' : (n.status === 'warn' ? 'var(--warn)' : 'var(--ok)')) : 'var(--crit)';
               return `
@@ -7408,7 +7409,7 @@ def cli_report(r, verbose=True, colour=True):
             if not k.startswith("_"):
                 setattr(A, k, "")
     W = 92
-    sc = _c(r["status"])
+    sc = A.OK if (r.get("grade") in ("A+", "A", "B") or (r.get("score", 0) >= 75 and not r.get("counts", {}).get("crit"))) else _c(r["status"])
     print()
     print(f"{A.ACC}╭{'─' * (W - 2)}╮{A.R}")
     title = f" 🛡  LINUX HEALTH SENTINEL v{VERSION}"
