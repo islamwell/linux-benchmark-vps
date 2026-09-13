@@ -42,8 +42,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.2.3"
-UPDATED = "2026-09-13 15:02"
+VERSION = "2.2.4"
+UPDATED = "2026-09-13 18:35"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -321,6 +321,16 @@ def fmt_bytes(n, digits=1):
         if abs(n) < 1024 or u == "P":
             return f"{n:.{0 if u == 'B' else digits}f}{u}"
         n /= 1024.0
+
+
+def fmt_num(n):
+    """Format numbers with comma separators (e.g. 1,234,567)."""
+    try:
+        if isinstance(n, float):
+            return f"{n:,.2f}".rstrip('0').rstrip('.')
+        return f"{int(n):,}"
+    except Exception:
+        return str(n)
 
 
 def fmt_dur(sec):
@@ -927,12 +937,12 @@ def check_disk_io(cur, prev, dt, T):
     c.score, c.status = min(s1, s2, s3), LEVELS[max(RANK[st1], RANK[st2], RANK[st3])]
     c.pct = clamp(worst_util)
     c.summary = (f"iowait {iowait:.1f}% · worst await {worst_await:.1f}ms · "
-                 f"{devs[0]['iops'] if devs else 0:.0f} IOPS · D-state {blocked}")
+                 f"{fmt_num(round(devs[0]['iops'])) if devs else 0} IOPS · D-state {fmt_num(blocked)}")
 
     if iowait >= T["iowait_warn"]:
         sev = "crit" if iowait >= T["iowait_crit"] else "warn"
         c.add(sev, f"High Disk Wait Time (CPU iowait is {iowait:.1f}%)",
-              f"{blocked} program(s) are stuck waiting on hard drive response.",
+              f"{fmt_num(blocked)} program(s) are stuck waiting on hard drive response.",
               "Why this happens: The processor is idling because it is waiting for files to be read from or written to the hard drive.",
               ["ps -eo pid,user,stat,cmd | awk '$3~/D/' # View programs waiting on disk"],
               ["Optimize database queries and turn on Redis caching"])
@@ -1471,29 +1481,29 @@ def check_logs(cur, prev, dt, T):
     
     extra_summary = ""
     if php_data["slow_count_1h"] > 0:
-        extra_summary = f" · {php_data['slow_count_1h']} PHP slow/h"
-    c.summary = (f"{nerr} journal errors/h · {len(fails)} failed logins/h · "
-                 f"{len(segv)} segfaults{extra_summary} · journal {c.metrics['journal_usage'] or 'n/a'}")
+        extra_summary = f" · {fmt_num(php_data['slow_count_1h'])} PHP slow/h"
+    c.summary = (f"{fmt_num(nerr)} journal errors/h · {fmt_num(len(fails))} failed logins/h · "
+                 f"{fmt_num(len(segv))} segfaults{extra_summary} · journal {c.metrics['journal_usage'] or 'n/a'}")
 
     if nerr >= T["logerr_warn"]:
         c.add("crit" if nerr >= T["logerr_crit"] else "warn",
-              f"{nerr} System Error Logs in the Past Hour",
-              " ⟶ ".join(f"[{n}×] {t}" for t, n in top[:2]),
+              f"{fmt_num(nerr)} System Error Logs in the Past Hour",
+              " ⟶ ".join(f"[{fmt_num(n)}×] {t}" for t, n in top[:2]),
               "Why this happens: A website, background daemon, or database is encountering recurring errors and logging them.",
               ["journalctl -p err --since '-1h' --no-pager | tail -30 # Read the most recent error lines"],
               ["Inspect the top repeating error line above and fix the corresponding website/service configuration"])
     if len(fails) >= T["authfail_warn"]:
         c.add("crit" if len(fails) >= T["authfail_crit"] else "warn",
-              f"{len(fails)} Failed SSH Password Logins in Past Hour (Brute-Force)",
-              "Top attacker IP addresses: " + ", ".join(f"{ip} ({n}×)" for ip, n in top_ips),
+              f"{fmt_num(len(fails))} Failed SSH Password Logins in Past Hour (Brute-Force)",
+              "Top attacker IP addresses: " + ", ".join(f"{ip} ({fmt_num(n)}×)" for ip, n in top_ips),
               "Why this happens: Automated bots on the internet are trying to guess your server SSH password on port 22.",
               ["lastb | head -15                      # See recent failed login attempts and usernames",
-               "sudo fail2ban-client status sshd 2>/dev/null || true"],
+                "sudo fail2ban-client status sshd 2>/dev/null || true"],
               ["Install fail2ban to auto-block attackers: `sudo apt install fail2ban` or `sudo dnf install fail2ban`",
-               "Disable password login in `/etc/ssh/sshd_config` and use SSH keys instead"])
+                "Disable password login in `/etc/ssh/sshd_config` and use SSH keys instead"])
     if php_data["slow_count_1h"] > 0:
         c.add("crit" if php_data["slow_count_1h"] >= T.get("php_slow_crit", 15) else "warn",
-              f"{php_data['slow_count_1h']} Slow PHP Script(s) Detected in Past Hour",
+              f"{fmt_num(php_data['slow_count_1h'])} Slow PHP Script(s) Detected in Past Hour",
               "Top slow scripts: " + (" | ".join(f"{s['script']} ({s['pool']}, {s['duration']})" for s in php_data["top_slow_scripts"][:3]) or "see table"),
               "Why this happens: PHP web requests took longer than 5 seconds to finish (slow database query, unindexed search, or external API timeout). Slow scripts tie up PHP worker processes, causing 502/504 Bad Gateway errors for visitors.",
               ["tail -n 50 /var/log/plesk-php*-fpm/slow.log 2>/dev/null || tail -n 50 /var/log/php-fpm-slow.log # View slow script backtraces"],
@@ -1502,7 +1512,7 @@ def check_logs(cur, prev, dt, T):
                "Increase maximum worker children (pm.max_children) in Plesk PHP Settings for that domain"])
     if php_data["active_php_pools"] > 0 and len(php_data["unlogged_pools"]) > 0:
         c.add("info" if php_data["slow_count_1h"] == 0 else "warn",
-              f"PHP Slow Logging is Turned Off for {len(php_data['unlogged_pools'])} Domain(s)",
+              f"PHP Slow Logging is Turned Off for {fmt_num(len(php_data['unlogged_pools']))} Domain(s)",
               "e.g. " + ", ".join(php_data["unlogged_pools"][:6]),
               "Why this matters: When a website freezes, PHP slow logging tells you the exact file, line number, and function responsible.",
               ["grep -rnE 'request_slowlog_timeout|slowlog' /opt/plesk/php/*/etc/php-fpm.d/ 2>/dev/null"],
@@ -4740,6 +4750,23 @@ const api=(p,o={})=>{
 };
 const bytes=n=>{n=+n||0;const u=['B','K','M','G','T','P'];let i=0;while(n>=1024&&i<5){n/=1024;i++}
  return (i?n.toFixed(1):n)+u[i]};
+const fmtNum=n=>{if(n===null||n===undefined||isNaN(n))return'—';return Number(n).toLocaleString()};
+function fmtVal(k,v,checkId){
+ if(v===null||v===undefined)return'—';
+ if(typeof v==='boolean')return v?'true':'false';
+ if(typeof v!=='number')return v;
+ if(isNaN(v))return'—';
+ const lk=String(k).toLowerCase();
+ if(/(_pct|busy|user|system|iowait|steal|irq|util|pct)$/.test(lk))return(Math.round(v*10)/10)+'%';
+ if(/(_ms|await_ms|latency_ms)$/.test(lk))return(Math.round(v*10)/10)+' ms';
+ if(/(rx_s|tx_s|read_s|write_s)$/.test(lk))return bytes(v)+'/s';
+ if(/(swap_in_s|swap_out_s|listen_drops_s|overflow_s|err_s|worst_err_s)$/.test(lk))return(Math.round(v*10)/10)+'/s';
+ if(checkId==='inodes'&&/(free|total)$/.test(lk))return fmtNum(v);
+ if(/(bytes|rss|cached|buffers|commit|slab|hugepages|swap_total|swap_free|swap_used)$/.test(lk)||(checkId!=='inodes'&&/(free|total|available)$/.test(lk)))return bytes(v);
+ if(/(iops|rps)$/.test(lk))return fmtNum(Math.round(v))+' '+k.toUpperCase();
+ if(Number.isInteger(v)||Math.abs(v)>=1000)return fmtNum(Math.round(v));
+ return String(Math.round(v*100)/100);
+}
 
 /* ── toasts ── */
 function toast(title,msg,kind='info',ms=4200){
@@ -4873,15 +4900,15 @@ function render(r){
  $('#gbar').setAttribute('stroke-dashoffset', C-(C*Math.max(r.score,2)/100));
  $('#gscore').innerHTML=`${r.score.toFixed(0)}<small>/100</small>`;
  $('#ggrade').textContent=`${r.grade} · ${r.grade_label.toUpperCase()}`;
- $('#gsub').textContent=`${r.counts.total} checks in ${r.duration_ms}ms · ${new Date(r.ts*1000).toLocaleTimeString()}`;
+ $('#gsub').textContent=`${fmtNum(r.counts.total)} checks in ${fmtNum(r.duration_ms)}ms · ${new Date(r.ts*1000).toLocaleTimeString()}`;
  $('#gpills').innerHTML=
-  (r.counts.crit?`<span class="pill c">${r.counts.crit} critical</span>`:'')+
-  (r.counts.warn?`<span class="pill w">${r.counts.warn} warning</span>`:'')+
-  `<span class="pill o">${r.counts.ok} healthy</span>`;
- ['all','crit','warn','ok'].forEach(k=>$('#c-'+k).textContent=k==='all'?r.counts.total:r.counts[k]);
- $('#c-inc').textContent=INCIDENTS.length;
- const bInc=$('#badge-inc'); if(bInc) bInc.textContent=INCIDENTS.length;
- if(VISITORS){ const bVis=$('#badge-visitors'); if(bVis) bVis.textContent=VISITORS.active_visitors_5m; }
+  (r.counts.crit?`<span class="pill c">${fmtNum(r.counts.crit)} critical</span>`:'')+
+  (r.counts.warn?`<span class="pill w">${fmtNum(r.counts.warn)} warning</span>`:'')+
+  `<span class="pill o">${fmtNum(r.counts.ok)} healthy</span>`;
+ ['all','crit','warn','ok'].forEach(k=>$('#c-'+k).textContent=k==='all'?fmtNum(r.counts.total):fmtNum(r.counts[k]));
+ $('#c-inc').textContent=fmtNum(INCIDENTS.length);
+ const bInc=$('#badge-inc'); if(bInc) bInc.textContent=fmtNum(INCIDENTS.length);
+ if(VISITORS){ const bVis=$('#badge-visitors'); if(bVis) bVis.textContent=fmtNum(VISITORS.active_visitors_5m); }
  if(BENCHMARK && BENCHMARK.tier_badge){ const bBench=$('#badge-bench'); if(bBench) bBench.textContent='Tier '+BENCHMARK.tier_badge; }
 
  // Top 4 KPI Cards with dedicated historical charts & Y-axis units
@@ -4972,33 +4999,36 @@ function card(c){
    ${f.diagnose.length?`<div class="sec"><h4>🔍 How to check the problem:</h4>${f.diagnose.map(cmd).join('')}</div>`:''}
    ${f.fix.length?`<div class="sec"><h4>🛠️ How to fix it (Easy Copy-Paste):</h4><ol class="fix">${f.fix.map(x=>`<li>${esc(x)}</li>`).join('')}</ol></div>`:''}
   </div>`).join('');
- const metrics=`<div class="sec"><h4>Detailed Metrics</h4><table class="mtable">${
-  Object.entries(c.metrics).filter(([k,v])=>['number','string','boolean'].includes(typeof v))
-  .map(([k,v])=>`<tr><td>${esc(k)}</td><td>${esc(typeof v==='number'?(Math.round(v*100)/100):v)}</td></tr>`).join('')
- }</table>${tables(c)}</div>`;
- return `<div class="glass card${OPEN.has(c.id)?' open':''}" data-id="${c.id}" data-s="${c.status}"
-   data-q="${esc((c.name+' '+c.summary+' '+c.findings.map(f=>f.title).join(' ')).toLowerCase())}"
-   style="--sc:${col}">
-  <div class="ch"><div class="ico"><svg viewBox="0 0 24 24">${ICONS[c.icon]||ICONS.alert}</svg></div>
-   <div style="flex:1"><div class="cn">${esc(c.name)}</div>
-    <div style="font-size:11.5px;color:var(--dim)">score ${c.score.toFixed(0)}/100 · weight ${c.weight}</div></div>
-   <span class="badge">${c.status==='ok'?'HEALTHY':c.status.toUpperCase()}</span></div>
-  <div class="cv"><b>${esc(c.value)}</b><span>${esc(c.unit)}</span>
-   <span class="sq">${c.findings.length?c.findings.length+' finding'+(c.findings.length>1?'s':''):'healthy'}</span></div>
-  <div class="bar"><i style="width:${Math.max(2,Math.min(100,c.pct)).toFixed(1)}%"></i></div>
-  <div class="cs">${esc(c.summary)}</div>
-  ${findings?`<div class="cf">${findings}</div>`:''}
-  <button class="expand" onclick="tog(this)">${c.findings.length?'View Diagnose &amp; Fix Guide':'View System Details'}
-   <svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg></button>
-  <div class="det"><div class="dbody">${detail||'<div class="sec"><h4>All Good</h4><div class="why">All metrics for this probe are within healthy operational thresholds.</div></div>'}${metrics}</div></div>
- </div>`;
+  const metrics=`<div class="sec"><h4>Detailed Metrics</h4><table class="mtable">${
+   Object.entries(c.metrics).filter(([k,v])=>['number','string','boolean'].includes(typeof v))
+   .map(([k,v])=>`<tr><td>${esc(k)}</td><td>${esc(fmtVal(k,v,c.id))}</td></tr>`).join('')
+  }</table>${tables(c)}</div>`;
+  return `<div class="glass card${OPEN.has(c.id)?' open':''}" data-id="${c.id}" data-s="${c.status}"
+    data-q="${esc((c.name+' '+c.summary+' '+c.findings.map(f=>f.title).join(' ')).toLowerCase())}"
+    style="--sc:${col}">
+   <div class="ch"><div class="ico"><svg viewBox="0 0 24 24">${ICONS[c.icon]||ICONS.alert}</svg></div>
+    <div style="flex:1"><div class="cn">${esc(c.name)}</div>
+     <div style="font-size:11.5px;color:var(--dim)">score ${c.score.toFixed(0)}/100 · weight ${c.weight}</div></div>
+    <span class="badge">${c.status==='ok'?'HEALTHY':c.status.toUpperCase()}</span></div>
+   <div class="cv"><b>${esc(c.value)}</b><span>${esc(c.unit)}</span>
+    <span class="sq">${c.findings.length?c.findings.length+' finding'+(c.findings.length>1?'s':''):'healthy'}</span></div>
+   <div class="bar"><i style="width:${Math.max(2,Math.min(100,c.pct)).toFixed(1)}%"></i></div>
+   <div class="cs">${esc(c.summary)}</div>
+   ${findings?`<div class="cf">${findings}</div>`:''}
+   <button class="expand" onclick="tog(this)">${c.findings.length?'View Diagnose &amp; Fix Guide':'View System Details'}
+    <svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg></button>
+   <div class="det"><div class="dbody">${detail||'<div class="sec"><h4>All Good</h4><div class="why">All metrics for this probe are within healthy operational thresholds.</div></div>'}${metrics}</div></div>
+  </div>`;
 }
 function tables(c){
  const t=[];
  const list=(arr,cols,title)=>{if(!Array.isArray(arr)||!arr.length)return'';
   return `<h4 style="margin-top:12px">${title}</h4><table class="mtable">`+arr.slice(0,8).map(o=>
-   `<tr>${cols.map((k,i)=>`<td>${esc(typeof o[k]==='number'?Math.round(o[k]*100)/100:(k.match(/free|total|rss|rx_s|tx_s|read_s|write_s/)?bytes(o[k]):o[k]))}</td>`).join('')}</tr>`).join('')+'</table>'};
- if(c.metrics.mounts) t.push(list(c.metrics.mounts,['mount','pct','free'],'Hard Drive Partitions (Disk space %, free)'));
+   `<tr>${cols.map((k,i)=>`<td>${esc(fmtVal(k,o[k],c.id))}</td>`).join('')}</tr>`).join('')+'</table>'};
+ if(c.metrics.mounts) {
+  const isInode = (c.id === 'inodes');
+  t.push(list(c.metrics.mounts,['mount','pct','free'], isInode ? 'Filesystem Inode Slots (Inode %, Free Inodes)' : 'Hard Drive Partitions (Disk space %, Free Space)'));
+ }
  if(c.metrics.devices) t.push(list(c.metrics.devices,['dev','util','await_ms','iops'],'Storage Devices (Busy %, Wait Time ms, IOPS)'));
  if(c.metrics.ifaces) t.push(list(c.metrics.ifaces,['iface','rx_s','tx_s','err_s'],'Network Cards (Download/s, Upload/s, Errors/s)'));
  if(c.metrics.top_cpu) t.push(list(c.metrics.top_cpu,['comm','user','cpu','cmd'],'Programs using the most CPU (%)'));
@@ -5125,7 +5155,7 @@ async function doDoctorAction(act){
 function renderVisitors(v){
   if(!v) return;
   const badge = $('#badge-visitors');
-  if(badge) badge.textContent = `${v.active_visitors_5m}`;
+  if(badge) badge.textContent = fmtNum(v.active_visitors_5m);
 
   const view = $('#view-visitors');
   if(!view) return;
@@ -5140,18 +5170,18 @@ function renderVisitors(v){
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:20px;">
       <div class="glass" style="padding:16px;">
         <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">🟢 Active Visitors (5m)</span>
-        <div style="font-size:32px;font-weight:800;margin-top:4px;color:var(--ok);">${v.active_visitors_5m}</div>
-        <div style="font-size:11.5px;color:var(--dim);">${v.active_visitors_15m} unique IPs in last 15 min</div>
+        <div style="font-size:32px;font-weight:800;margin-top:4px;color:var(--ok);">${fmtNum(v.active_visitors_5m)}</div>
+        <div style="font-size:11.5px;color:var(--dim);">${fmtNum(v.active_visitors_15m)} unique IPs in last 15 min</div>
       </div>
       <div class="glass" style="padding:16px;">
         <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">🔌 Live TCP Sockets</span>
-        <div style="font-size:32px;font-weight:800;margin-top:4px;">${v.live_connections}</div>
+        <div style="font-size:32px;font-weight:800;margin-top:4px;">${fmtNum(v.live_connections)}</div>
         <div style="font-size:11.5px;color:var(--dim);">Concurrent connections to 80/443</div>
       </div>
       <div class="glass" style="padding:16px;">
         <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">🛡️ Threat Shield</span>
-        <div style="font-size:32px;font-weight:800;margin-top:4px;color:${v.threat_count > 0 ? 'var(--crit)' : 'var(--ok)'};">${v.threat_count || 0}</div>
-        <div style="font-size:11.5px;color:var(--dim);">${bannedList.length} IP(s) currently blocked in firewall</div>
+        <div style="font-size:32px;font-weight:800;margin-top:4px;color:${v.threat_count > 0 ? 'var(--crit)' : 'var(--ok)'};">${fmtNum(v.threat_count || 0)}</div>
+        <div style="font-size:11.5px;color:var(--dim);">${fmtNum(bannedList.length)} IP(s) currently blocked in firewall</div>
       </div>
       <div class="glass" style="padding:16px;">
         <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">📊 HTTP Status Codes</span>
@@ -5160,7 +5190,7 @@ function renderVisitors(v){
           <span style="font-size:18px;font-weight:700;color:var(--warn);">${pct4}% <small style="font-size:11px;color:var(--dim);">4xx</small></span>
           <span style="font-size:18px;font-weight:700;color:${pct5>0?'var(--crit)':'var(--dim)'};">${pct5}% <small style="font-size:11px;color:var(--dim);">5xx</small></span>
         </div>
-        <div style="font-size:11.5px;color:var(--dim);margin-top:4px;">${v.requests_per_second} req/s rate</div>
+        <div style="font-size:11.5px;color:var(--dim);margin-top:4px;">${fmtNum(v.requests_per_second)} req/s rate</div>
       </div>
     </div>
 
@@ -5168,7 +5198,7 @@ function renderVisitors(v){
       <div class="glass" style="padding:20px;overflow:hidden;">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px;">
           <h3 style="font-size:15px;display:flex;align-items:center;gap:8px;">🌍 Real-Time Visitors &amp; Geographic Location</h3>
-          <span style="font-size:12px;color:var(--dim);">${v.visitors.length} client(s) tracked</span>
+          <span style="font-size:12px;color:var(--dim);">${fmtNum(v.visitors.length)} client(s) tracked</span>
         </div>
         ${v.visitors.length ? `
           <div style="overflow-x:auto;">
@@ -5202,7 +5232,7 @@ function renderVisitors(v){
                     <td><span class="badge" style="font-size:10px;padding:2px 6px;${vis.code>=500?'color:var(--crit);background:rgba(255,85,102,.15)':(vis.code>=400?'color:var(--warn);background:rgba(255,179,64,.15)':'color:var(--ok);background:rgba(37,227,154,.15)')}">${vis.code}</span></td>
                     <td><span class="badge" title="${esc(thr.reason)}" style="font-size:10px;padding:2px 7px;color:${thr.color};background:color-mix(in srgb,${thr.color} 15%,transparent);border-color:color-mix(in srgb,${thr.color} 30%,transparent);">${esc(thr.label)}</span></td>
                     <td style="font-size:12px;color:var(--dim);">${esc(vis.device)}</td>
-                    <td style="text-align:right;font-weight:700;">${vis.hits}</td>
+                    <td style="text-align:right;font-weight:700;">${fmtNum(vis.hits)}</td>
                     <td style="text-align:right;">
                       ${IS_VIEWER ? `<span style="font-size:11px;color:var(--dim);">View Only</span>` : (isBanned ? `
                         <button class="btn" onclick="unbanIP('${esc(vis.ip)}')" style="height:26px;padding:0 8px;font-size:11px;color:var(--ok);border-color:color-mix(in srgb,var(--ok) 35%,transparent);">✓ Unban</button>
@@ -5231,7 +5261,7 @@ function renderVisitors(v){
             ${v.top_paths.map(tp => `
               <div style="padding:8px 12px;background:var(--card2);border-radius:10px;display:flex;justify-content:space-between;align-items:center;">
                 <code style="font-size:12px;color:var(--txt);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(tp.path)}</code>
-                <span style="font-size:11.5px;font-weight:700;color:var(--acc);">${tp.hits} hit${tp.hits>1?'s':''}</span>
+                <span style="font-size:11.5px;font-weight:700;color:var(--acc);">${fmtNum(tp.hits)} hit${tp.hits>1?'s':''}</span>
               </div>
             `).join('')}
           </div>
@@ -5243,7 +5273,7 @@ function renderVisitors(v){
     <div class="glass" style="padding:20px;">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px;">
         <div>
-          <h3 style="font-size:15px;display:flex;align-items:center;gap:8px;">🛡️ Firewall Shield · Blocked IP Addresses (${bannedList.length})</h3>
+          <h3 style="font-size:15px;display:flex;align-items:center;gap:8px;">🛡️ Firewall Shield · Blocked IP Addresses (${fmtNum(bannedList.length)})</h3>
           <span style="font-size:12px;color:var(--dim);">Banned IPs are immediately dropped in iptables/ufw to protect your server.</span>
         </div>
         ${IS_VIEWER ? '' : `<button class="btn" onclick="promptManualBan()" style="height:30px;font-size:12px;color:var(--crit);border-color:color-mix(in srgb,var(--crit) 35%,transparent);">+ Block Custom IP</button>`}
@@ -5370,7 +5400,7 @@ function renderHardwareBenchmarkView(b){
       </div>
       <div style="display:flex;align-items:center;gap:18px;">
         <div style="text-align:right;">
-          <div style="font-size:36px;font-weight:900;color:${scoreColor};line-height:1;">${b.composite_score}<small style="font-size:15px;color:var(--mut);font-weight:600;">/1000</small></div>
+          <div style="font-size:36px;font-weight:900;color:${scoreColor};line-height:1;">${fmtNum(b.composite_score)}<small style="font-size:15px;color:var(--mut);font-weight:600;">/1000</small></div>
           <span style="font-size:11px;color:var(--dim);text-transform:uppercase;font-weight:700;">Composite Score</span>
         </div>
         ${IS_VIEWER ? '' : `
@@ -5384,8 +5414,8 @@ function renderHardwareBenchmarkView(b){
     <div class="bench-grid">
       <div class="bench-card">
         <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">🖥️ CPU Compute Score</span>
-        <div style="font-size:28px;font-weight:800;margin:6px 0 2px;color:var(--acc);">${b.cpu.multi_core_score} <small style="font-size:13px;color:var(--mut);">multi-core</small></div>
-        <div style="font-size:12px;color:var(--txt);">Single-Core: <b>${b.cpu.single_core_score}</b> pts</div>
+        <div style="font-size:28px;font-weight:800;margin:6px 0 2px;color:var(--acc);">${fmtNum(b.cpu.multi_core_score)} <small style="font-size:13px;color:var(--mut);">multi-core</small></div>
+        <div style="font-size:12px;color:var(--txt);">Single-Core: <b>${fmtNum(b.cpu.single_core_score)}</b> pts</div>
         <div style="font-size:11.5px;color:var(--dim);margin-top:4px;">${b.cpu.cores} Cores · ${b.cpu.efficiency}% parallel scaling efficiency</div>
       </div>
 
@@ -5503,7 +5533,7 @@ function renderCapacityResults(b){
             Visitor Traffic Capacity Verdict
           </span>
           <div style="font-size:26px;font-weight:900;color:${statusColor};margin-top:2px;">
-            ~${b.safe_concurrent_visitors} Concurrent Visitors
+            ~${fmtNum(b.safe_concurrent_visitors)} Concurrent Visitors
           </div>
           <div style="font-size:12px;color:var(--mut);margin-top:3px;">
             Tested against <b>${esc(b.target_url)}</b> (${esc(b.mode)} mode) on ${esc(b.date)} in ${b.duration_s}s
@@ -5512,7 +5542,7 @@ function renderCapacityResults(b){
 
         <div style="text-align:right;">
           <div style="font-size:30px;font-weight:900;color:var(--txt);line-height:1;">
-            ${b.safe_rps} <small style="font-size:14px;color:var(--mut);">RPS</small>
+            ${fmtNum(b.safe_rps)} <small style="font-size:14px;color:var(--mut);">RPS</small>
           </div>
           <span style="font-size:11px;color:var(--dim);text-transform:uppercase;font-weight:700;">Sustainable Throughput</span>
         </div>
@@ -5521,14 +5551,14 @@ function renderCapacityResults(b){
       <div class="cap-stat-grid">
         <div class="cap-stat-card">
           <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">👥 Safe Active Visitors</span>
-          <div style="font-size:26px;font-weight:800;color:var(--ok);margin:6px 0 2px;">~${b.safe_concurrent_visitors} <small style="font-size:12px;color:var(--mut);">simultaneous</small></div>
+          <div style="font-size:26px;font-weight:800;color:var(--ok);margin:6px 0 2px;">~${fmtNum(b.safe_concurrent_visitors)} <small style="font-size:12px;color:var(--mut);">simultaneous</small></div>
           <div style="font-size:12px;color:var(--txt);">Response latency: <b>${b.safe_latency_ms} ms</b></div>
         </div>
 
         <div class="cap-stat-card">
           <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">⚡ Requests / Second</span>
-          <div style="font-size:26px;font-weight:800;color:var(--acc);margin:6px 0 2px;">${b.safe_rps} <small style="font-size:12px;color:var(--mut);">RPS safe</small></div>
-          <div style="font-size:12px;color:var(--txt);">Peak burst throughput: <b>${b.peak_rps} RPS</b></div>
+          <div style="font-size:26px;font-weight:800;color:var(--acc);margin:6px 0 2px;">${fmtNum(b.safe_rps)} <small style="font-size:12px;color:var(--mut);">RPS safe</small></div>
+          <div style="font-size:12px;color:var(--txt);">Peak burst throughput: <b>${fmtNum(b.peak_rps)} RPS</b></div>
         </div>
 
         <div class="cap-stat-card">
@@ -5601,8 +5631,8 @@ function renderCapacityResults(b){
                 return `
                   <tr>
                     <td><b>Stage ${s.stage}</b> (${esc(s.name)})</td>
-                    <td><b style="color:var(--txt);font-size:13.5px;">${s.concurrency}</b> visitors</td>
-                    <td><b>${s.rps}</b> req/s</td>
+                    <td><b style="color:var(--txt);font-size:13.5px;">${fmtNum(s.concurrency)}</b> visitors</td>
+                    <td><b>${fmtNum(s.rps)}</b> req/s</td>
                     <td>${s.avg_latency_ms} ms</td>
                     <td>${s.p95_latency_ms} ms</td>
                     <td>${s.error_rate_pct}%</td>
@@ -5886,7 +5916,7 @@ function renderFleet(f){
   const el = $('#view-fleet');
   if(!el) return;
   const nodes = (f && f.nodes) || [];
-  $('#badge-fleet').textContent = nodes.length;
+  $('#badge-fleet').textContent = fmtNum(nodes.length);
 
   const lic = LICENSE || (BOOT && BOOT.license) || {};
   const isAgency = (lic.tier === 'agency');
@@ -5925,9 +5955,9 @@ function renderFleet(f){
     </div>
 
     <div class="kpis" style="margin-bottom:20px;">
-      <div class="kpi-card"><div class="kpi-l">Connected Nodes</div><div class="kpi-v">${total}</div><div class="kpi-s">Multi-VPS Fleet</div></div>
-      <div class="kpi-card"><div class="kpi-l">Nodes Online</div><div class="kpi-v" style="color:var(--ok);">${online}</div><div class="kpi-s">Responding &lt;4s</div></div>
-      <div class="kpi-card"><div class="kpi-l">Offline / Unhealthy</div><div class="kpi-v" style="color:${offline > 0 ? 'var(--crit)' : 'var(--mut)'};">${offline}</div><div class="kpi-s">${offline > 0 ? 'Action Needed' : 'All Clear'}</div></div>
+      <div class="kpi-card"><div class="kpi-l">Connected Nodes</div><div class="kpi-v">${fmtNum(total)}</div><div class="kpi-s">Multi-VPS Fleet</div></div>
+      <div class="kpi-card"><div class="kpi-l">Nodes Online</div><div class="kpi-v" style="color:var(--ok);">${fmtNum(online)}</div><div class="kpi-s">Responding &lt;4s</div></div>
+      <div class="kpi-card"><div class="kpi-l">Offline / Unhealthy</div><div class="kpi-v" style="color:${offline > 0 ? 'var(--crit)' : 'var(--mut)'};">${fmtNum(offline)}</div><div class="kpi-s">${offline > 0 ? 'Action Needed' : 'All Clear'}</div></div>
       <div class="kpi-card"><div class="kpi-l">Average Fleet Health</div><div class="kpi-v" style="color:${avg >= 85 ? 'var(--ok)' : (avg >= 65 ? 'var(--warn)' : 'var(--crit)')};">${avg}<small style="font-size:14px;">/100</small></div><div class="kpi-s">Composite Score</div></div>
     </div>`;
 
@@ -5994,7 +6024,7 @@ function renderFleet(f){
                   <td><span style="font-size:11.5px;color:var(--dim);">${esc(n.uptime || '—')}</span></td>
                   <td>
                     <span style="font-size:11px;font-weight:700;color:${n.alert_count > 0 ? 'var(--warn)' : 'var(--ok)'};">
-                      ${n.alert_count > 0 ? n.alert_count + ' issues' : '✓ 0 issues'}
+                      ${n.alert_count > 0 ? fmtNum(n.alert_count) + ' issues' : '✓ 0 issues'}
                     </span>
                   </td>
                   <td style="text-align:right;">
@@ -6125,29 +6155,29 @@ function renderSites(s){
   }
 
   const badge = $('#badge-sites');
-  if(badge) badge.textContent = `${s.up_count}/${s.total_sites}`;
+  if(badge) badge.textContent = `${fmtNum(s.up_count)}/${fmtNum(s.total_sites)}`;
 
   view.innerHTML = `
     <!-- Summary Stat Cards -->
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:20px;">
       <div class="glass" style="padding:16px;">
         <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">🌐 Monitored Websites</span>
-        <div style="font-size:32px;font-weight:800;margin-top:4px;">${s.total_sites}</div>
+        <div style="font-size:32px;font-weight:800;margin-top:4px;">${fmtNum(s.total_sites)}</div>
         <div style="font-size:11.5px;color:var(--dim);">Hosted vhosts &amp; custom sites</div>
       </div>
       <div class="glass" style="padding:16px;">
         <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">🟢 Online Sites</span>
-        <div style="font-size:32px;font-weight:800;margin-top:4px;color:var(--ok);">${s.up_count}</div>
+        <div style="font-size:32px;font-weight:800;margin-top:4px;color:var(--ok);">${fmtNum(s.up_count)}</div>
         <div style="font-size:11.5px;color:var(--dim);">Returning 200/300/400 OK</div>
       </div>
       <div class="glass" style="padding:16px;">
         <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">🔴 Down or Slow</span>
-        <div style="font-size:32px;font-weight:800;margin-top:4px;color:${s.down_count > 0 ? 'var(--crit)' : (s.slow_count > 0 ? 'var(--warn)' : 'var(--ok)')};">${s.down_count + s.slow_count}</div>
-        <div style="font-size:11.5px;color:var(--dim);">${s.down_count} down · ${s.slow_count} slow (&gt;1200ms)</div>
+        <div style="font-size:32px;font-weight:800;margin-top:4px;color:${s.down_count > 0 ? 'var(--crit)' : (s.slow_count > 0 ? 'var(--warn)' : 'var(--ok)')};">${fmtNum(s.down_count + s.slow_count)}</div>
+        <div style="font-size:11.5px;color:var(--dim);">${fmtNum(s.down_count)} down · ${fmtNum(s.slow_count)} slow (&gt;1200ms)</div>
       </div>
       <div class="glass" style="padding:16px;">
         <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">⚡ Average Latency</span>
-        <div style="font-size:32px;font-weight:800;margin-top:4px;color:var(--acc);">${s.avg_latency_ms} <small style="font-size:14px;color:var(--mut);">ms</small></div>
+        <div style="font-size:32px;font-weight:800;margin-top:4px;color:var(--acc);">${fmtNum(Math.round(s.avg_latency_ms))} <small style="font-size:14px;color:var(--mut);">ms</small></div>
         <div style="font-size:11.5px;color:var(--dim);">Round-trip response speed</div>
       </div>
     </div>
