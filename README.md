@@ -1,8 +1,11 @@
 # 🛡️ Linux Health Sentinel
 
-A **production-ready**, **zero-dependency** (pure Python 3 stdlib) Linux server health platform and forensics monitor featuring:
+A **production-ready**, **zero-dependency** (pure Python 3 stdlib) Linux server health platform, capacity benchmark, and forensics monitor featuring:
 
 * **👥 Safe Visitor Traffic Capacity & Stress Benchmark**: Safely tests how many simultaneous active visitors and requests/second your server can sustain. Features progressive concurrency ramping (5 → 15 → 30 → 50 → 150), real-time RPS/latency telemetry, and an **auto-abort circuit breaker** that halts immediately if load &ge; 4.5 or available RAM &lt; 120MB to guarantee zero downtime.
+* **🔐 Dual-Token Role-Based Access Control (RBAC)**: Distinct credentials for **Admin** (`admin_token` with full server control, PHP recycle, 1-click firewall bans, and benchmarks) and **View-Only** (`view_token` for clients, marketing, and staff showing real-time metrics and reports while blocking all mutations with HTTP 403).
+* **🛡️ Security Shield & Anti-Brute-Force Rate Limiter**: Sliding-window rate limiter (5 failed token attempts in 60s → 15-minute lockout with HTTP 429), constant-time `hmac.compare_digest` token validation, security headers (`X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`), and native `iptables` & RHEL `firewalld` rich rule support.
+* **📦 Universal Multi-Distro Installer (`install.sh` & `update.sh`)**: Seamless package detection and auto-installation across **Debian, Ubuntu, RHEL, CentOS, Rocky Linux, AlmaLinux, Fedora, openSUSE, and Arch Linux** with interactive prompt or automated flags.
 * **🔄 Universal 1-Command Auto-Updater (`update.sh`)**: Update or install to the latest release in seconds with a single command without overwriting your tokens or custom thresholds.
 * **Top-10 Core Linux Health Probes**: CPU utilization & steal time, normalized load average, memory & swap pressure (with PSI), disk space & read-only detection, disk I/O bottlenecks & await latencies, inode exhaustion & open file handles, network drops/errors/retransmits/conntrack, processes/threads/zombies/D-state, systemd failed services/uptime/reboot flags/NTP, and journal errors/SSH brute-force detection.
 * **0–100 Scoring Engine**: Linear threshold interpolation, severity caps (max 54 for critical, max 79 for warning), and letter grades (A+ through F).
@@ -17,7 +20,7 @@ A **production-ready**, **zero-dependency** (pure Python 3 stdlib) Linux server 
 
 ## 🚀 1-Command Universal Auto-Update or Install
 
-To install Sentinel or upgrade an existing installation to the latest release (**v2.0.0**), simply run:
+To install Sentinel or upgrade an existing installation to the latest release (**v2.1.0**), simply run:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/islamwell/linux-benchmark-vps/master/update.sh | sudo bash
@@ -378,6 +381,6 @@ sudo /opt/health-sentinel/deploy/optimize-io-memory.sh
 ---
 
 ## 📜 Versioning
-Current Version: **v2.0.0 (updated 2026-09-13 06:15)**
+Current Version: **v2.1.0 (updated 2026-09-13 08:30)**
 
 

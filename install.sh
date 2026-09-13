@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — Automated Installer & Service Manager
-# Version: 2.0.0 (updated 2026-09-13 06:15)
+# Version: 2.1.0 (updated 2026-09-13 08:30)
 # ==============================================================================
 
 set -euo pipefail
 
-VERSION="2.0.0"
-UPDATED="2026-09-13 06:15"
+VERSION="2.1.0"
+UPDATED="2026-09-13 08:30"
 
 # Target installation paths
 INSTALL_DIR="/opt/health-sentinel"
@@ -23,6 +23,9 @@ CRON_TIMER_FILE="/etc/systemd/system/sentinel-cron.timer"
 PORT=""
 BIND=""
 TOKEN=""
+ADMIN_TOKEN=""
+VIEW_TOKEN=""
+AUTO_CONFIRM=false
 ENABLE_SLOWLOG=false
 ENABLE_TIMER=false
 UNINSTALL=false
@@ -47,9 +50,18 @@ while [[ $# -gt 0 ]]; do
             BIND="$2"
             shift 2
             ;;
-        --token)
+        --token|--admin-token)
+            ADMIN_TOKEN="$2"
             TOKEN="$2"
             shift 2
+            ;;
+        --view-token)
+            VIEW_TOKEN="$2"
+            shift 2
+            ;;
+        -y|--yes|--non-interactive)
+            AUTO_CONFIRM=true
+            shift
             ;;
         --enable-php-slowlog)
             ENABLE_SLOWLOG=true
@@ -71,7 +83,10 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --port <port>             Web dashboard port (default: 8686)"
             echo "  --bind <ip>               Bind IP address (default: 127.0.0.1 for security)"
-            echo "  --token <token>           Web authentication token (auto-generated if omitted)"
+            echo "  --admin-token <token>     Admin authentication token (full control, auto-generated if omitted)"
+            echo "  --view-token <token>      View-Only token for clients/staff (read-only, auto-generated if omitted)"
+            echo "  --token <token>           Legacy alias for --admin-token"
+            echo "  -y, --yes                 Non-interactive mode (auto-install missing dependencies)"
             echo "  --enable-php-slowlog      Safely configure PHP-FPM / Plesk slow logging (5s threshold)"
             echo "  --enable-timer            Also enable 5-minute systemd timer (sentinel-cron.timer)"
             echo "  --uninstall               Stop service and remove Sentinel from system"
@@ -122,24 +137,88 @@ echo -e "${C_BLUE}║  ${C_DIM}Zero-dependency server health monitor · dashboar
 echo -e "${C_BLUE}╚════════════════════════════════════════════════════════════════════════════╝${C_RESET}"
 echo ""
 
-# 1. Dependency checks
-echo -e "${C_BOLD}[1/6] Checking system requirements...${C_RESET}"
-if ! command -v python3 >/dev/null 2>&1; then
-    echo -e "${C_WARN}[!] Python 3 not found. Installing python3...${C_RESET}"
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -qq && apt-get install -y -qq python3
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y -q python3
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y -q python3
+# 1. Dependency checks & interactive auto-installation
+echo -e "${C_BOLD}[1/6] Checking system requirements & dependencies...${C_RESET}"
+
+PKG_MANAGER=""
+if command -v apt-get >/dev/null 2>&1; then
+    PKG_MANAGER="apt"
+elif command -v dnf >/dev/null 2>&1; then
+    PKG_MANAGER="dnf"
+elif command -v yum >/dev/null 2>&1; then
+    PKG_MANAGER="yum"
+elif command -v zypper >/dev/null 2>&1; then
+    PKG_MANAGER="zypper"
+elif command -v pacman >/dev/null 2>&1; then
+    PKG_MANAGER="pacman"
+fi
+
+MISSING_PKGS=()
+! command -v python3 >/dev/null 2>&1 && MISSING_PKGS+=("python3")
+! command -v curl >/dev/null 2>&1 && MISSING_PKGS+=("curl")
+! command -v git >/dev/null 2>&1 && MISSING_PKGS+=("git")
+
+if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
+    echo -e "    ${C_WARN}[!] Missing requirements detected: ${MISSING_PKGS[*]}${C_RESET}"
+    DO_INSTALL=false
+    if [ "$AUTO_CONFIRM" = true ] || [ ! -t 0 ]; then
+        DO_INSTALL=true
     else
-        echo -e "${C_CRIT}[-] Error: Could not install python3 automatically. Please install Python 3.7+.${C_RESET}" >&2
+        read -r -p "    Would you like Sentinel to install missing dependencies automatically? [Y/n]: " prompt_resp </dev/tty || prompt_resp="y"
+        if [[ -z "$prompt_resp" || "$prompt_resp" =~ ^[Yy]$ ]]; then
+            DO_INSTALL=true
+        fi
+    fi
+
+    if [ "$DO_INSTALL" = true ]; then
+        echo -e "    ${C_BLUE}Installing missing dependencies (${MISSING_PKGS[*]})...${C_RESET}"
+        case "$PKG_MANAGER" in
+            apt)
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update -qq
+                apt-get install -y -qq "${MISSING_PKGS[@]}"
+                ;;
+            dnf)
+                dnf install -y -q "${MISSING_PKGS[@]}"
+                ;;
+            yum)
+                yum install -y -q "${MISSING_PKGS[@]}"
+                ;;
+            zypper)
+                zypper --non-interactive install -y "${MISSING_PKGS[@]}"
+                ;;
+            pacman)
+                pacman -Sy --noconfirm "${MISSING_PKGS[@]}"
+                ;;
+            *)
+                echo -e "${C_CRIT}[-] Error: No supported package manager (apt, dnf, yum, zypper, pacman) detected.${C_RESET}" >&2
+                echo -e "    Please manually install: ${MISSING_PKGS[*]}" >&2
+                exit 1
+                ;;
+        esac
+        echo -e "    ${C_GREEN}✓${C_RESET} All missing dependencies installed successfully."
+    else
+        echo -e "${C_CRIT}[-] Error: Missing required dependencies (${MISSING_PKGS[*]}). Aborting installation.${C_RESET}" >&2
         exit 1
     fi
 fi
 
+if ! command -v python3 >/dev/null 2>&1; then
+    echo -e "${C_CRIT}[-] Error: Python 3 could not be found. Please install Python 3.7+ manually.${C_RESET}" >&2
+    exit 1
+fi
+
 PYTHON_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
 echo -e "    ${C_GREEN}✓${C_RESET} Python ${PYTHON_VER} detected"
+
+# Check firewall utility
+if command -v firewall-cmd >/dev/null 2>&1; then
+    echo -e "    ${C_GREEN}✓${C_RESET} Firewall backend: firewalld (RHEL/CentOS/Rocky/Alma)"
+elif command -v iptables >/dev/null 2>&1; then
+    echo -e "    ${C_GREEN}✓${C_RESET} Firewall backend: iptables (Debian/Ubuntu/Standard)"
+else
+    echo -e "    ${C_DIM}ℹ Firewall backend: iptables/firewalld not active (ban will log warning)${C_RESET}"
+fi
 
 # 2. Determine source directory
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -192,7 +271,7 @@ if [ ! -f "${CONFIG_FILE}" ]; then
 fi
 
 # Safely update config using Python with sys.argv
-python3 - "${CONFIG_FILE}" "${BIND}" "${PORT}" "${TOKEN}" <<'PYEOF'
+python3 - "${CONFIG_FILE}" "${BIND}" "${PORT}" "${TOKEN}" "${ADMIN_TOKEN}" "${VIEW_TOKEN}" <<'PYEOF'
 import sys
 import json
 import secrets
@@ -201,6 +280,8 @@ cfg_path = sys.argv[1]
 arg_bind = sys.argv[2]
 arg_port = sys.argv[3]
 arg_token = sys.argv[4]
+arg_admin = sys.argv[5]
+arg_view = sys.argv[6]
 
 with open(cfg_path, 'r') as f:
     cfg = json.load(f)
@@ -215,14 +296,28 @@ if not cfg['web'].get('bind'):
 if not cfg['web'].get('port'):
     cfg['web']['port'] = 8686
 
-# Generate a strong token if token is empty and none provided
-current_token = cfg['web'].get('token', '').strip()
-if not current_token and not arg_token:
-    cfg['web']['token'] = secrets.token_urlsafe(24)
+# Configure admin token
+current_admin = (cfg['web'].get('admin_token') or cfg['web'].get('token') or '').strip()
+if arg_admin:
+    cfg['web']['admin_token'] = arg_admin
 elif arg_token:
-    cfg['web']['token'] = arg_token
+    cfg['web']['admin_token'] = arg_token
+elif not current_admin:
+    cfg['web']['admin_token'] = 'adm_' + secrets.token_urlsafe(24)
+else:
+    cfg['web']['admin_token'] = current_admin
 
-# Apply explicit overrides if provided on CLI
+# Keep legacy token synchronized with admin token
+cfg['web']['token'] = cfg['web']['admin_token']
+
+# Configure view-only token
+current_view = (cfg['web'].get('view_token') or '').strip()
+if arg_view:
+    cfg['web']['view_token'] = arg_view
+elif not current_view:
+    cfg['web']['view_token'] = 'viw_' + secrets.token_urlsafe(24)
+
+# Apply explicit network overrides if provided on CLI
 if arg_bind:
     cfg['web']['bind'] = arg_bind
 if arg_port:
@@ -237,7 +332,8 @@ chmod 640 "${CONFIG_FILE}"
 # Retrieve active settings for display
 FINAL_BIND=$(python3 -c "import json; print(json.load(open('${CONFIG_FILE}'))['web'].get('bind', '127.0.0.1'))")
 FINAL_PORT=$(python3 -c "import json; print(json.load(open('${CONFIG_FILE}'))['web'].get('port', 8686))")
-FINAL_TOKEN=$(python3 -c "import json; print(json.load(open('${CONFIG_FILE}'))['web'].get('token', ''))")
+FINAL_ADMIN_TOKEN=$(python3 -c "import json; w=json.load(open('${CONFIG_FILE}'))['web']; print(w.get('admin_token') or w.get('token') or '')")
+FINAL_VIEW_TOKEN=$(python3 -c "import json; print(json.load(open('${CONFIG_FILE}'))['web'].get('view_token', ''))")
 
 # 6. Install and enable Systemd service
 echo -e "${C_BOLD}[5/6] Registering and starting systemd service (sentinel.service)...${C_RESET}"
@@ -300,21 +396,23 @@ echo -e "${C_GREEN}╔═══════════════════�
 echo -e "${C_GREEN}║  ${C_BOLD}✓  INSTALLATION SUCCESSFUL · LINUX HEALTH SENTINEL v${VERSION}${C_RESET}${C_GREEN}                 ║${C_RESET}"
 echo -e "${C_GREEN}╚════════════════════════════════════════════════════════════════════════════╝${C_RESET}"
 echo ""
-echo -e "  ${C_BOLD}Dashboard Security:${C_RESET} Bound to ${C_GREEN}${FINAL_BIND}:${FINAL_PORT}${C_RESET}"
-if [ -n "$FINAL_TOKEN" ]; then
-    echo -e "  ${C_BOLD}Generated Token:${C_RESET}    ${C_WARN}${FINAL_TOKEN}${C_RESET}"
-    echo -e "  ${C_BOLD}Dashboard URL:${C_RESET}      ${C_GREEN}http://${FINAL_BIND}:${FINAL_PORT}?token=${FINAL_TOKEN}${C_RESET}"
-else
-    echo -e "  ${C_BOLD}Dashboard URL:${C_RESET}      ${C_GREEN}http://${FINAL_BIND}:${FINAL_PORT}${C_RESET}"
-fi
-echo -e "  ${C_BOLD}Prometheus Metrics:${C_RESET} ${C_BLUE}http://127.0.0.1:${FINAL_PORT}/metrics${C_RESET}"
-echo -e "  ${C_BOLD}Config File:${C_RESET}        ${C_DIM}${CONFIG_FILE}${C_RESET}"
-echo -e "  ${C_BOLD}Service Status:${C_RESET}     ${C_DIM}systemctl status sentinel${C_RESET}"
+echo -e "  ${C_BOLD}Dashboard Network:${C_RESET}     Bound to ${C_GREEN}${FINAL_BIND}:${FINAL_PORT}${C_RESET}"
 echo ""
-echo -e "  ${C_BOLD}🔒 Recommended Secure Access:${C_RESET}"
-echo -e "  Since Sentinel is securely bound to ${FINAL_BIND}, access it from your laptop via SSH tunnel:"
+echo -e "  ${C_BOLD}⚡ Admin Dashboard (Full Control):${C_RESET}"
+echo -e "     ${C_GREEN}http://${FINAL_BIND}:${FINAL_PORT}?token=${FINAL_ADMIN_TOKEN}${C_RESET}"
+echo -e "     ${C_DIM}Permissions: Full system fixes, PHP recycle, benchmarks, firewall bans${C_RESET}"
+echo ""
+echo -e "  ${C_BOLD}👁️ View-Only Dashboard (Client & Team Access):${C_RESET}"
+echo -e "     ${C_BLUE}http://${FINAL_BIND}:${FINAL_PORT}?token=${FINAL_VIEW_TOKEN}${C_RESET}"
+echo -e "     ${C_DIM}Permissions: Real-time health metrics, uptime status, reports (zero mutations)${C_RESET}"
+echo ""
+echo -e "  ${C_BOLD}Prometheus Metrics:${C_RESET}    ${C_BLUE}http://127.0.0.1:${FINAL_PORT}/metrics${C_RESET}"
+echo -e "  ${C_BOLD}Config File:${C_RESET}           ${C_DIM}${CONFIG_FILE}${C_RESET}"
+echo -e "  ${C_BOLD}Service Status:${C_RESET}        ${C_DIM}systemctl status sentinel${C_RESET}"
+echo ""
+echo -e "  ${C_BOLD}🔒 Recommended Secure Access (SSH Tunnel from your laptop):${C_RESET}"
 echo -e "  ${C_BLUE}ssh -L ${FINAL_PORT}:127.0.0.1:${FINAL_PORT} root@${SERVER_IP}${C_RESET}"
-echo -e "  Then open: ${C_GREEN}http://localhost:${FINAL_PORT}${FINAL_TOKEN:+?token=$FINAL_TOKEN}${C_RESET}"
+echo -e "  Then open: ${C_GREEN}http://localhost:${FINAL_PORT}?token=${FINAL_ADMIN_TOKEN}${C_RESET}"
 echo ""
 echo -e "  ${C_BOLD}Helpful Commands:${C_RESET}"
 echo -e "  • Instant CLI report:   ${C_BLUE}sudo python3 ${INSTALL_DIR}/sentinel.py --once${C_RESET}"

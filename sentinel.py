@@ -15,6 +15,7 @@
 import argparse
 import concurrent.futures
 import glob
+import hmac
 import json
 import os
 import pwd
@@ -38,8 +39,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.0.0"
-UPDATED = "2026-09-13 06:15"
+VERSION = "2.1.0"
+UPDATED = "2026-09-13 08:30"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -64,7 +65,7 @@ DEFAULTS = {
     "state_file": "/var/lib/health-sentinel/state.json",
     "incidents_dir": "/var/lib/health-sentinel/incidents",
     "incident_history": 50,
-    "web": {"enabled": True, "bind": "127.0.0.1", "port": 8686, "token": ""},
+    "web": {"enabled": True, "bind": "127.0.0.1", "port": 8686, "token": "", "admin_token": "", "view_token": ""},
     "thresholds": {
         "cpu_warn": 85, "cpu_crit": 95,
         "steal_warn": 5, "steal_crit": 12,
@@ -2619,6 +2620,58 @@ class CapacityBenchmark:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  AUTHENTICATION RATE LIMITER & ANTI-BRUTE-FORCE SHIELD
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AuthRateLimiter:
+    """
+    Sliding-window authentication rate limiter preventing brute-force token attacks.
+    Blocks any client IP exceeding 5 failed token attempts in 60s for 15 minutes.
+    """
+    def __init__(self, max_fails=5, window_seconds=60, lockout_seconds=900):
+        self.max_fails = max_fails
+        self.window = window_seconds
+        self.lockout = lockout_seconds
+        self.failed_attempts = {}
+        self.lockouts = {}
+        self.lock = threading.Lock()
+
+    def is_locked(self, ip):
+        if not ip:
+            return False
+        now = time.time()
+        with self.lock:
+            exp = self.lockouts.get(ip)
+            if exp:
+                if now < exp:
+                    return True
+                else:
+                    del self.lockouts[ip]
+                    self.failed_attempts.pop(ip, None)
+            return False
+
+    def record_fail(self, ip):
+        if not ip:
+            return
+        now = time.time()
+        with self.lock:
+            times = [t for t in self.failed_attempts.get(ip, []) if now - t < self.window]
+            times.append(now)
+            self.failed_attempts[ip] = times
+            if len(times) >= self.max_fails:
+                self.lockouts[ip] = now + self.lockout
+
+    def reset(self, ip):
+        if not ip:
+            return
+        with self.lock:
+            self.failed_attempts.pop(ip, None)
+            self.lockouts.pop(ip, None)
+
+AUTH_LIMITER = AuthRateLimiter()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  SECURITY SHIELD (1-Click Firewall IP Banning & Threat Detection)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2665,6 +2718,12 @@ class SecurityShield:
                     rc_chk, _ = sh(["iptables", "-C", "SENTINEL_BLOCK", "-s", ip, "-j", "DROP"], timeout=2)
                     if rc_chk != 0:
                         sh(["iptables", "-I", "SENTINEL_BLOCK", "-s", ip, "-j", "DROP"], timeout=2)
+            else:
+                rc_fw, _ = sh(["which", "firewall-cmd"], timeout=2)
+                if rc_fw == 0:
+                    for ip in list(self.banned_ips.keys()):
+                        sh(["firewall-cmd", "--permanent", f"--add-rich-rule=rule family=ipv4 source address={ip} drop"], timeout=2)
+                    sh(["firewall-cmd", "--reload"], timeout=2)
         except Exception:
             pass
 
@@ -2742,6 +2801,12 @@ class SecurityShield:
                 if rc_ufw == 0:
                     sh(["ufw", "insert", "1", "deny", "from", ip, "to", "any"], timeout=2)
                     applied = True
+                else:
+                    rc_fw, _ = sh(["which", "firewall-cmd"], timeout=2)
+                    if rc_fw == 0:
+                        sh(["firewall-cmd", "--permanent", f"--add-rich-rule=rule family=ipv4 source address={ip} drop"], timeout=3)
+                        sh(["firewall-cmd", "--reload"], timeout=3)
+                        applied = True
 
             self.banned_ips[ip] = {
                 "ip": ip,
@@ -2763,6 +2828,8 @@ class SecurityShield:
         with self.lock:
             sh(["iptables", "-D", "SENTINEL_BLOCK", "-s", ip, "-j", "DROP"], timeout=2)
             sh(["ufw", "delete", "deny", "from", ip, "to", "any"], timeout=2)
+            sh(["firewall-cmd", "--permanent", f"--remove-rich-rule=rule family=ipv4 source address={ip} drop"], timeout=3)
+            sh(["firewall-cmd", "--reload"], timeout=3)
             if ip in self.banned_ips:
                 del self.banned_ips[ip]
                 self._save()
@@ -4088,21 +4155,22 @@ kbd{font-size:10.5px;padding:1px 5px;border-radius:5px;border:1px solid var(--st
 .cap-bar-fill{height:100%;background:linear-gradient(90deg,var(--acc),var(--ok));border-radius:999px;transition:width .3s ease}
 .chip-btn{padding:4px 10px;border-radius:8px;font-size:11px;background:var(--card);border:1px solid var(--stroke2);color:var(--mut);cursor:pointer;transition:.15s}
 .chip-btn:hover{color:var(--txt);border-color:var(--acc)}
+body.role-viewer .admin-only{display:none!important}
 </style></head><body>
 <div class="wrap">
  <header>
   <div class="brand">
    <div class="logo"><svg viewBox="0 0 24 24"><path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-4z"/><path d="M8.5 12.5l2.2 2.2 4.8-5"/></svg></div>
-   <div><h1>Health Sentinel <span style="font-size:11px;color:var(--dim);font-weight:600">v__VER__</span></h1>
+   <div><h1>Health Sentinel <span style="font-size:11px;color:var(--dim);font-weight:600">v__VER__</span> <span id="roleBadge"></span></h1>
     <div class="sub" id="hostline">loading…</div></div>
   </div>
   <div class="spacer"></div>
   <input class="search" id="q" placeholder="Filter checks…  ( / )">
   <button class="btn" id="autoBtn" onclick="toggleAuto()"><svg viewBox="0 0 24 24"><path d="M12 6v6l4 2"/><circle cx="12" cy="12" r="9"/></svg><span id="autoTxt">Auto</span></button>
   <button class="btn" onclick="toggleTheme()"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg></button>
-  <button class="btn" onclick="openQuickActionsModal()"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>⚡ Quick Actions &amp; PHP</button>
+  <button class="btn admin-only" onclick="openQuickActionsModal()"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>⚡ Quick Actions &amp; PHP</button>
   <button class="btn" onclick="openExecutiveReportModal()"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>📄 Executive Report</button>
-  <button class="btn" onclick="testAlert(this)"><svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 10-12 0c0 7-3 8-3 8h18s-3-1-3-8"/><path d="M13.7 21a2 2 0 01-3.4 0"/></svg>Test alert</button>
+  <button class="btn admin-only" onclick="testAlert(this)"><svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 10-12 0c0 7-3 8-3 8h18s-3-1-3-8"/><path d="M13.7 21a2 2 0 01-3.4 0"/></svg>Test alert</button>
   <button class="btn" onclick="dl()"><svg viewBox="0 0 24 24"><path d="M12 3v12M7 11l5 5 5-5M4 20h16"/></svg>JSON</button>
   <button class="btn primary" id="scanBtn" onclick="scan()"><svg viewBox="0 0 24 24" id="scanIco"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 4v5h-5"/></svg>Scan now</button>
  </header>
@@ -4192,11 +4260,19 @@ const $=s=>document.querySelector(s), esc=s=>String(s==null?'':s)
  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 
 const URL_TOKEN = (new URLSearchParams(window.location.search).get('token') || BOOT.token || '').trim();
+const IS_VIEWER = (BOOT.role === 'viewer');
 const api=(p,o={})=>{
  const sep = p.includes('?') ? '&' : '?';
  const url = URL_TOKEN ? `${p}${sep}token=${encodeURIComponent(URL_TOKEN)}` : p;
- return fetch(url,{headers:{'X-Auth-Token':URL_TOKEN},...o}).then(r=>{
-  if(r.status === 401) throw new Error('Unauthorized - Invalid token');
+ return fetch(url,{headers:{'X-Auth-Token':URL_TOKEN},...o}).then(async r=>{
+  if(r.status === 401) throw new Error('Unauthorized - Invalid or missing token');
+  if(r.status === 403) {
+    const err = await r.json().catch(()=>({error:'Forbidden: View-Only user cannot execute administrative actions'}));
+    throw new Error(err.error || 'Action forbidden for View-Only users');
+  }
+  if(r.status === 429) {
+    throw new Error('Too many failed attempts. Locked out for 15 minutes.');
+  }
   return r.json();
  });
 };
@@ -4644,11 +4720,11 @@ function renderVisitors(v){
                     <td style="font-size:12px;color:var(--dim);">${esc(vis.device)}</td>
                     <td style="text-align:right;font-weight:700;">${vis.hits}</td>
                     <td style="text-align:right;">
-                      ${isBanned ? `
+                      ${IS_VIEWER ? `<span style="font-size:11px;color:var(--dim);">View Only</span>` : (isBanned ? `
                         <button class="btn" onclick="unbanIP('${esc(vis.ip)}')" style="height:26px;padding:0 8px;font-size:11px;color:var(--ok);border-color:color-mix(in srgb,var(--ok) 35%,transparent);">✓ Unban</button>
                       ` : `
                         <button class="btn" onclick="promptBanIP('${esc(vis.ip)}', '${esc(thr.reason||thr.label)}')" style="height:26px;padding:0 8px;font-size:11px;color:var(--crit);border-color:color-mix(in srgb,var(--crit) 35%,transparent);">🚫 Ban</button>
-                      `}
+                      `)}
                     </td>
                   </tr>`;
                 }).join('')}
@@ -4686,7 +4762,7 @@ function renderVisitors(v){
           <h3 style="font-size:15px;display:flex;align-items:center;gap:8px;">🛡️ Firewall Shield · Blocked IP Addresses (${bannedList.length})</h3>
           <span style="font-size:12px;color:var(--dim);">Banned IPs are immediately dropped in iptables/ufw to protect your server.</span>
         </div>
-        <button class="btn" onclick="promptManualBan()" style="height:30px;font-size:12px;color:var(--crit);border-color:color-mix(in srgb,var(--crit) 35%,transparent);">+ Block Custom IP</button>
+        ${IS_VIEWER ? '' : `<button class="btn" onclick="promptManualBan()" style="height:30px;font-size:12px;color:var(--crit);border-color:color-mix(in srgb,var(--crit) 35%,transparent);">+ Block Custom IP</button>`}
       </div>
       ${bannedList.length ? `
         <div style="overflow-x:auto;">
@@ -4708,7 +4784,9 @@ function renderVisitors(v){
                   <td style="font-size:12px;color:var(--dim);">${esc(b.date || '–')}</td>
                   <td><span class="badge" style="font-size:10.5px;color:var(--ok);background:rgba(37,227,154,.12);">✓ ACTIVE DROP</span></td>
                   <td style="text-align:right;">
-                    <button class="btn" onclick="unbanIP('${esc(b.ip)}')" style="height:26px;padding:0 10px;font-size:11.5px;color:var(--ok);border-color:color-mix(in srgb,var(--ok) 35%,transparent);">✓ Unban IP</button>
+                    ${IS_VIEWER ? `<span style="font-size:11px;color:var(--dim);">Protected</span>` : `
+                      <button class="btn" onclick="unbanIP('${esc(b.ip)}')" style="height:26px;padding:0 10px;font-size:11.5px;color:var(--ok);border-color:color-mix(in srgb,var(--ok) 35%,transparent);">✓ Unban IP</button>
+                    `}
                   </td>
                 </tr>
               `).join('')}
@@ -4783,9 +4861,15 @@ function renderHardwareBenchmarkView(b){
         <p style="font-size:13.5px;color:var(--mut);margin-bottom:24px;line-height:1.5;">
           Test your server's single-core &amp; multi-core CPU compute speed, in-memory RAM bandwidth, NVMe/SSD sequential write/read throughput, and network latency to major global backbones.
         </p>
-        <button class="btn primary" id="run-bench-btn" onclick="runBenchmark()" style="height:44px;padding:0 28px;font-size:14.5px;margin:0 auto;">
-          <svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg> ⚡ Run Full VPS Benchmark Now
-        </button>
+        ${IS_VIEWER ? `
+          <div style="font-size:13px;color:var(--dim);padding:10px 18px;border-radius:8px;background:var(--card2);display:inline-block;">
+            🔒 Benchmark execution requires Admin role
+          </div>
+        ` : `
+          <button class="btn primary" id="run-bench-btn" onclick="runBenchmark()" style="height:44px;padding:0 28px;font-size:14.5px;margin:0 auto;">
+            <svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg> ⚡ Run Full VPS Benchmark Now
+          </button>
+        `}
       </div>`;
   }
 
@@ -4805,9 +4889,11 @@ function renderHardwareBenchmarkView(b){
           <div style="font-size:36px;font-weight:900;color:${scoreColor};line-height:1;">${b.composite_score}<small style="font-size:15px;color:var(--mut);font-weight:600;">/1000</small></div>
           <span style="font-size:11px;color:var(--dim);text-transform:uppercase;font-weight:700;">Composite Score</span>
         </div>
-        <button class="btn" id="run-bench-btn" onclick="runBenchmark()" style="height:40px;font-size:13px;">
-          <svg viewBox="0 0 24 24" id="bench-spin"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 4v5h-5"/></svg> Re-Run Benchmark
-        </button>
+        ${IS_VIEWER ? '' : `
+          <button class="btn" id="run-bench-btn" onclick="runBenchmark()" style="height:40px;font-size:13px;">
+            <svg viewBox="0 0 24 24" id="bench-spin"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 4v5h-5"/></svg> Re-Run Benchmark
+          </button>
+        `}
       </div>
     </div>
 
@@ -4865,12 +4951,18 @@ function renderCapacityBenchmarkView(){
         </div>
 
         <div style="display:flex;align-items:center;gap:10px;">
-          <button class="btn primary" id="start-cap-btn" onclick="startCapacityBenchmark()" ${isRunning ? 'disabled' : ''} style="height:40px;font-size:13px;">
-            <svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg> 🚀 Run Capacity Benchmark
-          </button>
-          <button class="btn" id="stop-cap-btn" onclick="stopCapacityBenchmark()" ${!isRunning ? 'style="display:none;"' : ''} style="height:40px;font-size:13px;color:var(--crit);border-color:color-mix(in srgb,var(--crit) 40%,transparent);">
-            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><rect x="9" y="9" width="6" height="6"/></svg> 🛑 Emergency Stop
-          </button>
+          ${IS_VIEWER ? `
+            <div style="font-size:12.5px;color:var(--dim);padding:8px 14px;border-radius:8px;background:var(--card2);">
+              🔒 Capacity testing requires Admin role
+            </div>
+          ` : `
+            <button class="btn primary" id="start-cap-btn" onclick="startCapacityBenchmark()" ${isRunning ? 'disabled' : ''} style="height:40px;font-size:13px;">
+              <svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg> 🚀 Run Capacity Benchmark
+            </button>
+            <button class="btn" id="stop-cap-btn" onclick="stopCapacityBenchmark()" ${!isRunning ? 'style="display:none;"' : ''} style="height:40px;font-size:13px;color:var(--crit);border-color:color-mix(in srgb,var(--crit) 40%,transparent);">
+              <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><rect x="9" y="9" width="6" height="6"/></svg> 🛑 Emergency Stop
+            </button>
+          `}
         </div>
       </div>
 
@@ -5227,7 +5319,7 @@ function renderSites(s){
           <button class="btn primary" onclick="checkSitesNow()" style="height:42px;padding:0 24px;font-size:14px;">
             <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 4v5h-5"/></svg> ⚡ Scan Hosted Domains Now
           </button>
-          <button class="btn" onclick="openAddSiteModal()" style="height:42px;padding:0 20px;font-size:14px;">+ Add Custom Website</button>
+          ${IS_VIEWER ? '' : `<button class="btn" onclick="openAddSiteModal()" style="height:42px;padding:0 20px;font-size:14px;">+ Add Custom Website</button>`}
         </div>
       </div>`;
     return;
@@ -5268,7 +5360,7 @@ function renderSites(s){
         <span style="font-size:12px;color:var(--dim);">Auto-refreshed with health status</span>
       </div>
       <div style="display:flex;gap:10px;">
-        <button class="btn" onclick="openAddSiteModal()" style="height:34px;font-size:12.5px;">+ Add Website</button>
+        ${IS_VIEWER ? '' : `<button class="btn" onclick="openAddSiteModal()" style="height:34px;font-size:12.5px;">+ Add Website</button>`}
         <button class="btn primary" id="check-sites-btn" onclick="checkSitesNow()" style="height:34px;font-size:12.5px;">
           <svg viewBox="0 0 24 24" style="width:14px;height:14px;"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 4v5h-5"/></svg> ⚡ Check All Now
         </button>
@@ -5309,7 +5401,7 @@ function renderSites(s){
               <span>Checked: ${esc(site.checked_at || '–')}</span>
               <div style="display:flex;gap:6px;">
                 <button class="btn" onclick="checkSingleSite('${esc(site.url)}')" style="height:24px;padding:0 8px;font-size:11px;">🔄 Test</button>
-                ${site.is_custom ? `
+                ${(!IS_VIEWER && site.is_custom) ? `
                   <button class="btn" onclick="removeSite('${esc(site.url)}')" style="height:24px;padding:0 8px;font-size:11px;color:var(--crit);">🗑️</button>
                 ` : ''}
               </div>
@@ -5779,6 +5871,12 @@ document.addEventListener('keydown',e=>{
 
 /* ── boot ── */
 document.documentElement.dataset.theme=localStorage.sentinelTheme||'dark';
+if(BOOT.role === 'viewer'){
+ document.body.classList.add('role-viewer');
+ const rb=$('#roleBadge');if(rb)rb.innerHTML='<span class="badge" style="background:rgba(245,158,11,0.15);color:var(--warn);border:1px solid rgba(245,158,11,0.3);font-size:11px;font-weight:700;margin-left:8px;">👁️ View-Only</span>';
+} else if(BOOT.token || BOOT.role === 'admin') {
+ const rb=$('#roleBadge');if(rb)rb.innerHTML='<span class="badge" style="background:rgba(16,185,129,0.15);color:var(--ok);border:1px solid rgba(16,185,129,0.3);font-size:11px;font-weight:700;margin-left:8px;">⚡ Admin</span>';
+}
 $('#chans').innerHTML=BOOT.channels.length
  ? 'Active Alert Channels: '+BOOT.channels.map(c=>`<span class="ch2 on">${esc(c)}</span>`).join(' ')
  : '<span class="ch2">No alert channel enabled — configure in config.json</span>';
@@ -5804,16 +5902,57 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     # ── helpers ──
-    def _authed(self):
-        tok = (self.cfg["web"].get("token") or "").strip()
-        if not tok:
-            return True
+    def _client_ip(self):
+        if hasattr(self, "client_address") and self.client_address:
+            return self.client_address[0]
+        return "127.0.0.1"
+
+    def _auth_role(self):
+        """
+        Returns (role, err_code) where role is 'admin', 'viewer', or None.
+        err_code is None, 401, or 429.
+        Enforces anti-brute-force rate limiting (AUTH_LIMITER) and constant-time token comparison.
+        """
+        web_cfg = self.cfg.get("web", {}) if self.cfg else {}
+        admin_tok = (web_cfg.get("admin_token") or web_cfg.get("token") or "").strip()
+        view_tok = (web_cfg.get("view_token") or "").strip()
+
+        # If no tokens configured at all, grant admin access
+        if not admin_tok and not view_tok:
+            return ("admin", None)
+
+        ip = self._client_ip()
+        if AUTH_LIMITER.is_locked(ip):
+            return (None, 429)
+
         q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         req_token = q.get("token", [""])[0].strip() or (self.headers.get("X-Auth-Token") or "").strip()
         auth_hdr = (self.headers.get("Authorization") or "").strip()
         if auth_hdr.startswith("Bearer "):
             req_token = auth_hdr[7:].strip()
-        return req_token == tok
+
+        if not req_token:
+            return (None, 401)
+
+        # Check admin token
+        if admin_tok and hmac.compare_digest(req_token, admin_tok):
+            AUTH_LIMITER.reset(ip)
+            return ("admin", None)
+
+        # Check viewer token
+        if view_tok and hmac.compare_digest(req_token, view_tok):
+            AUTH_LIMITER.reset(ip)
+            return ("viewer", None)
+
+        # Failed attempt
+        AUTH_LIMITER.record_fail(ip)
+        if AUTH_LIMITER.is_locked(ip):
+            return (None, 429)
+        return (None, 401)
+
+    def _authed(self):
+        role, _ = self._auth_role()
+        return role is not None
 
     def _send(self, code, body, ctype="application/json; charset=utf-8"):
         if isinstance(body, (dict, list)):
@@ -5824,16 +5963,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
         self.end_headers()
         try:
             self.wfile.write(data)
         except BrokenPipeError:
             pass
 
-    def _payload(self):
+    def _payload(self, role="admin"):
         with self.engine.lock:
             rep = self.engine.report or self.engine.scan()
         return {
+            "role": role,
             "report": rep,
             "history": list(self.engine.history)[-5760:],
             "incidents": list(self.engine.incidents.recent_incidents)[-20:],
@@ -5860,18 +6002,24 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path == "/favicon.svg":
             return self._send(200, FAVICON, "image/svg+xml")
-        if not self._authed():
+
+        role, err = self._auth_role()
+        if err == 429:
+            return self._send(429, {"error": "Too many failed authentication attempts. Locked out for 15 minutes."})
+        if err == 401:
             return self._send(401, {"error": "unauthorized"})
+
         if path in ("/", "/index.html"):
             channels = [n for n, c in self.cfg["alerts"].items()
                         if isinstance(c, dict) and c.get("enabled")]
             boot = {"interval": self.cfg["scan_interval"],
+                    "role": role,
                     "token": self.cfg["web"].get("token", ""),
                     "channels": channels}
             page = HTML_PAGE.replace("__BOOTSTRAP__", json.dumps(boot)).replace("__VER__", VERSION).replace("__UPDATED__", UPDATED)
             return self._send(200, page, "text/html; charset=utf-8")
         if path == "/api/health":
-            return self._send(200, self._payload())
+            return self._send(200, self._payload(role=role))
         if path == "/api/visitors":
             return self._send(200, self.engine.visitor_tracker.scan(force=True))
         if path == "/api/benchmark":
@@ -5917,9 +6065,15 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        if not self._authed():
+        role, err = self._auth_role()
+        if err == 429:
+            return self._send(429, {"error": "Too many failed authentication attempts. Locked out for 15 minutes."})
+        if err == 401:
             return self._send(401, {"error": "unauthorized"})
+
         path = urllib.parse.urlparse(self.path).path
+        if role != "admin" and path != "/api/sites/check":
+            return self._send(403, {"ok": False, "error": "Forbidden: View-only role cannot execute administrative actions."})
         data_bytes = b""
         try:
             n = int(self.headers.get("Content-Length") or 0)

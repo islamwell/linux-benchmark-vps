@@ -10,7 +10,9 @@
     "enabled": true,
     "bind": "127.0.0.1",
     "port": 8686,
-    "token": ""
+    "token": "",
+    "admin_token": "",
+    "view_token": ""
   },
 
   "thresholds": {

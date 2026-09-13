@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — 1-Command Universal Auto-Updater
-# Version: 2.0.0 (updated 2026-09-13 06:15)
+# Version: 2.1.0 (updated 2026-09-13 08:30)
 # ==============================================================================
 
 set -euo pipefail
@@ -46,6 +46,10 @@ else
         dnf install -y -q git
     elif command -v yum >/dev/null 2>&1; then
         yum install -y -q git
+    elif command -v zypper >/dev/null 2>&1; then
+        zypper --non-interactive install -y git
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -Sy --noconfirm git
     fi
     git clone --depth=1 "${REPO_URL}" "${TMP_DIR}"
 fi
@@ -88,7 +92,7 @@ if [ -f "/etc/systemd/system/sentinel.service" ]; then
     fi
 else
     echo -e "    ${C_WARN}[!] sentinel.service not registered yet. Running full installer...${C_RESET}"
-    bash "${INSTALL_DIR}/install.sh"
+    bash "${INSTALL_DIR}/install.sh" -y
 fi
 
 echo -e "${C_BOLD}[4/4] Extracting dashboard access credentials...${C_RESET}"
@@ -99,24 +103,39 @@ try:
         cfg = json.load(f)
     w = cfg.get('web', {})
     port = w.get('port', 8686)
-    tok = w.get('token', '')
     bind = w.get('bind', '127.0.0.1')
-    print(f"{bind}|{port}|{tok}")
+    admin_tok = (w.get('admin_token') or w.get('token') or '').strip()
+    view_tok = (w.get('view_token') or '').strip()
+    print(f"{bind}|{port}|{admin_tok}|{view_tok}")
 except Exception as e:
-    print(f"127.0.0.1|8686|")
+    print("127.0.0.1|8686||")
 PYEOF
 )
 
-IFS='|' read -r CFG_BIND CFG_PORT CFG_TOKEN <<< "${ACCESS_INFO}"
+IFS='|' read -r CFG_BIND CFG_PORT CFG_ADMIN_TOKEN CFG_VIEW_TOKEN <<< "${ACCESS_INFO}"
 
 PUBLIC_IP=$(curl -s -m 2 https://api.ipify.org 2>/dev/null || curl -s -m 2 https://icanhazip.com 2>/dev/null || echo "${CFG_BIND}")
 
 echo -e "\n${C_GREEN}╔════════════════════════════════════════════════════════════════════════════╗${C_RESET}"
-echo -e "${C_GREEN}║  ${C_BOLD}✓  UPDATE SUCCESSFUL — LINUX HEALTH SENTINEL v2.0.0                    ${C_RESET}${C_GREEN}║${C_RESET}"
+echo -e "${C_GREEN}║  ${C_BOLD}✓  UPDATE SUCCESSFUL — LINUX HEALTH SENTINEL v2.1.0                    ${C_RESET}${C_GREEN}║${C_RESET}"
 echo -e "${C_GREEN}╚════════════════════════════════════════════════════════════════════════════╝${C_RESET}\n"
 
-echo -e "  ▸ Dashboard URL : ${C_BOLD}${C_BLUE}http://${PUBLIC_IP}:${CFG_PORT}/?token=${CFG_TOKEN}${C_RESET}"
-echo -e "  ▸ Security Token: ${C_BOLD}${CFG_TOKEN}${C_RESET}"
-echo -e "  ▸ Service Status: ${C_GREEN}active (running)${C_RESET}\n"
-echo -e "  ${C_DIM}To update anytime in the future, just run:${C_RESET}"
+echo -e "  ▸ Service Status: ${C_GREEN}active (running)${C_RESET}"
+echo -e "  ▸ Network Bind  : ${CFG_BIND}:${CFG_PORT}\n"
+
+if [ -n "$CFG_ADMIN_TOKEN" ]; then
+    echo -e "  ${C_BOLD}⚡ Admin Dashboard (Full Access):${C_RESET}"
+    echo -e "     ${C_GREEN}http://${PUBLIC_IP}:${CFG_PORT}/?token=${CFG_ADMIN_TOKEN}${C_RESET}"
+fi
+
+if [ -n "$CFG_VIEW_TOKEN" ]; then
+    echo -e "  ${C_BOLD}👁️ View-Only Dashboard (Client & Team Access):${C_RESET}"
+    echo -e "     ${C_BLUE}http://${PUBLIC_IP}:${CFG_PORT}/?token=${CFG_VIEW_TOKEN}${C_RESET}"
+fi
+
+if [ -z "$CFG_ADMIN_TOKEN" ] && [ -z "$CFG_VIEW_TOKEN" ]; then
+    echo -e "  ▸ Dashboard URL : ${C_BOLD}${C_BLUE}http://${PUBLIC_IP}:${CFG_PORT}/${C_RESET}"
+fi
+
+echo -e "\n  ${C_DIM}To update anytime in the future, just run:${C_RESET}"
 echo -e "  ${C_BOLD}curl -fsSL https://raw.githubusercontent.com/islamwell/linux-benchmark-vps/master/update.sh | sudo bash${C_RESET}\n"
