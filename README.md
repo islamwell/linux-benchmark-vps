@@ -24,7 +24,7 @@ A **production-ready**, **zero-dependency** (pure Python 3 stdlib) Linux server 
 
 ## 🚀 1-Command Universal Auto-Update or Install
 
-To install Sentinel or upgrade an existing installation to the latest release (**v2.2.7**), simply run:
+To install Sentinel or upgrade an existing installation to the latest release (**v2.2.8**), simply run:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/islamwell/linux-benchmark-vps/master/update.sh | sudo bash
@@ -315,13 +315,24 @@ Track the speed and availability of all client websites and virtual hosts hosted
 
 Accurately find out **how many simultaneous visitors your server can handle** before slowing down or throwing 502/504 errors:
 
-* **Progressive Concurrency Ramping**: Safely tests traffic stages (e.g. 5 → 15 → 30 → 50 concurrent simulated users for Quick Mode, or up to 150 for Full Stress Mode).
+* **Three Concurrency Profiles**:
+  1. **⚡ Quick Safe Test**: 5 → 15 → 30 → 50 concurrent visitors (~12s), protected by circuit breakers.
+  2. **🔥 Full Stress Test**: 10 → 25 → 50 → 75 → 100 → 150 concurrent visitors (~22s), protected by circuit breakers.
+  3. **💀 Max Stress — No Safety Net**: 25 → 50 → 100 → 200 → 350 → 500 concurrent visitors (~25s). All CPU load and RAM circuit breakers are intentionally bypassed to discover the absolute breaking point and maximum burst throughput of your server stack.
 * **Live Telemetry & Diagnostics**: Measures real-time requests/sec (RPS), average latency (ms), 95th percentile response time, and error rates (% 4xx/5xx/timeouts).
-* **🛡️ Built-in Auto-Abort Circuit Breakers**:
+* **🛡️ Built-in Auto-Abort Circuit Breakers (Safe Modes)**:
   1. **CPU Load Watchdog**: Instantly stops the test if CPU Load Average spikes $\ge 4.5$ (or $> 3\times$ CPU cores).
   2. **Memory Guard**: Automatically halts if available RAM drops below 120MB, protecting your system from the Linux OOM killer.
   3. **Error Spike Protection**: Freezes further escalation if error rates exceed 25% or response latency exceeds 2,200ms, designating the previous stable stage as maximum safe capacity.
-  4. **Emergency Stop Button**: Stop workers in under 100ms from the web interface at any time.
+  4. **Emergency Stop Button**: Stop workers in under 100ms from the web interface or Ctrl-C at any time.
+* **CLI Terminal Execution**: Run benchmark directly from command line with full color progress:
+  ```bash
+  # Quick safe test
+  python3 /opt/health-sentinel/sentinel.py --stress-test http://127.0.0.1:80/
+
+  # Max uncapped stress test up to 500 visitors (No Safety Net)
+  python3 /opt/health-sentinel/sentinel.py --stress-test http://127.0.0.1:80/ --stress-mode max
+  ```
 * **Plain-English Capacity Verdict**: Explains safe concurrent visitors, sustainable monthly pageviews, identifies the primary bottleneck (CPU, RAM, PHP-FPM worker pool, or I/O), and provides specific actionable optimization steps.
 
 ---
@@ -500,6 +511,6 @@ Supported proxy engines:
 ---
 
 ## 📜 Versioning
-Current Version: **v2.2.7 (updated 2026-09-14 18:15)**
+Current Version: **v2.2.8 (updated 2026-09-14 23:05)**
 
 

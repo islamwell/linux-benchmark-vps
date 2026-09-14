@@ -49,8 +49,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.2.7"
-UPDATED = "2026-09-14 18:15"
+VERSION = "2.2.8"
+UPDATED = "2026-09-14 23:05"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -2631,6 +2631,87 @@ class CapacityBenchmark:
         self.worker_thread.start()
         return {"ok": True, "message": f"Capacity benchmark started ({mode} mode on {target_url})"}
 
+    def run_cli(self, target_url=None, mode="quick"):
+        """
+        Synchronous CLI terminal runner for capacity benchmark with live formatted progress.
+        """
+        if not target_url or target_url == "default":
+            target_url = self._detect_default_target()
+
+        mode_names = {
+            "quick": "⚡ Quick Safe Test (Up to 50 visitors, ~12s)",
+            "full": "🔥 Full Stress Test (Up to 150 visitors, ~22s)",
+            "max": "💀 Max Stress Test — NO SAFETY NET (Up to 500 visitors, uncapped)"
+        }
+        mode_title = mode_names.get(mode, mode)
+        safety_status = "DISABLED (All CPU load and RAM circuit breakers bypassed)" if mode == "max" else "ACTIVE (CPU load >= 4.5 or RAM < 120MB auto-abort)"
+
+        print("\n\033[1;36m╔══════════════════════════════════════════════════════════════════════════════╗\033[0m")
+        print("\033[1;36m║\033[0m   \033[1;37m👥 LINUX HEALTH SENTINEL — VISITOR TRAFFIC CAPACITY BENCHMARK\033[0m             \033[1;36m║\033[0m")
+        print("\033[1;36m╚══════════════════════════════════════════════════════════════════════════════╝\033[0m")
+        print(f"  \033[1;33mTarget Endpoint\033[0m : {target_url}")
+        print(f"  \033[1;33mTest Profile   \033[0m : {mode_title}")
+        print(f"  \033[1;33mSafety Nets    \033[0m : \033[{'1;31m' if mode == 'max' else '1;32m'}{safety_status}\033[0m")
+        print(f"  \033[1;33mDate/Time      \033[0m : {datetime.now(timezone.utc).astimezone().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("\033[2m" + "─" * 78 + "\033[0m")
+        print("  Starting simulated visitor traffic ramp... Press \033[1;33mCtrl-C\033[0m for emergency stop.\n")
+
+        res_start = self.start(target_url=target_url, mode=mode)
+        if not res_start.get("ok"):
+            print(f"\033[1;31m[-] Could not start benchmark: {res_start.get('message')}\033[0m\n")
+            return 1
+
+        print(f"  \033[1;37m{'STAGE':<14} {'CONCURRENCY':<16} {'THROUGHPUT':<14} {'AVG LATENCY':<14} {'ERRORS':<10} {'STATUS'}\033[0m")
+        print("  " + "─" * 76)
+
+        printed_stages = 0
+        try:
+            while True:
+                time.sleep(0.3)
+                st = self.get_status()
+                stages = st.get("stages_completed", [])
+                while printed_stages < len(stages):
+                    s = stages[printed_stages]
+                    s_label = f"Stage {s['stage']}"
+                    c_label = f"{s['concurrency']} visitors"
+                    rps_label = f"{s['rps']} req/s"
+                    lat_label = f"{s['avg_latency_ms']} ms"
+                    err_label = f"{s['error_rate_pct']}%"
+                    status_col = "\033[1;32m" if s['status'] in ('Optimal', 'Good') else ("\033[1;33m" if s['status'] == 'Degraded' else "\033[1;31m")
+                    print(f"  {s_label:<14} {c_label:<16} {rps_label:<14} {lat_label:<14} {err_label:<10} {status_col}{s['status']}\033[0m")
+                    printed_stages += 1
+                if not st.get("is_running"):
+                    break
+        except KeyboardInterrupt:
+            print("\n  \033[1;31m[!] Emergency Stop triggered by user. Stopping worker threads...\033[0m")
+            self.stop()
+            while self.get_status().get("is_running"):
+                time.sleep(0.1)
+
+        res = self.last_result or {}
+        if not res.get("ok"):
+            print(f"\n\033[1;31m[-] Benchmark Terminated: {res.get('error') or res.get('abort_reason')}\033[0m\n")
+            return 1
+
+        print("\n\033[1;36m╔══════════════════════════════════════════════════════════════════════════════╗\033[0m")
+        print("\033[1;36m║\033[0m   \033[1;37m📊 VISITOR CAPACITY VERDICT & FINDINGS\033[0m                                     \033[1;36m║\033[0m")
+        print("\033[1;36m╚══════════════════════════════════════════════════════════════════════════════╝\033[0m")
+        print(f"  \033[1;32mSafe Visitor Capacity\033[0m : \033[1;37m~{res.get('safe_concurrent_visitors')} Concurrent Active Visitors\033[0m")
+        print(f"  \033[1;32mSustainable Throughput\033[0m: {res.get('safe_rps')} Requests/Second ({res.get('safe_latency_ms')}ms avg latency)")
+        print(f"  \033[1;32mPeak Throughput Burst\033[0m : {res.get('peak_rps')} Requests/Second")
+        print(f"  \033[1;32mEstimated Monthly Vol\033[0m : ~{res.get('monthly_pageviews_est', 0):,} Pageviews/Month")
+        print(f"  \033[1;33mPrimary Bottleneck   \033[0m : {res.get('bottleneck')}")
+        if res.get("safety_aborted"):
+            print(f"  \033[1;31mCircuit Breaker Abort\033[0m : {res.get('abort_reason')}")
+        print(f"\n  \033[1;37mPlain-English Diagnosis:\033[0m\n  \033[36m{res.get('diagnosis')}\033[0m\n")
+        recs = res.get("recommendations", [])
+        if recs:
+            print("  \033[1mRecommended Actions to Multiply Capacity:\033[0m")
+            for r in recs:
+                print(f"    \033[36m▸\033[0m {r}")
+            print()
+        return 0
+
     def _detect_default_target(self):
         for port, scheme in [(80, "http"), (443, "https"), (8686, "http"), (8080, "http")]:
             try:
@@ -2664,7 +2745,16 @@ class CapacityBenchmark:
 
     def _run_benchmark_thread(self, target_url, mode):
         t_start = time.time()
-        if mode == "full":
+        if mode == "max":
+            stage_configs = [
+                {"concurrency": 25, "duration": 3.0, "name": "Warmup Surge"},
+                {"concurrency": 50, "duration": 3.5, "name": "Heavy Traffic"},
+                {"concurrency": 100, "duration": 4.0, "name": "Severe Load"},
+                {"concurrency": 200, "duration": 4.5, "name": "Extreme Pressure"},
+                {"concurrency": 350, "duration": 4.5, "name": "Max Saturation"},
+                {"concurrency": 500, "duration": 5.0, "name": "Absolute Limit"}
+            ]
+        elif mode == "full":
             stage_configs = [
                 {"concurrency": 10, "duration": 3.0, "name": "Baseline Warmup"},
                 {"concurrency": 25, "duration": 3.5, "name": "Light Traffic"},
@@ -2710,9 +2800,9 @@ class CapacityBenchmark:
         if is_ssl:
             ssl_ctx = ssl._create_unverified_context()
 
-        # 0. Preflight check: Verify target URL responds
+        # 0. Preflight check: Verify target URL responds (Safety net check bypassed in max mode)
         cur_load = self._get_load()
-        if cur_load >= max(4.0, CORES * 2.5):
+        if mode != "max" and cur_load >= max(4.0, CORES * 2.5):
             res = {
                 "ok": False,
                 "status": "aborted",
@@ -2825,7 +2915,7 @@ class CapacityBenchmark:
                                 try: conn.close()
                                 except Exception: pass
                             conn = None
-                        time.sleep(0.015)
+                        time.sleep(0.005 if mode == "max" else 0.015)
                     if conn:
                         try: conn.close()
                         except Exception: pass
@@ -2845,16 +2935,18 @@ class CapacityBenchmark:
                     load_val = self._get_load()
                     free_ram = self._get_free_ram_mb()
 
-                    max_safe_load = max(4.5, CORES * 3.0)
-                    if load_val >= max_safe_load:
-                        safety_aborted = True
-                        abort_reason = f"Safety Circuit Breaker: CPU Load average reached {load_val:.1f} (Limit: {max_safe_load:.1f}). Benchmark aborted immediately to protect server stability."
-                        break
+                    # Safety Circuit Breakers (Bypassed if mode == "max")
+                    if mode != "max":
+                        max_safe_load = max(4.5, CORES * 3.0)
+                        if load_val >= max_safe_load:
+                            safety_aborted = True
+                            abort_reason = f"Safety Circuit Breaker: CPU Load average reached {load_val:.1f} (Limit: {max_safe_load:.1f}). Benchmark aborted immediately to protect server stability."
+                            break
 
-                    if free_ram < 120.0:
-                        safety_aborted = True
-                        abort_reason = f"Safety Circuit Breaker: Available RAM dropped to {free_ram:.0f}MB (< 120MB threshold). Aborted immediately to prevent Linux OOM-killer."
-                        break
+                        if free_ram < 120.0:
+                            safety_aborted = True
+                            abort_reason = f"Safety Circuit Breaker: Available RAM dropped to {free_ram:.0f}MB (< 120MB threshold). Aborted immediately to prevent Linux OOM-killer."
+                            break
 
                     with stats_lock:
                         cur_tot = success_count[0] + fail_count[0]
@@ -2922,7 +3014,8 @@ class CapacityBenchmark:
                 if safety_aborted:
                     break
 
-                if avg_lat >= 2200.0 or err_pct >= 25.0:
+                # In max mode, early saturation cutoff is bypassed to evaluate full breaking limits
+                if mode != "max" and (avg_lat >= 2200.0 or err_pct >= 25.0):
                     server_saturated = True
                     break
 
@@ -2959,7 +3052,16 @@ class CapacityBenchmark:
             elif any(s["avg_latency_ms"] > 1000.0 for s in stages_results):
                 bottleneck = "Dynamic Script Latency / Database Query Time"
 
-            if safe_visitors >= 100:
+            if mode == "max":
+                max_concurrency_tested = max([s["concurrency"] for s in stages_results], default=500)
+                highest_err = max([s["error_rate_pct"] for s in stages_results], default=0.0)
+                if safe_visitors >= 350 and highest_err < 5.0:
+                    diagnosis = f"💀 Max Stress Passed Unharmed: Server was subjected to uncapped load up to {max_concurrency_tested} simultaneous visitors with all safety nets disabled. It sustained ~{safe_visitors} concurrent visitors ({safe_rps} req/s, {safe_latency}ms latency) with peak burst of {peak_rps} RPS and minimal errors ({highest_err}%). Truly exceptional server capacity."
+                elif safe_visitors >= 100:
+                    diagnosis = f"💀 Max Stress Completed: Uncapped stress test ramped to {max_concurrency_tested} visitors without safety circuit breakers. Server remained fully healthy up to ~{safe_visitors} simultaneous visitors ({safe_rps} req/s), reaching peak {peak_rps} RPS before saturating under extreme load ({highest_err}% peak error rate). Primary bottleneck: {bottleneck}."
+                else:
+                    diagnosis = f"💀 Max Stress Breaking Point Reached: Uncapped test pushed server to {max_concurrency_tested} concurrent visitors with safety nets off. Server started degrading early, with safe capacity estimated at ~{safe_visitors} visitors ({safe_rps} req/s). High failure rate ({highest_err}%) occurred at high concurrency due to {bottleneck.lower()}."
+            elif safe_visitors >= 100:
                 diagnosis = f"🚀 High Enterprise Capacity: Your server comfortably sustained {safe_visitors}+ simultaneous active visitors ({safe_rps} req/sec) with rapid {safe_latency}ms response times. Ideal for high-traffic stores, portals, and viral traffic surges."
             elif safe_visitors >= 45:
                 diagnosis = f"⚡ Robust Standard Capacity: Your server easily handles ~{safe_visitors} simultaneous active visitors ({safe_rps} req/sec) without degradation ({safe_latency}ms avg latency). This translates to over {monthly_views:,} monthly pageviews."
@@ -2977,6 +3079,8 @@ class CapacityBenchmark:
                 recommendations.append("Enable FastCGI or Nginx microcaching: Caching dynamic HTML pages reduces CPU load by 80–90%, allowing thousands of visitors.")
             recommendations.append("Enable HTTP/2 Keep-Alive and gzip/brotli compression on static assets to minimize network handshake overhead.")
             recommendations.append("If running WordPress or CMS, install an Object Cache (Redis or Memcached) to eliminate repeated database queries.")
+            if mode == "max":
+                recommendations.append("To endure 500+ simultaneous visitors, optimize Linux kernel network parameters (increase net.core.somaxconn to 4096 and fs.file-max).")
 
             final_result = {
                 "ok": True,
@@ -2986,6 +3090,7 @@ class CapacityBenchmark:
                 "duration_s": round(time.time() - t_start, 1),
                 "target_url": target_url,
                 "mode": mode,
+                "no_safety_net": (mode == "max"),
                 "safe_concurrent_visitors": safe_visitors,
                 "safe_rps": safe_rps,
                 "safe_latency_ms": safe_latency,
@@ -5188,7 +5293,7 @@ const ICONS = {
  alert:'<path d="M12 3l9.5 17H2.5L12 3z"/><path d="M12 9v5M12 17h.01"/>'
 };
 const CLR={ok:'var(--ok)',warn:'var(--warn)',crit:'var(--crit)',info:'var(--acc)'};
-let REPORT=null, HIST=[], INCIDENTS=[], FILTER='all', AUTO=true, TIMER=null, OPEN=new Set(), ACTIVE_RANGES={cpu:'10m',mem:'10m',load:'10m',disk:'10m'}, VISITORS=null, BENCHMARK=null, CAPACITY_BENCHMARK=null, BENCH_SUBTAB='capacity', CAPACITY_TIMER=null, DOCTOR=null, SITES=null, SECURITY=null, CURRENT_TAB='overview', BRANDING=(BOOT&&BOOT.branding)||null, FLEET=null, LICENSE=(BOOT&&BOOT.license)||null;
+let REPORT=null, HIST=[], INCIDENTS=[], FILTER='all', AUTO=true, TIMER=null, OPEN=new Set(), ACTIVE_RANGES={cpu:'10m',mem:'10m',load:'10m',disk:'10m'}, VISITORS=null, BENCHMARK=null, CAPACITY_BENCHMARK=null, BENCH_SUBTAB='capacity', CAPACITY_TIMER=null, CAP_SELECTED_MODE='quick', DOCTOR=null, SITES=null, SECURITY=null, CURRENT_TAB='overview', BRANDING=(BOOT&&BOOT.branding)||null, FLEET=null, LICENSE=(BOOT&&BOOT.license)||null;
 
 const $=s=>document.querySelector(s), esc=s=>String(s==null?'':s)
  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -5957,14 +6062,18 @@ function renderCapacityBenchmarkView(){
           </div>
         </div>
 
-        <div style="min-width:220px;">
+        <div style="min-width:240px;">
           <label style="font-size:11.5px;text-transform:uppercase;color:var(--dim);font-weight:700;letter-spacing:.5px;display:block;margin-bottom:6px;">
             Test Profile
           </label>
-          <select id="cap-mode" style="width:100%;padding:9px 12px;border-radius:8px;border:1px solid var(--stroke);background:var(--card);color:var(--txt);font-size:13px;">
-            <option value="quick" selected>⚡ Quick Safe Test (Up to 50 visitors, ~12s)</option>
-            <option value="full">🔥 Full Stress Test (Up to 150 visitors, ~22s)</option>
+          <select id="cap-mode" onchange="onCapModeChange(this)" style="width:100%;padding:9px 12px;border-radius:8px;border:1px solid var(--stroke);background:var(--card);color:var(--txt);font-size:13px;">
+            <option value="quick" ${CAP_SELECTED_MODE==='quick'?'selected':''}>⚡ Quick Safe Test (Up to 50 visitors, ~12s)</option>
+            <option value="full" ${CAP_SELECTED_MODE==='full'?'selected':''}>🔥 Full Stress Test (Up to 150 visitors, ~22s)</option>
+            <option value="max" ${CAP_SELECTED_MODE==='max'?'selected':''}>💀 Max Stress — No Safety Net (Up to 500 visitors, uncapped)</option>
           </select>
+          <div id="cap-mode-warning" style="display:${CAP_SELECTED_MODE==='max'?'block':'none'};margin-top:8px;padding:8px 12px;border-radius:8px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:var(--crit);font-size:11.5px;line-height:1.4;">
+            <b>⚠️ Extreme Stress Warning:</b> Disables all CPU load and RAM circuit breakers, ramping up to 500 simultaneous visitors uncapped.
+          </div>
         </div>
       </div>
     </div>
@@ -5985,21 +6094,35 @@ function renderCapacityBenchmarkView(){
   `;
 }
 
+function onCapModeChange(sel){
+  CAP_SELECTED_MODE = sel.value;
+  const w = $('#cap-mode-warning');
+  if(w) w.style.display = (sel.value === 'max' ? 'block' : 'none');
+}
+
 function renderCapacityResults(b){
+  const isMax = (b.mode === 'max' || b.no_safety_net);
   const statusColor = b.safety_aborted ? 'var(--warn)' : (b.safe_concurrent_visitors >= 45 ? 'var(--ok)' : (b.safe_concurrent_visitors >= 15 ? 'var(--acc)' : 'var(--warn)'));
 
   return `
     <div class="glass" style="padding:22px 26px;margin-bottom:18px;">
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;border-bottom:1px solid var(--stroke);padding-bottom:16px;margin-bottom:16px;">
         <div>
-          <span style="font-size:11.5px;text-transform:uppercase;color:var(--dim);font-weight:700;letter-spacing:.8px;">
-            Visitor Traffic Capacity Verdict
-          </span>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <span style="font-size:11.5px;text-transform:uppercase;color:var(--dim);font-weight:700;letter-spacing:.8px;">
+              Visitor Traffic Capacity Verdict
+            </span>
+            ${isMax ? `
+              <span style="display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:5px;background:rgba(239,68,68,0.15);color:var(--crit);border:1px solid rgba(239,68,68,0.35);font-size:11px;font-weight:800;">
+                💀 Max Stress Mode (Safety Nets Disabled · 500 Visitors)
+              </span>
+            ` : ''}
+          </div>
           <div style="font-size:26px;font-weight:900;color:${statusColor};margin-top:2px;">
             ~${fmtNum(b.safe_concurrent_visitors)} Concurrent Visitors
           </div>
           <div style="font-size:12px;color:var(--mut);margin-top:3px;">
-            Tested against <b>${esc(b.target_url)}</b> (${esc(b.mode)} mode) on ${esc(b.date)} in ${b.duration_s}s
+            Tested against <b>${esc(b.target_url)}</b> (${isMax ? '<b style="color:var(--crit);">max uncapped</b>' : esc(b.mode)} mode) on ${esc(b.date)} in ${b.duration_s}s
           </div>
         </div>
 
@@ -6117,23 +6240,31 @@ function renderCapacityLive(st){
   if(!card) return;
   card.style.display = 'block';
 
+  const isMax = (st.mode === 'max');
   const pct = Math.min(Math.round((st.stage_index / Math.max(st.total_stages, 1)) * 100), 100);
 
   card.innerHTML = `
-    <div class="glass" style="padding:20px 24px;margin-bottom:18px;border-color:color-mix(in srgb,var(--acc) 40%,transparent);background:color-mix(in srgb,var(--acc) 4%,transparent);">
+    <div class="glass" style="padding:20px 24px;margin-bottom:18px;border-color:${isMax ? 'color-mix(in srgb,var(--crit) 50%,transparent)' : 'color-mix(in srgb,var(--acc) 40%,transparent)'};background:${isMax ? 'color-mix(in srgb,var(--crit) 5%,transparent)' : 'color-mix(in srgb,var(--acc) 4%,transparent)'};">
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:8px;">
         <div style="display:flex;align-items:center;gap:10px;">
-          <div class="spin" style="display:inline-block;width:18px;height:18px;border:2px solid var(--acc);border-top-color:transparent;border-radius:50%;"></div>
+          <div class="spin" style="display:inline-block;width:18px;height:18px;border:2px solid ${isMax ? 'var(--crit)' : 'var(--acc)'};border-top-color:transparent;border-radius:50%;"></div>
           <div>
-            <b style="font-size:14px;color:var(--txt);">Stage ${st.stage_index} of ${st.total_stages}: Ramping ${st.target_concurrency} Simultaneous Visitors…</b>
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+              <b style="font-size:14px;color:var(--txt);">Stage ${st.stage_index} of ${st.total_stages}: Ramping ${st.target_concurrency} Simultaneous Visitors…</b>
+              ${isMax ? `
+                <span style="display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:5px;background:rgba(239,68,68,0.2);color:var(--crit);border:1px solid rgba(239,68,68,0.4);font-size:10.5px;font-weight:800;letter-spacing:.5px;">
+                  💀 NO SAFETY NET — UNCAPPED
+                </span>
+              ` : ''}
+            </div>
             <div style="font-size:12px;color:var(--mut);">Simulating user browsing requests (${st.elapsed_stage_s}s elapsed in current stage)</div>
           </div>
         </div>
-        <div style="font-size:13px;font-weight:700;color:var(--acc);">${pct}% Completed</div>
+        <div style="font-size:13px;font-weight:700;color:${isMax ? 'var(--crit)' : 'var(--acc)'};">${pct}% Completed</div>
       </div>
 
       <div class="cap-bar-wrap">
-        <div class="cap-bar-fill" style="width:${pct}%;"></div>
+        <div class="cap-bar-fill" style="width:${pct}%;${isMax ? 'background:linear-gradient(90deg,var(--crit),#f97316);' : ''}"></div>
       </div>
 
       <div class="cap-stat-grid" style="margin-top:12px;">
@@ -6162,14 +6293,16 @@ async function startCapacityBenchmark(){
   const urlInp = $('#cap-target-url');
   const modeSel = $('#cap-mode');
   const targetUrl = (urlInp ? urlInp.value : '').trim() || 'http://127.0.0.1:80/';
-  const mode = (modeSel ? modeSel.value : 'quick') || 'quick';
+  const mode = (modeSel ? modeSel.value : CAP_SELECTED_MODE) || 'quick';
+  CAP_SELECTED_MODE = mode;
 
   const startBtn = $('#start-cap-btn');
   const stopBtn = $('#stop-cap-btn');
 
   try {
     if(startBtn) startBtn.disabled = true;
-    toast('Launching Capacity Benchmark', `Testing ${targetUrl} (${mode} mode)…`, 'info', 3500);
+    const modeLabel = (mode === 'max') ? '💀 Max Stress (No Safety Net)' : `${mode} mode`;
+    toast('Launching Capacity Benchmark', `Testing ${targetUrl} (${modeLabel})…`, mode === 'max' ? 'warn' : 'info', 4000);
 
     const res = await api('/api/benchmark/capacity/run', {
       method: 'POST',
@@ -8658,6 +8791,10 @@ def main():
     ap.add_argument("--no-alerts", action="store_true")
     ap.add_argument("--test-alerts", action="store_true", help="send sample alerts and report status per channel")
     ap.add_argument("--activate-license", metavar="KEY", help="activate Sentinel Pro or Agency license key")
+    ap.add_argument("--stress-test", metavar="URL", nargs="?", const="default",
+                    help="run visitor traffic capacity benchmark from CLI (default: auto-detect port 80/443)")
+    ap.add_argument("--stress-mode", choices=["quick", "full", "max"], default="quick",
+                    help="stress test profile: quick (up to 50), full (up to 150), max (up to 500, no safety net)")
     ap.add_argument("--bind"), ap.add_argument("--port", type=int)
     ap.add_argument("--interval", type=int)
     args = ap.parse_args()
@@ -8686,6 +8823,10 @@ def main():
     alerts = AlertManager(engine) if cfg["alerts"]["enabled"] else None
     if alerts:
         engine.auto_healer.set_alert_manager(alerts)
+
+    if args.stress_test is not None:
+        target_url = args.stress_test
+        return engine.capacity_benchmark.run_cli(target_url=target_url, mode=args.stress_mode)
 
     if args.test_alerts:
         if not alerts or not any(isinstance(c, dict) and c.get("enabled") for c in cfg["alerts"].values()):
