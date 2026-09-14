@@ -49,8 +49,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.2.10"
-UPDATED = "2026-09-14 23:25"
+VERSION = "2.2.11"
+UPDATED = "2026-09-14 23:45"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -3150,7 +3150,7 @@ class AuthRateLimiter:
     """
     MAX_KEYS = 20000
 
-    def __init__(self, max_fails=5, window_seconds=60, lockout_seconds=900):
+    def __init__(self, max_fails=10, window_seconds=60, lockout_seconds=900):
         self.max_fails = max_fails
         self.window = window_seconds
         self.lockout = lockout_seconds
@@ -3234,16 +3234,13 @@ class AuthRateLimiter:
             return True
 
     def succeed(self, ip):
-        """Rolls back the speculative attempt upon successful authentication."""
+        """Clears lockouts and failed attempts upon successful authentication."""
         k = self._key(ip)
         if not k:
             return
         with self.lock:
-            times = self.failed_attempts.get(k)
-            if times:
-                times.pop()
-                if not times:
-                    self.failed_attempts.pop(k, None)
+            self.failed_attempts.pop(k, None)
+            self.lockouts.pop(k, None)
 
     def record_fail(self, ip):
         """Backward-compatibility wrapper for recording failure."""
@@ -4474,7 +4471,7 @@ class Engine:
         self.sampler = Sampler()
         self.history = deque(maxlen=cfg.get("history_points", 5760))
         self.report = None
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.scan_lock = threading.Lock()
         self.last_scan_time = 0.0
         self.cached_report = None
@@ -4670,6 +4667,17 @@ class Engine:
                 self.report = report
             self._save_state()
             return report
+
+    def get_report(self, force=False):
+        """
+        Thread-safe getter for current report without holding locks during scanning.
+        Prevents deadlocks between the HTTP server thread and the background scanning loop.
+        """
+        if not force:
+            with self.lock:
+                if self.report is not None:
+                    return self.report
+        return self.scan(force=force)
 
 
 def _os_pretty():
@@ -7060,7 +7068,10 @@ async function scan(){
   }
 }
 
+let LOADING = false;
 async function load(){
+  if(LOADING) return;
+  LOADING = true;
   try{
     const r=await api('/api/health');
     if(r.branding) applyBranding(r.branding);
@@ -7070,9 +7081,20 @@ async function load(){
     if(r.capacity_benchmark && r.capacity_benchmark.last_result) CAPACITY_BENCHMARK = r.capacity_benchmark.last_result;
     SITES=r.sites||null;SECURITY=r.security||null;
     FLEET=r.fleet||null;
-    render(r.report);renderFleet(FLEET);renderSites(SITES);renderVisitors(VISITORS);renderBenchmark(BENCHMARK);renderServerDoctor(DOCTOR);
+    if(r.report) render(r.report);
+    renderFleet(FLEET);renderSites(SITES);renderVisitors(VISITORS);renderBenchmark(BENCHMARK);renderServerDoctor(DOCTOR);
     if(CURRENT_TAB==='incidents') renderIncidentsView();
-  }catch(e){}
+  }catch(e){
+    console.error('Sentinel load error:', e);
+    if(!REPORT){
+      const gsub = $('#gsub');
+      if(gsub) gsub.innerHTML = `<span style="color:var(--crit)">⚠ Telemetry error: ${esc(e.message || e)}</span> · <a href="javascript:load()" style="color:var(--acc);text-decoration:underline;">Retry</a>`;
+      const ggrade = $('#ggrade');
+      if(ggrade) ggrade.textContent = 'OFFLINE';
+    }
+  }finally{
+    LOADING = false;
+  }
   checkUpdatesSilent();
 }
 async function testAlert(b){b.disabled=true;
@@ -8202,6 +8224,9 @@ $('#chans').innerHTML=BOOT.channels.length
  ? 'Active Alert Channels: '+BOOT.channels.map(c=>`<span class="ch2 on">${esc(c)}</span>`).join(' ')
  : '<span class="ch2">No alert channel enabled — configure in config.json</span>';
 $('#autoBtn').classList.add('on');$('#autoTxt').textContent=`Auto ${BOOT.interval}s`;
+if(BOOT && BOOT.report){
+  render(BOOT.report);
+}
 load();TIMER=setInterval(load,BOOT.interval*1000);
 </script></body></html>"""
 
@@ -8216,6 +8241,12 @@ FAVICON = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
 HEX_COLOR_RE = re.compile(r'\A#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})\Z')
 URL_RE = re.compile(r'\A(?:https?://[^\s<>"{}|\\^`]+|/[a-zA-Z0-9_\-./]+)\Z')
 EMAIL_RE = re.compile(r'\A[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+\Z')
+
+
+class SentinelHTTPServer(ThreadingHTTPServer):
+    request_queue_size = 128
+    daemon_threads = True
+    allow_reuse_address = True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -8362,8 +8393,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _payload(self, role="admin"):
-        with self.engine.lock:
-            rep = self.engine.report or self.engine.scan()
+        rep = self.engine.get_report()
         return {
             "role": role,
             "report": rep,
@@ -8411,13 +8441,19 @@ class Handler(BaseHTTPRequestHandler):
         if norm_path in ("/", "/index.html"):
             channels = [n for n, c in self.cfg["alerts"].items()
                         if isinstance(c, dict) and c.get("enabled")]
-            boot = {"interval": self.cfg["scan_interval"],
-                    "role": role,
-                    "token": self.cfg["web"].get("token", ""),
-                    "channels": channels,
-                    "branding": self.cfg.get("branding", {}),
-                    "license": self.engine.license_manager.get_status()}
-            page = HTML_PAGE.replace("__BOOTSTRAP__", json.dumps(boot)).replace("__VER__", VERSION).replace("__UPDATED__", UPDATED)
+            web_cfg = self.cfg.get("web", {})
+            auth_token = (web_cfg.get("admin_token") or web_cfg.get("token") or "") if role == "admin" else (web_cfg.get("view_token") or "")
+            rep = self.engine.get_report()
+            boot = {
+                "interval": self.cfg["scan_interval"],
+                "role": role,
+                "token": auth_token,
+                "channels": channels,
+                "branding": self.cfg.get("branding", {}),
+                "license": self.engine.license_manager.get_status(),
+                "report": rep
+            }
+            page = HTML_PAGE.replace("__BOOTSTRAP__", json.dumps(boot, default=str)).replace("__VER__", VERSION).replace("__UPDATED__", UPDATED)
             return self._send(200, page, "text/html; charset=utf-8")
         if norm_path == "/api/branding":
             return self._send(200, self.cfg.get("branding", {}))
@@ -8438,8 +8474,7 @@ class Handler(BaseHTTPRequestHandler):
         if norm_path == "/api/sites":
             return self._send(200, self.engine.site_monitor.get_summary())
         if norm_path == "/api/server-doctor":
-            with self.engine.lock:
-                rep = self.engine.report or self.engine.scan()
+            rep = self.engine.get_report()
             return self._send(200, generate_server_doctor(rep))
         if norm_path == "/api/report/html":
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -8450,8 +8485,7 @@ class Handler(BaseHTTPRequestHandler):
                 branding_override["client_name"] = q["client"][0]
             if "title" in q:
                 branding_override["report_title"] = q["title"][0]
-            with self.engine.lock:
-                rep = self.engine.report or self.engine.scan()
+            rep = self.engine.get_report()
             html = generate_executive_html(rep, self.engine.history, branding_override, self.engine.healing_history)
             return self._send(200, html, "text/html; charset=utf-8")
         if norm_path == "/api/auto-heal":
@@ -8747,7 +8781,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def prometheus(engine):
-    r = engine.report or engine.scan()
+    r = engine.get_report()
     h = prom_esc(r["host"])
     L = ["# HELP sentinel_health_score Overall health score 0-100",
          "# TYPE sentinel_health_score gauge",
@@ -8914,6 +8948,12 @@ def main():
         print(json.dumps(rep, indent=2, default=str)) if args.json else cli_report(rep, not args.quiet)
         return {"ok": 0, "warn": 1, "crit": 2}[rep["status"]]
 
+    # Prime telemetry counters so initial scan is ready immediately on server boot
+    try:
+        engine.scan()
+    except Exception as e:
+        print(f"[sentinel] Initial scan warning: {e}", file=sys.stderr)
+
     # daemon: background scanner + web dashboard
     stop = threading.Event()
     threading.Thread(target=background_loop,
@@ -8941,7 +8981,7 @@ def main():
         print(f"[sentinel] Generated secure 36-char admin token: {new_token}")
 
     Handler.engine, Handler.alerts, Handler.cfg, Handler.cfg_path = engine, alerts, cfg, args.config
-    srv = ThreadingHTTPServer((cfg["web"]["bind"], cfg["web"]["port"]), Handler)
+    srv = SentinelHTTPServer((cfg["web"]["bind"], cfg["web"]["port"]), Handler)
     active_tok = cfg["web"].get("admin_token") or cfg["web"].get("token")
     url = f"http://{cfg['web']['bind']}:{cfg['web']['port']}"
     if active_tok:
