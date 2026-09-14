@@ -49,8 +49,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.2.12"
-UPDATED = "2026-09-14 23:58"
+VERSION = "2.2.13"
+UPDATED = "2026-09-15 00:15"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -5044,8 +5044,12 @@ class AlertManager:
             headers["Authorization"] = f"Bearer {tok}"
 
         try:
+            # Publish as JSON directly to the ntfy root endpoint (e.g. https://ntfy.sh/)
+            # Per ntfy documentation: when publishing JSON, the POST must be sent to the root URL,
+            # NOT to /<topic>. Sending JSON to /<topic> causes ntfy to treat the JSON payload as raw plain text.
+            endpoint = f"{server}/"
             req = urllib.request.Request(
-                f"{server}/{topic}",
+                endpoint,
                 data=json.dumps(payload).encode("utf-8"),
                 headers=headers
             )
@@ -5074,8 +5078,25 @@ class AlertManager:
 
     def _webhook(self, subject, text, htmlbody, report, events):
         cfg = self.cfg["webhook"]
-        st = self._post(cfg["url"], {"subject": subject, "text": text, "report": report,
-                                     "events": events}, cfg.get("headers"))
+        url = (cfg.get("url") or "").strip()
+        # If user entered an ntfy URL into generic webhook, send clean plain text with headers instead of raw JSON
+        if "ntfy.sh" in url or "/ntfy" in url:
+            ascii_title = subject.encode("ascii", "ignore").decode("ascii")[:200]
+            priority_tag = {"crit": "urgent", "warn": "high", "ok": "default"}.get(report.get("status"), "default")
+            h = {
+                "Title": ascii_title,
+                "Content-Type": "text/plain; charset=utf-8",
+                "Priority": priority_tag,
+                "Markdown": "yes",
+                "User-Agent": f"health-sentinel/{VERSION}"
+            }
+            h.update(cfg.get("headers") or {})
+            req = urllib.request.Request(url, data=text[:3800].encode("utf-8"), headers=h)
+            with urllib.request.urlopen(req, timeout=12) as r:
+                return f"Webhook (ntfy) HTTP {r.status}"
+
+        st = self._post(url, {"subject": subject, "text": text, "report": report,
+                              "events": events}, cfg.get("headers"))
         return f"Webhook HTTP {st}"
 
     def _desktop(self, subject, text, htmlbody, report, events):
