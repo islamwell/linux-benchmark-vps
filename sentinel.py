@@ -49,8 +49,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.2.11"
-UPDATED = "2026-09-14 23:45"
+VERSION = "2.2.12"
+UPDATED = "2026-09-14 23:58"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -889,7 +889,33 @@ class Check:
         self.pct = clamp(pct if pct is not None else (v / max(crit, 1e-9)) * 100.0)
 
     def add(self, sev, title, detail="", why="", diagnose=(), fix=()):
-        self.findings.append(Finding(sev, title, detail, why, list(diagnose), list(fix)))
+        # Self-healing for 5 positional argument calls: c.add(sev, title, why_string, diagnose_list, fix_list)
+        if isinstance(why, (list, tuple)) and not fix:
+            fix = list(diagnose)
+            diagnose = list(why)
+            why = detail if isinstance(detail, str) else ""
+            detail = ""
+        elif isinstance(why, (list, tuple)) and fix:
+            fix = list(fix)
+            diagnose = list(diagnose) + list(why)
+            why = ""
+
+        # Normalize string types
+        if isinstance(why, (list, tuple)):
+            why = " ".join(str(x) for x in why)
+        if isinstance(detail, (list, tuple)):
+            detail = " ".join(str(x) for x in detail)
+
+        why_str = str(why or "").strip()
+        why_str = re.sub(r'^(Why this happens:?\s*|Why this matters:?\s*|Why:?\s*)', '', why_str, flags=re.I).strip()
+        detail_str = str(detail or "").strip()
+        title_str = str(title or "").strip()
+
+        # Clean multiple whitespaces in diagnose/fix commands
+        clean_diag = [re.sub(r'[ \t]{2,}', '  ', str(x)).strip() for x in (diagnose or []) if str(x).strip()]
+        clean_fix = [re.sub(r'[ \t]{2,}', '  ', str(x)).strip() for x in (fix or []) if str(x).strip()]
+
+        self.findings.append(Finding(str(sev).lower(), title_str, detail_str, why_str, clean_diag, clean_fix))
 
     def finalize(self):
         worst = max([RANK[f.severity] for f in self.findings] + [RANK[self.status]])
@@ -1301,10 +1327,11 @@ def check_inodes(cur, prev, dt, T):
         if r["pct"] >= T["inode_warn"]:
             c.add("crit" if r["pct"] >= T["inode_crit"] else "warn",
                   f"Too Many Small Files on {r['mount']} ({r['pct']:.0f}% inode slots used)",
-                  "Why this happens: Linux limits how many individual files you can create. Millions of tiny cache files, old PHP session files, or email queue fragments can fill up inode slots even if you still have gigabytes of disk space.",
-                  [f"df -i {r['mount']}                     # Check inode usage count on {r['mount']}"],
-                  ["Delete old PHP session files: `sudo find /var/lib/php/sessions /tmp -type f -mmin +180 -delete`",
-                   "Clear mail queues: `sudo postsuper -d ALL deferred` (if using Postfix)"])
+                  detail=f"Mount {r['mount']} has used {r['pct']:.0f}% of allocated inodes",
+                  why="Linux limits how many individual files you can create. Millions of tiny cache files, old PHP session files, or email queue fragments can fill up inode slots even if you still have gigabytes of disk space.",
+                  diagnose=[f"df -i {r['mount']}  # Check inode usage count on {r['mount']}"],
+                  fix=["Delete old PHP session files: `sudo find /var/lib/php/sessions /tmp -type f -mmin +180 -delete`",
+                       "Clear mail queues: `sudo postsuper -d ALL deferred` (if using Postfix)"])
     return c.finalize()
 
 
@@ -1356,15 +1383,17 @@ def check_network(cur, prev, dt, T):
     if retrans >= T["retrans_warn"]:
         c.add("crit" if retrans >= T["retrans_crit"] else "warn",
               f"Network Packet Loss / Retransmission at {retrans:.1f}%",
-              "Why this happens: Some network packets sent by the server are getting lost in transit on the internet, forcing the server to resend them.",
-              ["ping -c 10 1.1.1.1                      # Test packet loss to external internet"],
-              ["Turn on BBR network congestion control: `sudo sysctl -w net.ipv4.tcp_congestion_control=bbr`"])
+              detail=f"{top['iface'] if top else 'Network interface'} is retransmitting {retrans:.1f}% of outgoing TCP packets",
+              why="Some network packets sent by the server are getting lost in transit on the internet, forcing the server to resend them.",
+              diagnose=["ping -c 10 1.1.1.1  # Test packet loss to external internet"],
+              fix=["Turn on BBR network congestion control: `sudo sysctl -w net.ipv4.tcp_congestion_control=bbr`"])
     if overflow > 0 or listen_drops > 5:
         c.add("crit" if overflow > 0 else "warn",
               f"Incoming Web Connections Are Being Dropped ({overflow:.0f} drops/s)",
-              "Why this happens: Too many visitors are connecting simultaneously and the server connection queue is full.",
-              ["ss -ltn                                # Check current listening sockets and backlogs"],
-              ["Increase connection backlog limit: `sudo sysctl -w net.core.somaxconn=4096 net.ipv4.tcp_max_syn_backlog=8192`"])
+              detail=f"Connection queue overflow: {overflow:.0f} drops/s (listen drops: {listen_drops:.0f}/s)",
+              why="Too many visitors are connecting simultaneously and the server connection queue is full.",
+              diagnose=["ss -ltn  # Check current listening sockets and backlogs"],
+              fix=["Increase connection backlog limit: `sudo sysctl -w net.core.somaxconn=4096 net.ipv4.tcp_max_syn_backlog=8192`"])
     return c.finalize()
 
 
@@ -1401,14 +1430,16 @@ def check_processes(cur, prev, dt, T):
     if zombies >= T["zombie_warn"]:
         c.add("crit" if zombies >= T["zombie_crit"] else "warn",
               f"{zombies} Dead / Zombie Process(es) Left Open",
-              "Why this happens: A program finished running, but its parent program did not clean it up.",
-              ["ps -eo pid,ppid,user,stat,comm | awk '$4~/Z/' # Find who created the zombie processes"],
-              ["Restart the parent application that spawned the zombie processes"])
+              detail=f"{zombies} zombie processes detected in system process table",
+              why="A program finished running, but its parent program did not clean it up.",
+              diagnose=["ps -eo pid,ppid,user,stat,comm | awk '$4~/Z/'  # Find who created the zombie processes"],
+              fix=["Restart the parent application that spawned the zombie processes"])
     if dstate >= max(4, CORES):
         c.add("warn", f"{dstate} Program(s) Stuck Waiting on Disk (D-State)",
-              "Why this happens: Programs are frozen waiting for the hard drive to read or write data.",
-              ["ps -eo pid,user,stat,cmd | awk '$3~/D/' # View the frozen programs"],
-              ["Check drive speed and health; wait for heavy backup or database imports to finish"])
+              detail=f"{dstate} tasks currently blocked in uninterruptible disk sleep",
+              why="Programs are frozen waiting for the hard drive to read or write data.",
+              diagnose=["ps -eo pid,user,stat,cmd | awk '$3~/D/'  # View the frozen programs"],
+              fix=["Check drive speed and health; wait for heavy backup or database imports to finish"])
     return c.finalize()
 
 
@@ -1446,15 +1477,17 @@ def check_services(cur, prev, dt, T):
     if failed:
         c.add("crit" if len(failed) > 1 else "warn",
               f"{len(failed)} System Service(s) Crashed / Failed: {', '.join(failed[:4])}",
-              "Why this happens: A background service crashed on startup or encountered an unhandled error.",
-              [f"sudo systemctl status {failed[0]}    # View why the service crashed",
-               f"sudo journalctl -u {failed[0]} -n 30 # View recent error logs for this service"],
-              [f"Restart the service: `sudo systemctl reset-failed {failed[0]} && sudo systemctl restart {failed[0]}`"])
+              detail=f"Failed services: {', '.join(failed[:4])}",
+              why="A background service crashed on startup or encountered an unhandled error.",
+              diagnose=[f"sudo systemctl status {failed[0]}  # View why the service crashed",
+                        f"sudo journalctl -u {failed[0]} -n 30  # View recent error logs for this service"],
+              fix=[f"Restart the service: `sudo systemctl reset-failed {failed[0]} && sudo systemctl restart {failed[0]}`"])
     if reboot_required:
-        c.add("warn", "Server Reboot Recommended for Security Updates", pkgs or "Kernel update pending",
-              "Why this happens: New Linux security packages were installed and need a reboot to become active.",
-              ["cat /var/run/reboot-required.pkgs 2>/dev/null || true"],
-              ["Schedule a convenient time and run: `sudo reboot`"])
+        c.add("warn", "Server Reboot Recommended for Security Updates",
+              detail=pkgs or "Kernel update pending",
+              why="New Linux security packages were installed and need a reboot to become active.",
+              diagnose=["cat /var/run/reboot-required.pkgs 2>/dev/null || true"],
+              fix=["Schedule a convenient time and run: `sudo reboot`"])
     return c.finalize()
 
 
@@ -4788,27 +4821,47 @@ class AlertManager:
         return f"{icon} {worst} · {self.host} · {names} · health {report['score']:.0f}/100"
 
     def text(self, events, report):
-        L = [f"{EMOJI[report['status']]} {self.host} — Health {report['score']:.0f}/100 "
-             f"({report['grade']} · {report['grade_label']})",
-             f"Server: {report['os']} · {report['cores']} cores · up {report['uptime']} · {report['time']}", ""]
+        status_emoji = EMOJI.get(report.get("status", "ok"), "🟢")
+        L = [
+            f"{status_emoji} {self.host} — Health {report['score']:.0f}/100 ({report['grade']} · {report['grade_label']})",
+            f"Server: {report['os']} · {report['cores']} cores · up {report['uptime']} · {report['time']}",
+            "──────────────────────────────────────────",
+            ""
+        ]
         for e in events:
             c = e["check"]
             if e["type"] == "recovery":
-                L.append(f"{EMOJI['ok']} RECOVERED: {c['name']} is back to normal! ({c['summary']})")
+                L.append(f"✅ RECOVERED: {c['name']} is back to normal! ({c.get('summary', '')})")
+                L.append("")
                 continue
-            L.append(f"{EMOJI[c['status']]} {c['status'].upper()}: {c['name']} = {c['value']}{(' ' + c['unit']) if c['unit'] else ''}")
-            L.append(f"   Summary: {c['summary']}")
-            for f in c["findings"][:2]:
-                L.append(f"   ▸ {f['title']}")
-                if f["why"]:
-                    L.append(f"     Why: {f['why']}")
-                for fx in f["fix"][:2]:
-                    L.append(f"     ✔ Fix: {fx}")
-                for dg in f["diagnose"][:1]:
-                    L.append(f"     🔍 Check: {dg}")
+
+            check_emoji = EMOJI.get(c.get("status", "warn"), "⚠️")
+            val = str(c.get("value", "")).strip()
+            unit = str(c.get("unit", "")).strip()
+            if val and val != "—":
+                val_str = f" = {val}{unit if unit.startswith('%') else (' ' + unit if unit else '')}"
+            else:
+                val_str = ""
+            L.append(f"{check_emoji} {c['status'].upper()}: {c['name']}{val_str}")
+            if c.get("summary"):
+                L.append(f"  Summary: {c['summary']}")
+
+            for f in c.get("findings", [])[:2]:
+                L.append(f"\n  ▸ {f['title']}")
+                if f.get("why"):
+                    clean_why = re.sub(r'^(Why this happens:?\s*|Why this matters:?\s*|Why:?\s*)', '', str(f['why']), flags=re.I).strip()
+                    L.append(f"    • Why: {clean_why}")
+                for dg in f.get("diagnose", [])[:2]:
+                    clean_dg = re.sub(r'[ \t]{2,}', '  ', str(dg)).strip()
+                    L.append(f"    🔍 Diagnose: {clean_dg}")
+                for fx in f.get("fix", [])[:2]:
+                    clean_fx = re.sub(r'[ \t]{2,}', '  ', str(fx)).strip()
+                    L.append(f"    🛠️ Quick Fix: {clean_fx}")
             L.append("")
-        L.append("— Linux Health Sentinel v" + VERSION)
-        return "\n".join(L)
+
+        L.append("──────────────────────────────────────────")
+        L.append(f"🛡️ Linux Health Sentinel v{VERSION}")
+        return "\n".join(L).strip()
 
     def html(self, events, report):
         col = {"crit": "#e5484d", "warn": "#f5a524", "ok": "#17c964", "info": "#4a7dff"}
@@ -4876,12 +4929,17 @@ class AlertManager:
             c = e["check"]
             status_emoji = "🟢" if e["type"] == "recovery" else ("🔴" if c["status"] == "crit" else "🟠")
             lines.append(f"{status_emoji} *{c['name']}: {c['value']} {c['unit']}*")
-            for f in c["findings"][:1]:
+            for f in c.get("findings", [])[:1]:
                 lines.append(f"• *Issue:* {f['title']}")
-                if f["why"]:
-                    lines.append(f"• *Why:* {f['why']}")
-                if f["fix"]:
-                    lines.append(f"• *Fix:* `{f['fix'][0]}`")
+                if f.get("why"):
+                    clean_why = re.sub(r'^(Why this happens:?\s*|Why this matters:?\s*|Why:?\s*)', '', str(f['why']), flags=re.I).strip()
+                    lines.append(f"• *Why:* {clean_why}")
+                if f.get("diagnose"):
+                    clean_dg = re.sub(r'[ \t]{2,}', '  ', str(f['diagnose'][0])).strip()
+                    lines.append(f"• *Check:* `{clean_dg}`")
+                if f.get("fix"):
+                    clean_fx = re.sub(r'[ \t]{2,}', '  ', str(f['fix'][0])).strip()
+                    lines.append(f"• *Fix:* `{clean_fx}`")
             lines.append("")
         
         wa_text = "\n".join(lines).strip()
@@ -4974,7 +5032,8 @@ class AlertManager:
             "title": subject[:200],
             "message": text[:3800],
             "priority": priority,
-            "tags": [tag]
+            "tags": [tag],
+            "markdown": True
         }
         headers = {
             "Content-Type": "application/json; charset=utf-8",
@@ -5000,6 +5059,7 @@ class AlertManager:
                 "Content-Type": "text/plain; charset=utf-8",
                 "Priority": {"crit": "urgent", "warn": "high", "ok": "default"}.get(report.get("status"), "default"),
                 "Tags": tag,
+                "Markdown": "yes",
                 "User-Agent": f"health-sentinel/{VERSION}"
             }
             if cfg.get("token"):
