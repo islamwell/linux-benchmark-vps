@@ -24,7 +24,7 @@ A **production-ready**, **zero-dependency** (pure Python 3 stdlib) Linux server 
 
 ## 🚀 1-Command Universal Auto-Update or Install
 
-To install Sentinel or upgrade an existing installation to the latest release (**v2.2.9**), simply run:
+To install Sentinel or upgrade an existing installation to the latest release (**v2.2.10**), simply run:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/islamwell/linux-benchmark-vps/master/update.sh | sudo bash
@@ -511,6 +511,6 @@ Supported proxy engines:
 ---
 
 ## 📜 Versioning
-Current Version: **v2.2.9 (updated 2026-09-14 23:15)**
+Current Version: **v2.2.10 (updated 2026-09-14 23:25)**
 
 

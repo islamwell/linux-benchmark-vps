@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — Automated Installer & Service Manager
-# Version: 2.2.9 (updated 2026-09-14 23:15)
+# Version: 2.2.10 (updated 2026-09-14 23:25)
 # ==============================================================================
 
 set -euo pipefail
 
-VERSION="2.2.9"
-UPDATED="2026-09-14 23:15"
+VERSION="2.2.10"
+UPDATED="2026-09-14 23:25"
 
 # Target installation paths
 INSTALL_DIR="/opt/health-sentinel"
@@ -282,6 +282,15 @@ chmod 750 "${INCIDENTS_DIR}"
 echo -e "${C_BOLD}[3/6] Installing application files into ${INSTALL_DIR}...${C_RESET}"
 cp "${SOURCE_DIR}/sentinel.py" "${INSTALL_DIR}/sentinel.py"
 chmod 755 "${INSTALL_DIR}/sentinel.py"
+
+if [ -f "${SOURCE_DIR}/update.sh" ]; then
+    cp "${SOURCE_DIR}/update.sh" "${INSTALL_DIR}/update.sh"
+    chmod 755 "${INSTALL_DIR}/update.sh"
+fi
+if [ -f "${SOURCE_DIR}/install.sh" ]; then
+    cp "${SOURCE_DIR}/install.sh" "${INSTALL_DIR}/install.sh"
+    chmod 755 "${INSTALL_DIR}/install.sh"
+fi
 
 if [ -f "${SOURCE_DIR}/deploy/enable-plesk-php-slowlog.sh" ]; then
     cp "${SOURCE_DIR}/deploy/enable-plesk-php-slowlog.sh" "${INSTALL_DIR}/deploy/"

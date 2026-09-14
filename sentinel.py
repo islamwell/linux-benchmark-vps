@@ -49,8 +49,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.2.9"
-UPDATED = "2026-09-14 23:15"
+VERSION = "2.2.10"
+UPDATED = "2026-09-14 23:25"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -474,21 +474,29 @@ def check_for_updates():
 
 def execute_system_update():
     """
-    Executes update.sh or git pull in a background detached thread with a short delay
-    so the HTTP response can be sent cleanly to the caller before daemon restarts.
+    Executes update.sh, git pull, or on-the-fly remote updater in a background detached thread
+    with a short delay so the HTTP response can be sent cleanly to the caller before daemon restarts.
     """
     update_script = "/opt/health-sentinel/update.sh"
     base_dir = os.path.dirname(os.path.abspath(__file__))
     local_update = os.path.join(base_dir, "update.sh")
 
-    if os.path.isfile(update_script) and os.access(update_script, os.X_OK):
+    if os.path.isfile(update_script):
         cmd = ["/bin/bash", update_script]
-    elif os.path.isfile(local_update) and os.access(local_update, os.X_OK):
+    elif os.path.isfile(local_update):
         cmd = ["/bin/bash", local_update]
     elif os.path.isdir(os.path.join(base_dir, ".git")):
         cmd = ["git", "-C", base_dir, "pull", "origin", "master"]
     else:
-        return False, "Neither /opt/health-sentinel/update.sh nor a git repository was found to execute update."
+        # Self-healing fallback: Download latest update.sh directly from GitHub and execute
+        remote_cmd = (
+            "if command -v curl >/dev/null 2>&1; then "
+            "curl -fsSL https://raw.githubusercontent.com/islamwell/linux-benchmark-vps/master/update.sh -o /tmp/sentinel-update.sh; "
+            "elif command -v wget >/dev/null 2>&1; then "
+            "wget -qO /tmp/sentinel-update.sh https://raw.githubusercontent.com/islamwell/linux-benchmark-vps/master/update.sh; "
+            "fi && chmod +x /tmp/sentinel-update.sh && /bin/bash /tmp/sentinel-update.sh"
+        )
+        cmd = ["/bin/bash", "-c", remote_cmd]
 
     def _run_detached():
         time.sleep(1.2)
@@ -498,14 +506,27 @@ def execute_system_update():
                 "HOME": "/root",
                 "DEBIAN_FRONTEND": "noninteractive"
             }
+            log_path = "/tmp/sentinel-update.log"
+            try:
+                log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+                timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+                os.write(log_fd, f"[{timestamp}] Launching Sentinel update: {' '.join(cmd)}\n".encode("utf-8"))
+            except Exception:
+                log_fd = subprocess.DEVNULL
+
             subprocess.Popen(
                 cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=log_fd if log_fd != subprocess.DEVNULL else subprocess.DEVNULL,
+                stderr=log_fd if log_fd != subprocess.DEVNULL else subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
                 env=env
             )
+            if log_fd != subprocess.DEVNULL:
+                try:
+                    os.close(log_fd)
+                except Exception:
+                    pass
         except Exception as e:
             try:
                 syslog.syslog(syslog.LOG_ERR, f"[sentinel] Update invocation error: {e}")
