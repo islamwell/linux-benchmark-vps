@@ -49,8 +49,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.2.8"
-UPDATED = "2026-09-14 23:05"
+VERSION = "2.2.9"
+UPDATED = "2026-09-14 23:15"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -4929,17 +4929,59 @@ class AlertManager:
 
     def _ntfy(self, subject, text, htmlbody, report, events):
         cfg = self.cfg["ntfy"]
-        priority = {"crit": "urgent", "warn": "high", "ok": "default"}.get(report["status"], "default")
-        tag = {"crit": "rotating_light", "warn": "warning", "ok": "white_check_mark"}.get(report["status"], "white_check_mark")
-        h = {"Title": subject[:200], "Content-Type": "text/plain",
-             "Priority": priority,
-             "Tags": tag}
+        priority_map = {"crit": 5, "warn": 4, "ok": 3}
+        priority = priority_map.get(report.get("status"), 3)
+        tag = {"crit": "rotating_light", "warn": "warning", "ok": "white_check_mark"}.get(report.get("status"), "white_check_mark")
+
+        server = (cfg.get("server") or "https://ntfy.sh").strip().rstrip("/")
+        if not server.startswith("http://") and not server.startswith("https://"):
+            server = "https://" + server
+        topic = (cfg.get("topic") or "").strip().lstrip("/")
+        if not topic:
+            raise ValueError("ntfy topic is empty or not configured")
+
+        payload = {
+            "topic": topic,
+            "title": subject[:200],
+            "message": text[:3800],
+            "priority": priority,
+            "tags": [tag]
+        }
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "User-Agent": f"health-sentinel/{VERSION}"
+        }
         if cfg.get("token"):
-            h["Authorization"] = "Bearer " + cfg["token"]
-        req = urllib.request.Request(f"{cfg['server'].rstrip('/')}/{cfg['topic']}",
-                                     data=text[:3800].encode(), headers=h)
-        with urllib.request.urlopen(req, timeout=12) as r:
-            return f"ntfy HTTP {r.status}"
+            tok = cfg["token"].strip()
+            headers["Authorization"] = f"Bearer {tok}"
+
+        try:
+            req = urllib.request.Request(
+                f"{server}/{topic}",
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers
+            )
+            with urllib.request.urlopen(req, timeout=12) as r:
+                return f"ntfy HTTP {r.status}"
+        except Exception:
+            # Fallback for legacy plain text ntfy endpoints: clean Title to ASCII to avoid latin-1 codec errors
+            ascii_title = subject.encode("ascii", "ignore").decode("ascii")[:200]
+            legacy_headers = {
+                "Title": ascii_title,
+                "Content-Type": "text/plain; charset=utf-8",
+                "Priority": {"crit": "urgent", "warn": "high", "ok": "default"}.get(report.get("status"), "default"),
+                "Tags": tag,
+                "User-Agent": f"health-sentinel/{VERSION}"
+            }
+            if cfg.get("token"):
+                legacy_headers["Authorization"] = f"Bearer {cfg['token'].strip()}"
+            req_legacy = urllib.request.Request(
+                f"{server}/{topic}",
+                data=text[:3800].encode("utf-8"),
+                headers=legacy_headers
+            )
+            with urllib.request.urlopen(req_legacy, timeout=12) as r:
+                return f"ntfy HTTP {r.status}"
 
     def _webhook(self, subject, text, htmlbody, report, events):
         cfg = self.cfg["webhook"]
