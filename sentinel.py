@@ -49,8 +49,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.2.13"
-UPDATED = "2026-09-15 00:15"
+VERSION = "2.2.14"
+UPDATED = "2026-09-16 06:20"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -5160,25 +5160,31 @@ code,pre,.mono{font-family:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Co
  backdrop-filter:blur(18px) saturate(140%);-webkit-backdrop-filter:blur(18px);box-shadow:var(--shadow)}
 
 /* ── header ─────────────────────────────────────────── */
-header{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:22px}
-.brand{display:flex;align-items:center;gap:13px}
-.logo{width:44px;height:44px;border-radius:13px;display:grid;place-items:center;position:relative;
- background:linear-gradient(145deg,var(--acc),var(--acc2));box-shadow:0 8px 24px -8px var(--acc)}
-.logo svg{width:23px;height:23px;stroke:#fff;fill:none;stroke-width:2.1}
-.logo:after{content:"";position:absolute;inset:-4px;border-radius:17px;border:1px solid var(--acc);
+header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:20px}
+.brand{display:flex;align-items:center;gap:12px;flex-shrink:0}
+.logo{width:40px;height:40px;border-radius:11px;display:grid;place-items:center;position:relative;
+ background:linear-gradient(145deg,var(--acc),var(--acc2));box-shadow:0 6px 20px -6px var(--acc)}
+.logo svg{width:21px;height:21px;stroke:#fff;fill:none;stroke-width:2.1}
+.logo:after{content:"";position:absolute;inset:-4px;border-radius:15px;border:1px solid var(--acc);
  opacity:.35;animation:pulse 2.6s ease-out infinite}
 @keyframes pulse{0%{transform:scale(.92);opacity:.5}100%{transform:scale(1.25);opacity:0}}
-h1{font-size:19px;font-weight:750;letter-spacing:-.3px}
-.sub{font-size:12.5px;color:var(--mut)}
+h1{font-size:18px;font-weight:750;letter-spacing:-.3px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.sub{font-size:12px;color:var(--mut)}
 .spacer{flex:1}
-.btn{display:inline-flex;align-items:center;gap:7px;height:38px;padding:0 15px;border-radius:11px;
- border:1px solid var(--stroke2);background:var(--card);color:var(--txt);font-size:13.5px;font-weight:550;
- cursor:pointer;transition:.18s;white-space:nowrap}
-.btn:hover{background:var(--card2);transform:translateY(-1px);border-color:var(--acc)}
-.btn.primary{background:linear-gradient(135deg,var(--acc),var(--acc2));border:0;color:#fff;
- box-shadow:0 10px 26px -12px var(--acc)}
-.btn svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:2}
-.btn.on{border-color:var(--ok);color:var(--ok)}
+.actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:32px;padding:0 11px;border-radius:8px;
+ border:1px solid var(--stroke2);background:var(--card);color:var(--txt);font-size:12px;font-weight:600;
+ cursor:pointer;transition:.15s;white-space:nowrap;user-select:none;line-height:1}
+.btn:hover{background:var(--card2);border-color:var(--acc);color:var(--txt);transform:translateY(-1px)}
+.btn:active{transform:translateY(0)}
+.btn svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2;flex-shrink:0}
+.btn.primary{background:linear-gradient(135deg,var(--acc),var(--acc2));border-color:transparent;color:#fff;
+ box-shadow:0 6px 18px -4px var(--acc);font-weight:650}
+.btn.primary:hover{opacity:.95;border-color:transparent;box-shadow:0 8px 22px -4px var(--acc)}
+.btn.btn-icon{width:32px;height:32px;padding:0;flex-shrink:0}
+.btn.on{border-color:var(--ok);color:var(--ok);background:color-mix(in srgb,var(--ok) 10%,transparent)}
+.btn.on:hover{background:color-mix(in srgb,var(--ok) 18%,transparent)}
+.btn-sep{width:1px;height:18px;background:var(--stroke);margin:0 2px}
 .spin{animation:spin 1s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
 
 /* ── hero ───────────────────────────────────────────── */
@@ -5220,15 +5226,15 @@ h1{font-size:19px;font-weight:750;letter-spacing:-.3px}
 .dot{width:8px;height:8px;border-radius:50%;box-shadow:0 0 9px currentColor}
 
 /* ── toolbar ────────────────────────────────────────── */
-.tools{display:flex;gap:9px;align-items:center;margin:20px 0 14px;flex-wrap:wrap}
-.chip{height:33px;padding:0 14px;border-radius:999px;border:1px solid var(--stroke2);background:var(--card);
- color:var(--mut);font-size:13px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:7px;transition:.16s}
-.chip:hover{color:var(--txt);border-color:var(--acc)}
+.tools{display:flex;gap:7px;align-items:center;margin:16px 0 14px;flex-wrap:wrap}
+.chip{height:30px;padding:0 12px;border-radius:8px;border:1px solid var(--stroke2);background:var(--card);
+ color:var(--mut);font-size:12px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:6px;transition:.15s;white-space:nowrap;user-select:none}
+.chip:hover{color:var(--txt);border-color:var(--acc);transform:translateY(-1px)}
 .chip.active{background:var(--txt);color:var(--bg);border-color:transparent}
-.chip b{font-size:11px;opacity:.8}
-.search{min-width:160px;max-width:240px;height:33px;border-radius:999px;border:1px solid var(--stroke2);
- background:var(--card);color:var(--txt);padding:0 14px;font-size:12.5px;outline:0;transition:.18s}
-.search:focus{border-color:var(--acc);box-shadow:0 0 0 3px color-mix(in srgb,var(--acc) 18%,transparent);max-width:290px}
+.chip b{font-size:11px;opacity:.85;font-weight:700}
+.search{min-width:140px;max-width:220px;height:30px;border-radius:8px;border:1px solid var(--stroke2);
+ background:var(--card);color:var(--txt);padding:0 12px;font-size:12px;outline:0;transition:.18s}
+.search:focus{border-color:var(--acc);box-shadow:0 0 0 3px color-mix(in srgb,var(--acc) 18%,transparent);max-width:270px}
 
 /* ── check cards ────────────────────────────────────── */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(390px,1fr));gap:16px}
@@ -5309,13 +5315,14 @@ footer{margin-top:30px;display:flex;gap:14px;flex-wrap:wrap;align-items:center;
 kbd{font-size:10.5px;padding:1px 5px;border-radius:5px;border:1px solid var(--stroke2);background:var(--card)}
 
 /* ── tabs, doctor & benchmark styling ──────────────── */
-.nav-tabs{display:flex;gap:8px;margin:16px 0 20px;border-bottom:1px solid var(--stroke);padding-bottom:12px;overflow-x:auto}
-.tab-btn{padding:9px 18px;border-radius:999px;border:1px solid var(--stroke2);background:var(--card);color:var(--mut);font-size:13px;font-weight:650;cursor:pointer;display:inline-flex;align-items:center;gap:8px;transition:.18s;white-space:nowrap}
-.tab-btn svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:2}
+.nav-tabs{display:flex;gap:6px;margin:14px 0 18px;border-bottom:1px solid var(--stroke);padding-bottom:10px;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+.nav-tabs::-webkit-scrollbar{display:none}
+.tab-btn{padding:7px 13px;border-radius:8px;border:1px solid var(--stroke2);background:var(--card);color:var(--mut);font-size:12px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:7px;transition:.15s;white-space:nowrap;user-select:none}
+.tab-btn svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2;flex-shrink:0}
 .tab-btn:hover{color:var(--txt);border-color:var(--acc);transform:translateY(-1px)}
-.tab-btn.active{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;border-color:transparent;box-shadow:0 6px 18px -4px var(--acc)}
-.tab-badge{padding:2px 7px;border-radius:999px;font-size:11px;font-weight:700;background:rgba(0,0,0,.25);color:#fff}
-.tab-btn.active .tab-badge{background:rgba(255,255,255,.25)}
+.tab-btn.active{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;border-color:transparent;box-shadow:0 4px 14px -3px var(--acc)}
+.tab-badge{padding:2px 7px;border-radius:6px;font-size:10.5px;font-weight:700;background:rgba(0,0,0,.22);color:#fff}
+.tab-btn.active .tab-badge{background:rgba(255,255,255,.24)}
 .doctor-card{padding:18px 20px;border-radius:var(--r);background:var(--card);border:1px solid var(--stroke);margin-bottom:18px;transition:.2s}
 .doctor-card.ok{border-color:color-mix(in srgb,var(--ok) 35%,transparent);background:color-mix(in srgb,var(--ok) 6%,transparent)}
 .doctor-card.warn{border-color:color-mix(in srgb,var(--warn) 35%,transparent);background:color-mix(in srgb,var(--warn) 6%,transparent)}
@@ -5339,6 +5346,29 @@ kbd{font-size:10.5px;padding:1px 5px;border-radius:5px;border:1px solid var(--st
 .alert-tab-btn{padding:7px 14px;border-radius:8px;border:1px solid var(--stroke2);background:var(--card);color:var(--mut);font-size:12px;font-weight:600;cursor:pointer;transition:.15s}
 .alert-tab-btn:hover{color:var(--txt);border-color:var(--acc)}
 .alert-tab-btn.active{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;border-color:transparent;box-shadow:0 4px 14px -4px var(--acc)}
+
+/* ── responsive button & layout optimizations ──────────────── */
+@media(max-width:1240px){
+ .actions{gap:5px}
+ .btn{padding:0 9px;font-size:11.5px}
+}
+@media(max-width:960px){
+ header{flex-direction:column;align-items:stretch;gap:12px}
+ .actions{justify-content:flex-start;width:100%}
+ .btn-sep{display:none}
+}
+@media(max-width:680px){
+ .btn{height:30px;padding:0 8px;font-size:11px;gap:4px}
+ .btn.btn-icon{width:30px;height:30px}
+ .tab-btn{padding:6px 11px;font-size:11.5px}
+ .chip{height:28px;padding:0 9px;font-size:11.5px}
+ .search{min-width:110px;height:28px;font-size:11.5px}
+}
+@media(max-width:520px){
+ .btn-lbl{display:none}
+ .btn.primary .btn-lbl{display:inline}
+ .btn{padding:0 8px}
+}
 body.role-viewer .admin-only{display:none!important}
 </style></head><body>
 <div class="wrap">
@@ -5349,25 +5379,29 @@ body.role-viewer .admin-only{display:none!important}
     <div class="sub" id="hostline">loading…</div></div>
   </div>
   <div class="spacer"></div>
-  <button class="btn" id="autoBtn" onclick="toggleAuto()"><svg viewBox="0 0 24 24"><path d="M12 6v6l4 2"/><circle cx="12" cy="12" r="9"/></svg><span id="autoTxt">Auto</span></button>
-  <button class="btn" onclick="toggleTheme()"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg></button>
-  <button class="btn" id="licenseBtn" onclick="openLicenseModal()"><svg viewBox="0 0 24 24"><path d="M12 2a5 5 0 00-5 5v3H6a2 2 0 00-2 2v8a2 2 0 002 2h12a2 2 0 002-2v-8a2 2 0 00-2-2h-1V7a5 5 0 00-5-5zm-3 5a3 3 0 016 0v3H9V7z"/></svg><span id="licenseBtnText">🔑 License</span></button>
-  <button class="btn" id="updateBtn" onclick="openUpdateModal()"><svg viewBox="0 0 24 24"><path d="M12 2v10m0 0l3-3m-3 3l-3-3"/><path d="M4 14v4a2 2 0 002 2h12a2 2 0 002-2v-4"/></svg>🚀 Updates <span id="updateBadge" style="display:none;background:var(--acc);color:#fff;padding:2px 6px;border-radius:10px;font-size:10px;font-weight:700;margin-left:4px;">NEW</span></button>
-  <button class="btn admin-only" id="alertsBtn" onclick="openAlertsModal()"><svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 10-12 0c0 7-3 8-3 8h18s-3-1-3-8"/><path d="M13.7 21a2 2 0 01-3.4 0"/></svg>🔔 Notifications</button>
-  <button class="btn admin-only" onclick="openBrandingModal()"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 6.36 15.36L12 12V3z"/></svg>🎨 Branding</button>
-  <button class="btn admin-only" onclick="openQuickActionsModal()"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>⚡ Quick Actions &amp; PHP</button>
-  <button class="btn" onclick="openExecutiveReportModal()"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>📄 Executive Report</button>
-  <button class="btn" onclick="dl()"><svg viewBox="0 0 24 24"><path d="M12 3v12M7 11l5 5 5-5M4 20h16"/></svg>JSON</button>
-  <button class="btn primary" id="scanBtn" onclick="scan()"><svg viewBox="0 0 24 24" id="scanIco"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 4v5h-5"/></svg>Scan now</button>
+  <div class="actions">
+   <button class="btn" id="autoBtn" onclick="toggleAuto()" title="Auto-refresh interval"><svg viewBox="0 0 24 24"><path d="M12 6v6l4 2"/><circle cx="12" cy="12" r="9"/></svg><span id="autoTxt">Auto</span></button>
+   <button class="btn btn-icon" onclick="toggleTheme()" title="Toggle Dark/Light theme" aria-label="Toggle Theme"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg></button>
+   <div class="btn-sep"></div>
+   <button class="btn" id="licenseBtn" onclick="openLicenseModal()" title="License tier &amp; activation"><svg viewBox="0 0 24 24"><path d="M12 2a5 5 0 00-5 5v3H6a2 2 0 00-2 2v8a2 2 0 002 2h12a2 2 0 002-2v-8a2 2 0 00-2-2h-1V7a5 5 0 00-5-5zm-3 5a3 3 0 016 0v3H9V7z"/></svg><span id="licenseBtnText"><span class="btn-lbl">License</span></span></button>
+   <button class="btn" id="updateBtn" onclick="openUpdateModal()" title="Check for software updates"><svg viewBox="0 0 24 24"><path d="M12 2v10m0 0l3-3m-3 3l-3-3"/><path d="M4 14v4a2 2 0 002 2h12a2 2 0 002-2v-4"/></svg><span class="btn-lbl">Updates</span><span id="updateBadge" style="display:none;background:var(--acc);color:#fff;padding:1px 5px;border-radius:8px;font-size:9.5px;font-weight:700;margin-left:4px;">NEW</span></button>
+   <button class="btn admin-only" id="alertsBtn" onclick="openAlertsModal()" title="Alert notification channels (Telegram, Slack, Discord, Webhook, ntfy)"><svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 10-12 0c0 7-3 8-3 8h18s-3-1-3-8"/><path d="M13.7 21a2 2 0 01-3.4 0"/></svg><span class="btn-lbl">Alerts</span></button>
+   <button class="btn admin-only" onclick="openBrandingModal()" title="White-label branding &amp; logo customization"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 6.36 15.36L12 12V3z"/></svg><span class="btn-lbl">Branding</span></button>
+   <button class="btn admin-only" onclick="openQuickActionsModal()" title="Server quick actions &amp; PHP tuning"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg><span class="btn-lbl">Actions</span></button>
+   <div class="btn-sep"></div>
+   <button class="btn" onclick="openExecutiveReportModal()" title="Generate executive PDF/HTML report"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg><span class="btn-lbl">Report</span></button>
+   <button class="btn" onclick="dl()" title="Download raw JSON metrics"><svg viewBox="0 0 24 24"><path d="M12 3v12M7 11l5 5 5-5M4 20h16"/></svg><span class="btn-lbl">JSON</span></button>
+   <button class="btn primary" id="scanBtn" onclick="scan()" title="Run instant health scan"><svg viewBox="0 0 24 24" id="scanIco"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 4v5h-5"/></svg><span class="btn-lbl">Scan now</span></button>
+  </div>
  </header>
 
  <div class="nav-tabs">
-  <button class="tab-btn active" id="tab-overview-btn" onclick="switchTab('overview')"><svg viewBox="0 0 24 24"><path d="M3 12h18M3 6h18M3 18h18"/></svg>📊 System Health</button>
-  <button class="tab-btn" id="tab-fleet-btn" onclick="switchTab('fleet')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/><circle cx="12" cy="12" r="3"/></svg>🌐 Fleet Hub <span class="tab-badge" id="badge-fleet">0</span></button>
-  <button class="tab-btn" id="tab-sites-btn" onclick="switchTab('sites')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>🌐 Websites &amp; Uptime <span class="tab-badge" id="badge-sites">0</span></button>
-  <button class="tab-btn" id="tab-visitors-btn" onclick="switchTab('visitors')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3v18M3 12h18"/></svg>👥 Live Visitors &amp; Geo <span class="tab-badge" id="badge-visitors">0</span></button>
-  <button class="tab-btn" id="tab-benchmark-btn" onclick="switchTab('benchmark')"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>⚡ VPS Benchmark <span class="tab-badge" id="badge-bench">Ready</span></button>
-  <button class="tab-btn" id="tab-incidents-btn" onclick="switchTab('incidents')"><svg viewBox="0 0 24 24"><path d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>🚨 Culprits &amp; Incidents <span class="tab-badge" id="badge-inc">0</span></button>
+  <button class="tab-btn active" id="tab-overview-btn" onclick="switchTab('overview')"><svg viewBox="0 0 24 24"><path d="M3 12h18M3 6h18M3 18h18"/></svg>System Health</button>
+  <button class="tab-btn" id="tab-fleet-btn" onclick="switchTab('fleet')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/><circle cx="12" cy="12" r="3"/></svg>Fleet Hub <span class="tab-badge" id="badge-fleet">0</span></button>
+  <button class="tab-btn" id="tab-sites-btn" onclick="switchTab('sites')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>Websites &amp; Uptime <span class="tab-badge" id="badge-sites">0</span></button>
+  <button class="tab-btn" id="tab-visitors-btn" onclick="switchTab('visitors')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3v18M3 12h18"/></svg>Live Visitors &amp; Geo <span class="tab-badge" id="badge-visitors">0</span></button>
+  <button class="tab-btn" id="tab-benchmark-btn" onclick="switchTab('benchmark')"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>VPS Benchmark <span class="tab-badge" id="badge-bench">Ready</span></button>
+  <button class="tab-btn" id="tab-incidents-btn" onclick="switchTab('incidents')"><svg viewBox="0 0 24 24"><path d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>Incidents <span class="tab-badge" id="badge-inc">0</span></button>
  </div>
 
  <div id="view-overview">
@@ -5398,7 +5432,7 @@ body.role-viewer .admin-only{display:none!important}
    <button class="chip" data-f="crit" onclick="setF('crit',this)"><span class="dot" style="color:var(--crit);background:var(--crit)"></span>Critical <b id="c-crit">0</b></button>
    <button class="chip" data-f="warn" onclick="setF('warn',this)"><span class="dot" style="color:var(--warn);background:var(--warn)"></span>Warning <b id="c-warn">0</b></button>
    <button class="chip" data-f="ok" onclick="setF('ok',this)"><span class="dot" style="color:var(--ok);background:var(--ok)"></span>Healthy <b id="c-ok">0</b></button>
-   <button class="chip" data-f="incidents" onclick="showIncidents()">⚡ Culprits &amp; Incidents <b id="c-inc">0</b></button>
+   <button class="chip" data-f="incidents" onclick="showIncidents()">⚡ Incidents <b id="c-inc">0</b></button>
    <input class="search" id="q" placeholder="Filter checks…  ( / )">
    <div class="spacer"></div>
    <button class="chip" onclick="allOpen(true)">Expand all</button>
@@ -6580,7 +6614,7 @@ function updateLicenseBadge(lic){
     if(btnTxt) btnTxt.textContent = '⭐ Pro';
   } else {
     badge.innerHTML = `<span style="display:inline-block;padding:2px 8px;border-radius:6px;font-size:10px;font-weight:700;background:rgba(148,163,184,0.12);color:var(--mut);border:1px solid var(--stroke2);margin-left:6px;vertical-align:middle;">FREE CORE</span>`;
-    if(btnTxt) btnTxt.textContent = '🔑 License';
+    if(btnTxt) btnTxt.textContent = 'License';
   }
 }
 

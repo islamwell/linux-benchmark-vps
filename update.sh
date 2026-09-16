@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — 1-Command Universal Auto-Updater
-# Version: 2.2.13 (updated 2026-09-15 00:15)
+# Version: 2.2.14 (updated 2026-09-16 06:20)
 # ==============================================================================
 
 set -euo pipefail
 
-VERSION="2.2.13"
+VERSION="2.2.14"
 
 C_RESET="\033[0m"
 C_BOLD="\033[1m"
