@@ -176,6 +176,7 @@
     "enabled": true,
     "firewall_backend": "auto",
     "auto_flag_scanners": true,
+    "auto_block_hidden_files": true,
     "whitelist_ips": ["127.0.0.1", "::1"]
   },
 

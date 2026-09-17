@@ -49,8 +49,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.2.14"
-UPDATED = "2026-09-16 06:20"
+VERSION = "2.2.15"
+UPDATED = "2026-09-17 15:05"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -186,6 +186,7 @@ DEFAULTS = {
         "enabled": True,
         "firewall_backend": "auto",
         "auto_flag_scanners": True,
+        "auto_block_hidden_files": True,
         "whitelist_ips": ["127.0.0.1", "::1"]
     },
     "site_monitor": {
@@ -2336,6 +2337,12 @@ class VisitorTracker:
                 path_counts[p] = path_counts.get(p, 0) + 1
 
                 ip = entry["ip"]
+                path = entry["path"]
+                if self.security_shield and getattr(self.security_shield, "auto_block_hidden_files", True):
+                    is_hidden, hidden_reason = self.security_shield.is_hidden_file_probe(path)
+                    if is_hidden and not self.is_private_ip(ip):
+                        self.security_shield.ban_ip(ip, reason=f"Auto-block: {hidden_reason}", path=path)
+
                 if ip not in ip_stats:
                     ip_stats[ip] = {
                         "ip": ip,
@@ -3313,6 +3320,8 @@ class SecurityShield:
         self.banned_ips = {}
         self.lock = threading.Lock()
         self.whitelist = set(self.cfg.get("whitelist_ips", ["127.0.0.1", "::1"]))
+        self.auto_block_hidden_files = bool(self.cfg.get("auto_block_hidden_files", True))
+        self.alert_callback = None
         self._load()
         self._setup_firewall()
 
@@ -3406,7 +3415,7 @@ class SecurityShield:
         except ValueError:
             return False
 
-    def ban_ip(self, ip, reason="Manual ban via Web UI", admin_ip=None):
+    def ban_ip(self, ip, reason="Manual ban via Web UI", admin_ip=None, path=""):
         if not ip or not isinstance(ip, str):
             return False, "IP address is required."
         try:
@@ -3429,6 +3438,9 @@ class SecurityShield:
                 pass
 
         with self.lock:
+            if norm_ip in self.banned_ips:
+                return True, f"IP {norm_ip} already banned."
+
             applied = False
             has_ipt4 = (sh(["which", "iptables"], timeout=2)[0] == 0)
             has_ipt6 = (sh(["which", "ip6tables"], timeout=2)[0] == 0)
@@ -3461,11 +3473,17 @@ class SecurityShield:
             self.banned_ips[norm_ip] = {
                 "ip": norm_ip,
                 "reason": reason,
+                "path": path,
                 "banned_at": int(time.time()),
                 "date": datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S"),
                 "firewall_applied": applied
             }
             self._save()
+            if self.alert_callback:
+                try:
+                    self.alert_callback(norm_ip, reason, path)
+                except Exception:
+                    pass
             return True, f"IP {norm_ip} successfully banned."
 
     def unban_ip(self, ip):
@@ -3497,6 +3515,94 @@ class SecurityShield:
         with self.lock:
             return list(self.banned_ips.values())
 
+    def is_hidden_file_probe(self, path):
+        """
+        Determines if a requested path is probing for hidden files or sensitive dotfiles
+        (e.g., .env, .git, .aws, .ssh, .htaccess, .DS_Store, etc.).
+        Returns (is_probe: bool, reason: str).
+        Explicitly whitelists legitimate standard paths like /.well-known/.
+        """
+        if not path or not isinstance(path, str):
+            return False, None
+
+        # Double unquote to defend against URL-encoded bypasses (%2e%2e, %2eenv, etc.)
+        try:
+            unquoted = urllib.parse.unquote(urllib.parse.unquote(path))
+        except Exception:
+            unquoted = path
+
+        clean = unquoted.strip().split("?")[0].split("#")[0].replace("\\", "/")
+        norm = posixpath.normpath(clean).lower()
+
+        # Check query string for hidden file probes or path traversal
+        if "?" in unquoted:
+            query = unquoted.split("?", 1)[1].split("#")[0].replace("\\", "/")
+            q_norm = urllib.parse.unquote(query).lower()
+            if ".." in q_norm and (".env" in q_norm or ".git" in q_norm or ".ssh" in q_norm or ".aws" in q_norm or ".ht" in q_norm):
+                return True, f"Directory traversal query probe: {query[:60]}"
+            for pat in (".env", ".git", ".ssh", ".aws", ".htaccess", ".htpasswd"):
+                if f"={pat}" in q_norm or f"/{pat}" in q_norm or q_norm.startswith(pat) or f".{pat}" in q_norm:
+                    return True, f"Probe for hidden file in query string ({pat})"
+
+        # Whitelist standard ACME/Let's Encrypt and OAuth discovery paths (RFC 8615)
+        if norm == "/.well-known" or norm.startswith("/.well-known/"):
+            return False, None
+
+        # Check path segments
+        segments = [s for s in norm.split("/") if s and s != "."]
+
+        # Directory traversal attempt
+        if ".." in segments or ".." in clean:
+            return True, f"Directory traversal probe: {clean[:60]}"
+
+        for seg in segments:
+            if seg == ".well-known":
+                continue
+
+            # Target 1: Environment files (.env, .env.local, .env.prod, .env.backup, etc.)
+            if seg == ".env" or seg.startswith(".env.") or seg.startswith(".env_") or seg.endswith(".env"):
+                return True, f"Probe for hidden environment file ({seg})"
+
+            # Target 2: Git repository files (.git, .gitignore, .gitmodules, etc.)
+            if seg == ".git" or seg.startswith(".git/") or seg.startswith(".git") or seg.endswith(".git"):
+                return True, f"Probe for hidden Git repository ({seg})"
+
+            # Target 3: Version control systems (.svn, .hg, .bzr)
+            if seg in (".svn", ".hg", ".bzr") or seg.startswith((".svn", ".hg", ".bzr")):
+                return True, f"Probe for hidden VCS repository ({seg})"
+
+            # Target 4: Cloud and credential stores (.aws, .ssh, .kube, .docker, .npmrc)
+            if seg in (".aws", ".ssh", ".kube", ".docker", ".npmrc", ".yarnrc", ".pip", ".dockercfg", ".netrc"):
+                return True, f"Probe for hidden credentials ({seg})"
+
+            # Target 5: Server internal files (.htaccess, .htpasswd, .htgroups)
+            if seg in (".htaccess", ".htpasswd", ".htgroups") or seg.startswith((".htaccess", ".htpasswd")):
+                return True, f"Probe for hidden server config ({seg})"
+
+            # Target 6: System hidden files (.DS_Store, .directory, .trash)
+            if seg in (".ds_store", ".directory", ".trash") or seg.startswith(".ds_store"):
+                return True, f"Probe for hidden system file ({seg})"
+
+            # Target 7: Shell history / profiles (.bash_history, .zsh_history, .bashrc, .profile)
+            if seg in (".bash_history", ".zsh_history", ".history", ".bashrc", ".profile", ".zshrc"):
+                return True, f"Probe for hidden shell profile ({seg})"
+
+            # General: Any other hidden file or directory starting with '.' (except whitelisted .well-known)
+            if seg.startswith(".") and seg not in (".", ".."):
+                return True, f"Probe for hidden file/directory ({seg})"
+
+        # Sensitive backup/config probes that are common hidden file targets
+        sensitive_patterns = [
+            "/config.php.bak", "/config.php.save", "/config.php.old", "/config.php~",
+            "/wp-config.php.bak", "/wp-config.php.save", "/wp-config.php.old", "/wp-config.php~",
+            "/dump.sql", "/backup.sql", "/database.sql", "/db.sql"
+        ]
+        for pat in sensitive_patterns:
+            if pat in norm:
+                return True, f"Probe for sensitive database/backup file ({pat})"
+
+        return False, None
+
     def analyze_visitor_threat(self, visitor):
         ip = visitor.get("ip", "")
         if ip in self.banned_ips:
@@ -3512,6 +3618,26 @@ class SecurityShield:
         hits = visitor.get("hits", 0)
         code = visitor.get("code", 200)
 
+        # Check for hidden files (.env, .git, etc.)
+        is_hidden, hidden_reason = self.is_hidden_file_probe(path)
+        if is_hidden:
+            if self.auto_block_hidden_files and not self.is_private_ip(ip) and ip not in self.whitelist:
+                self.ban_ip(ip, reason=f"Auto-block: {hidden_reason}", path=path)
+                return {
+                    "level": "banned",
+                    "label": "⛔ BANNED",
+                    "color": "var(--crit)",
+                    "reason": f"Auto-block: {hidden_reason}",
+                    "is_banned": True
+                }
+            return {
+                "level": "threat_high",
+                "label": "🚨 Hidden File Probe",
+                "color": "var(--crit)",
+                "reason": hidden_reason,
+                "is_banned": False
+            }
+
         wp_patterns = ["/wp-login.php", "/xmlrpc.php", "/wp-admin", "/wp-content/plugins", "/wp-includes"]
         if any(p in path for p in wp_patterns):
             return {
@@ -3522,7 +3648,7 @@ class SecurityShield:
                 "is_banned": False
             }
 
-        exploit_patterns = ["/.env", "/.git", "/config.", "/phpmyadmin", "/pma", "/actuator", "/setup.php", "/backup.", "/dump.sql"]
+        exploit_patterns = ["/phpmyadmin", "/pma", "/actuator", "/setup.php", "/backup.", "/dump.sql"]
         if any(p in path for p in exploit_patterns):
             return {
                 "level": "threat_high",
@@ -4521,6 +4647,7 @@ class Engine:
         self.fleet_manager = FleetManager(cfg, cfg_path=cfg_path)
         self._load_state()
         self.auto_healer = AutoHealer(self)
+        self.alerts = None
 
     def _load_state(self):
         try:
@@ -4731,6 +4858,10 @@ class AlertManager:
         self.cfg = engine.cfg["alerts"]
         self.host = engine.cfg["hostname"]
         self.state = engine.alert_state
+        if hasattr(engine, "alerts"):
+            engine.alerts = self
+        if hasattr(engine, "security_shield") and engine.security_shield:
+            engine.security_shield.alert_callback = lambda ip, reason, path="": self.notify_auto_ban(ip, reason, path=path)
 
     def process(self, report):
         if not self.cfg.get("enabled"):
@@ -4808,6 +4939,68 @@ class AlertManager:
                 except Exception as e:
                     results[name] = {"ok": False, "detail": str(e)}
         return results
+
+    def notify_auto_ban(self, ip, reason, path=""):
+        if not self.cfg.get("enabled"):
+            return
+        now = time.time()
+        recent_bans = getattr(self, "_recent_ban_notifs", None)
+        if recent_bans is None:
+            recent_bans = {}
+            self._recent_ban_notifs = recent_bans
+        if now - recent_bans.get(ip, 0.0) < 3600:
+            return
+        recent_bans[ip] = now
+        if len(recent_bans) > 500:
+            self._recent_ban_notifs = {k: v for k, v in recent_bans.items() if now - v < 3600}
+
+        subject = f"🚨 SECURITY SHIELD: Auto-Blocked {ip} · {self.host}"
+        text = (
+            f"🚨 Security Shield Auto-Block on {self.host}\n"
+            f"──────────────────────────────────────────\n"
+            f"Blocked IP: {ip}\n"
+            f"Reason: {reason}\n"
+            f"{'Path: ' + path + chr(10) if path else ''}"
+            f"Firewall Rule: Dropped via iptables / ufw\n"
+            f"Time: {datetime.now(timezone.utc).astimezone().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"Action: Automatically added to blocked IPs list."
+        )
+        htmlbody = (
+            f"<div style='font-family:sans-serif;padding:18px;background:#0f172a;color:#f8fafc;border-radius:10px;'>"
+            f"<h3 style='color:#ef4444;margin:0 0 8px;'>🚨 Security Shield Auto-Block</h3>"
+            f"<p style='font-size:13px;color:#cbd5e1;margin:0 0 12px;'>A malicious scanner was automatically banned in the firewall for probing hidden files.</p>"
+            f"<table style='font-size:13px;border-collapse:collapse;width:100%;'>"
+            f"<tr><td style='padding:4px 0;color:#94a3b8;'>Server:</td><td><b>{self.host}</b></td></tr>"
+            f"<tr><td style='padding:4px 0;color:#94a3b8;'>Blocked IP:</td><td><code style='color:#f43f5e;'>{ip}</code></td></tr>"
+            f"<tr><td style='padding:4px 0;color:#94a3b8;'>Reason:</td><td>{reason}</td></tr>"
+            f"{f'<tr><td style=\"padding:4px 0;color:#94a3b8;\">Path:</td><td><code>{path}</code></td></tr>' if path else ''}"
+            f"<tr><td style='padding:4px 0;color:#94a3b8;'>Firewall Status:</td><td><b style='color:#10b981;'>DROPPED (Active)</b></td></tr>"
+            f"</table></div>"
+        )
+        threading.Thread(
+            target=self._send_raw_notification,
+            args=(subject, text, htmlbody),
+            daemon=True
+        ).start()
+
+    def _send_raw_notification(self, subject, text, htmlbody):
+        channels = [
+            ("telegram", self._telegram),
+            ("whatsapp", self._whatsapp),
+            ("email", self._email),
+            ("slack", self._slack),
+            ("ntfy", self._ntfy),
+            ("webhook", self._webhook),
+            ("desktop", self._desktop)
+        ]
+        dummy_rep = {"host": self.host, "score": 100, "status": "crit"}
+        for name, fn in channels:
+            cfg = self.cfg.get(name, {})
+            if isinstance(cfg, dict) and cfg.get("enabled"):
+                try:
+                    fn(subject, text, htmlbody, dummy_rep, [])
+                except Exception:
+                    pass
 
     # ── rendering ──────────────────────────────────────────────────────────
     def subject(self, events, report):
@@ -5933,7 +6126,10 @@ function renderVisitors(v){
         <div style="font-size:11.5px;color:var(--dim);">Concurrent connections to 80/443</div>
       </div>
       <div class="glass" style="padding:16px;">
-        <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">🛡️ Threat Shield</span>
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">🛡️ Threat Shield</span>
+          <span class="badge" style="font-size:9.5px;padding:2px 6px;color:var(--ok);background:rgba(37,227,154,.12);border-color:rgba(37,227,154,.25);">🔒 Auto-Block (.env/.git)</span>
+        </div>
         <div style="font-size:32px;font-weight:800;margin-top:4px;color:${v.threat_count > 0 ? 'var(--crit)' : 'var(--ok)'};">${fmtNum(v.threat_count || 0)}</div>
         <div style="font-size:11.5px;color:var(--dim);">${fmtNum(bannedList.length)} IP(s) currently blocked in firewall</div>
       </div>
@@ -6048,7 +6244,12 @@ function renderVisitors(v){
               ${bannedList.map(b => `
                 <tr>
                   <td><code style="font-size:13px;font-weight:700;color:var(--crit);">${esc(b.ip)}</code></td>
-                  <td style="font-size:12.5px;color:var(--txt);">${esc(b.reason || 'Manual block')}</td>
+                  <td style="font-size:12.5px;color:var(--txt);">
+                    ${b.reason && b.reason.toLowerCase().includes('auto-block') ? `
+                      <span class="badge" style="font-size:10px;padding:1px 6px;margin-right:6px;color:var(--crit);background:rgba(255,85,102,.12);border-color:rgba(255,85,102,.25);">AUTO-BLOCKED</span>
+                    ` : ''}
+                    ${esc(b.reason || 'Manual block')}
+                  </td>
                   <td style="font-size:12px;color:var(--dim);">${esc(b.date || '–')}</td>
                   <td><span class="badge" style="font-size:10.5px;color:var(--ok);background:rgba(37,227,154,.12);">✓ ACTIVE DROP</span></td>
                   <td style="text-align:right;">
@@ -8402,6 +8603,30 @@ class Handler(BaseHTTPRequestHandler):
             return self.client_address[0]
         return "127.0.0.1"
 
+    def _check_banned_client(self):
+        client_ip = self._client_ip()
+        if self.engine and hasattr(self.engine, "security_shield") and self.engine.security_shield:
+            shield = self.engine.security_shield
+            if client_ip in shield.banned_ips and not shield.is_private_ip(client_ip) and client_ip not in shield.whitelist:
+                return True, shield.banned_ips[client_ip].get("reason", "IP blocked by firewall")
+        return False, None
+
+    def _check_hidden_file_probe(self):
+        """
+        Inspects incoming HTTP request path for hidden file probes (.env, .git, etc.).
+        If detected, automatically bans external client IP in firewall and returns (True, reason).
+        """
+        raw_path = urllib.parse.urlparse(self.path).path
+        if self.engine and hasattr(self.engine, "security_shield") and self.engine.security_shield:
+            shield = self.engine.security_shield
+            is_hidden, reason = shield.is_hidden_file_probe(raw_path)
+            if is_hidden:
+                client_ip = self._client_ip()
+                if getattr(shield, "auto_block_hidden_files", True):
+                    shield.ban_ip(client_ip, reason=f"Auto-block: {reason}", path=raw_path)
+                return True, reason
+        return False, None
+
     def _check_origin(self):
         """Validates Origin and Referer against Host header on state-modifying requests."""
         host = (self.headers.get("Host") or "").lower()
@@ -8536,6 +8761,14 @@ class Handler(BaseHTTPRequestHandler):
 
     # ── routes ──
     def do_GET(self):
+        banned, ban_reason = self._check_banned_client()
+        if banned:
+            return self._send(403, {"error": f"Forbidden: {ban_reason}"})
+
+        is_hidden, reason = self._check_hidden_file_probe()
+        if is_hidden:
+            return self._send(403, {"error": f"Forbidden: {reason} - IP auto-blocked."})
+
         raw_path = urllib.parse.urlparse(self.path).path
         norm_path = posixpath.normpath(raw_path)
 
@@ -8627,7 +8860,28 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True, "alerts": get_masked_alerts_config(self.cfg.get("alerts", {}))})
         return self._send(404, {"error": "not found"})
 
+    def do_HEAD(self):
+        banned, _ = self._check_banned_client()
+        if banned:
+            return self._send(403, "")
+        is_hidden, _ = self._check_hidden_file_probe()
+        if is_hidden:
+            return self._send(403, "")
+        raw_path = urllib.parse.urlparse(self.path).path
+        norm_path = posixpath.normpath(raw_path)
+        if norm_path not in self.ALLOWED_GET_ROUTES:
+            return self._send(404, "")
+        return self._send(200, "")
+
     def do_POST(self):
+        banned, ban_reason = self._check_banned_client()
+        if banned:
+            return self._send(403, {"ok": False, "error": f"Forbidden: {ban_reason}"})
+
+        is_hidden, reason = self._check_hidden_file_probe()
+        if is_hidden:
+            return self._send(403, {"ok": False, "error": f"Forbidden: {reason} - IP auto-blocked."})
+
         raw_path = urllib.parse.urlparse(self.path).path
         norm_path = posixpath.normpath(raw_path)
 
@@ -9033,8 +9287,10 @@ def main():
 
     engine = Engine(cfg, cfg_path=args.config)
     alerts = AlertManager(engine) if cfg["alerts"]["enabled"] else None
+    engine.alerts = alerts
     if alerts:
         engine.auto_healer.set_alert_manager(alerts)
+        engine.security_shield.alert_callback = lambda ip, reason, path="": alerts.notify_auto_ban(ip, reason, path=path)
 
     if args.stress_test is not None:
         target_url = args.stress_test
