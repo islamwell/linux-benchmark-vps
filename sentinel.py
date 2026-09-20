@@ -49,8 +49,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.2.15"
-UPDATED = "2026-09-17 15:05"
+VERSION = "2.2.16"
+UPDATED = "2026-09-20 07:25"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -4954,13 +4954,16 @@ class AlertManager:
         if len(recent_bans) > 500:
             self._recent_ban_notifs = {k: v for k, v in recent_bans.items() if now - v < 3600}
 
+        path_line = f"Path: {path}\n" if path else ""
+        path_row = f"<tr><td style='padding:4px 0;color:#94a3b8;'>Path:</td><td><code>{path}</code></td></tr>" if path else ""
+
         subject = f"🚨 SECURITY SHIELD: Auto-Blocked {ip} · {self.host}"
         text = (
             f"🚨 Security Shield Auto-Block on {self.host}\n"
             f"──────────────────────────────────────────\n"
             f"Blocked IP: {ip}\n"
             f"Reason: {reason}\n"
-            f"{'Path: ' + path + chr(10) if path else ''}"
+            f"{path_line}"
             f"Firewall Rule: Dropped via iptables / ufw\n"
             f"Time: {datetime.now(timezone.utc).astimezone().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"Action: Automatically added to blocked IPs list."
@@ -4973,7 +4976,7 @@ class AlertManager:
             f"<tr><td style='padding:4px 0;color:#94a3b8;'>Server:</td><td><b>{self.host}</b></td></tr>"
             f"<tr><td style='padding:4px 0;color:#94a3b8;'>Blocked IP:</td><td><code style='color:#f43f5e;'>{ip}</code></td></tr>"
             f"<tr><td style='padding:4px 0;color:#94a3b8;'>Reason:</td><td>{reason}</td></tr>"
-            f"{f'<tr><td style=\"padding:4px 0;color:#94a3b8;\">Path:</td><td><code>{path}</code></td></tr>' if path else ''}"
+            f"{path_row}"
             f"<tr><td style='padding:4px 0;color:#94a3b8;'>Firewall Status:</td><td><b style='color:#10b981;'>DROPPED (Active)</b></td></tr>"
             f"</table></div>"
         )
