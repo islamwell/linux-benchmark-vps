@@ -49,8 +49,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.2.16"
-UPDATED = "2026-09-20 07:25"
+VERSION = "2.2.17"
+UPDATED = "2026-09-20 23:42"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -195,6 +195,13 @@ DEFAULTS = {
         "timeout_seconds": 5,
         "auto_discover_local_vhosts": True,
         "custom_sites": []
+    },
+    "port_monitor": {
+        "enabled": True,
+        "check_interval_seconds": 60,
+        "timeout_seconds": 3,
+        "auto_discover": True,
+        "custom_ports": []
     },
     "fleet": {
         "enabled": True,
@@ -3920,6 +3927,285 @@ class SiteMonitor:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  PORT MONITOR (TCP Service Availability Checker)
+# ─────────────────────────────────────────────────────────────────────────────
+
+WELL_KNOWN_PORTS = {
+    21: "FTP", 22: "SSH", 25: "SMTP", 53: "DNS",
+    80: "HTTP", 110: "POP3", 143: "IMAP", 443: "HTTPS",
+    465: "SMTPS", 587: "SMTP-TLS", 993: "IMAPS", 995: "POP3S",
+    3306: "MySQL", 5432: "PostgreSQL", 5984: "CouchDB",
+    6379: "Redis", 6380: "Redis-TLS", 8080: "HTTP-Alt",
+    8443: "HTTPS-Alt", 8686: "Sentinel", 9000: "PHP-FPM",
+    9200: "Elasticsearch", 9300: "ES-Transport",
+    11211: "Memcached", 27017: "MongoDB", 27018: "MongoDB-Alt",
+    5672: "RabbitMQ", 15672: "RabbitMQ-Mgmt",
+    2181: "Zookeeper", 6443: "K8s-API", 2379: "etcd",
+}
+
+
+class PortMonitor:
+    """
+    TCP port/service availability monitor.
+    Auto-discovers listening ports via `ss -tlnp` and supports custom
+    user-defined ports. Tracks per-port history and fires alert callbacks.
+    """
+
+    def __init__(self, cfg, state_dir="/var/lib/health-sentinel"):
+        self.cfg = cfg.get("port_monitor", {})
+        self.state_dir = state_dir
+        self.ports_file = os.path.join(state_dir, "port_monitor.json")
+        self.custom_ports = []     # list of {host, port, label, protocol}
+        self.results = {}          # "host:port" -> result dict
+        self.history = {}          # "host:port" -> deque(maxlen=30)
+        self.lock = threading.Lock()
+        self.last_check_time = 0.0
+        self.alert_callback = None  # wired by AlertManager
+
+    # ── persistence ──────────────────────────────────────────────────────────
+
+    def _load(self):
+        try:
+            if os.path.isfile(self.ports_file):
+                with open(self.ports_file) as f:
+                    data = json.load(f)
+                    self.custom_ports = data.get("custom_ports", [])
+        except Exception:
+            pass
+
+    def _save(self):
+        try:
+            os.makedirs(os.path.dirname(self.ports_file), exist_ok=True)
+            tmp = self.ports_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"custom_ports": self.custom_ports}, f, indent=2)
+            os.replace(tmp, self.ports_file)
+        except Exception:
+            pass
+
+    # ── discovery ────────────────────────────────────────────────────────────
+
+    def _discover_local_services(self):
+        """Auto-discover listening TCP ports via `ss -tlnp`."""
+        discovered = []
+        seen = set()
+        try:
+            out = subprocess.check_output(
+                ["ss", "-tlnp"], timeout=5, stderr=subprocess.DEVNULL
+            ).decode(errors="ignore")
+            for line in out.splitlines()[1:]:
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                local_addr = parts[3]
+                if local_addr.startswith("["):
+                    # IPv6 bracket notation: [::]:22
+                    port_str = local_addr.rsplit(":", 1)[-1]
+                    host_part = "127.0.0.1"
+                elif ":" in local_addr:
+                    pieces = local_addr.rsplit(":", 1)
+                    raw_h = pieces[0] or "0.0.0.0"
+                    host_part = "127.0.0.1" if raw_h in ("0.0.0.0", "*", "") else raw_h
+                    port_str = pieces[1]
+                else:
+                    continue
+                try:
+                    port = int(port_str)
+                except ValueError:
+                    continue
+                key = "127.0.0.1:{}".format(port)
+                if key in seen or port < 1 or port > 65535:
+                    continue
+                seen.add(key)
+                label = WELL_KNOWN_PORTS.get(port, "Port {}".format(port))
+                discovered.append({
+                    "host": "127.0.0.1",
+                    "port": port,
+                    "label": label,
+                    "protocol": "tcp",
+                    "is_custom": False,
+                })
+        except Exception:
+            pass
+        # Prioritise well-known ports; cap at 30 entries
+        known = [e for e in discovered if e["port"] in WELL_KNOWN_PORTS]
+        unknown = [e for e in discovered if e["port"] not in WELL_KNOWN_PORTS]
+        return (known + unknown)[:30]
+
+    # ── checking ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _port_key(host, port):
+        return "{}:{}".format(host, port)
+
+    def _check_single_port(self, entry):
+        host = entry.get("host", "127.0.0.1")
+        port = int(entry.get("port", 0))
+        label = entry.get("label") or WELL_KNOWN_PORTS.get(port, "Port {}".format(port))
+        protocol = entry.get("protocol", "tcp")
+        is_custom = bool(entry.get("is_custom", False))
+        key = self._port_key(host, port)
+        timeout = self.cfg.get("timeout_seconds", 3)
+
+        t0 = time.time()
+        is_open = False
+        error_msg = None
+
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                is_open = True
+        except ConnectionRefusedError:
+            error_msg = "Connection refused"
+        except socket.timeout:
+            error_msg = "Timeout"
+        except OSError as e:
+            error_msg = str(e)[:80]
+
+        latency_ms = round((time.time() - t0) * 1000.0, 1)
+
+        with self.lock:
+            if key not in self.history:
+                self.history[key] = deque(maxlen=30)
+            self.history[key].append(1 if is_open else 0)
+            hist = list(self.history[key])
+            prev = self.results.get(key, {})
+
+        uptime_pct = round((sum(hist) / len(hist)) * 100.0, 1) if hist else (100.0 if is_open else 0.0)
+        consec_fail = 0 if is_open else prev.get("consecutive_failures", 0) + 1
+
+        return {
+            "key": key,
+            "host": host,
+            "port": port,
+            "label": label,
+            "protocol": protocol,
+            "is_open": is_open,
+            "latency_ms": latency_ms if is_open else 0.0,
+            "uptime_pct": uptime_pct,
+            "consecutive_failures": consec_fail,
+            "error": error_msg if not is_open else None,
+            "is_custom": is_custom,
+            "checked_at": datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S"),
+        }
+
+    def _get_all_targets(self):
+        targets = []
+        seen = set()
+        for p in self.custom_ports:
+            key = self._port_key(p.get("host", "127.0.0.1"), p.get("port", 0))
+            if key not in seen:
+                seen.add(key)
+                entry = dict(p)
+                entry["is_custom"] = True
+                targets.append(entry)
+        if self.cfg.get("auto_discover", True):
+            for e in self._discover_local_services():
+                key = self._port_key(e["host"], e["port"])
+                if key not in seen:
+                    seen.add(key)
+                    targets.append(e)
+        return targets
+
+    def check_all(self, force=False):
+        now = time.time()
+        if not force and (now - self.last_check_time < 30.0) and self.results:
+            return self.get_summary()
+
+        targets = self._get_all_targets()
+        if not targets:
+            return self.get_summary()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(targets), 16)) as ex:
+            futures = {ex.submit(self._check_single_port, e): e for e in targets}
+            for fut in concurrent.futures.as_completed(futures):
+                try:
+                    res = fut.result()
+                    key = res["key"]
+                    with self.lock:
+                        self.results[key] = res
+                    # Fire alert callback when a port goes down (≥2 consecutive)
+                    if not res["is_open"] and res["consecutive_failures"] >= 2:
+                        if self.alert_callback:
+                            try:
+                                self.alert_callback(res)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+        self.last_check_time = time.time()
+        return self.get_summary()
+
+    def get_summary(self):
+        with self.lock:
+            port_list = list(self.results.values())
+
+        open_count = sum(1 for p in port_list if p.get("is_open"))
+        closed_count = sum(1 for p in port_list if not p.get("is_open"))
+        open_latencies = [p.get("latency_ms", 0) for p in port_list if p.get("is_open")]
+        avg_latency = round(sum(open_latencies) / len(open_latencies), 1) if open_latencies else 0.0
+
+        return {
+            "total": len(port_list),
+            "open_count": open_count,
+            "closed_count": closed_count,
+            "avg_latency_ms": avg_latency,
+            "ports": sorted(port_list, key=lambda p: (not p.get("is_open"), p.get("port", 0))),
+            "custom_ports": list(self.custom_ports),
+        }
+
+    # ── management ───────────────────────────────────────────────────────────
+
+    def add_port(self, host, port, label="", protocol="tcp"):
+        host = (host or "127.0.0.1").strip()
+        try:
+            port = int(port)
+            if not (1 <= port <= 65535):
+                return False, "Port must be between 1 and 65535."
+        except (TypeError, ValueError):
+            return False, "Invalid port number."
+        label = (label or WELL_KNOWN_PORTS.get(port, "Port {}".format(port))).strip()
+        protocol = protocol or "tcp"
+
+        with self.lock:
+            for p in self.custom_ports:
+                if p.get("host") == host and int(p.get("port", 0)) == port:
+                    return False, "{}:{} is already being monitored.".format(host, port)
+            self.custom_ports.append({"host": host, "port": port, "label": label, "protocol": protocol})
+            self._save()
+
+        threading.Thread(
+            target=self._check_and_store,
+            args=({"host": host, "port": port, "label": label, "protocol": protocol, "is_custom": True},),
+            daemon=True
+        ).start()
+        return True, "Port {}:{} ({}) added to monitor.".format(host, port, label)
+
+    def _check_and_store(self, entry):
+        res = self._check_single_port(entry)
+        with self.lock:
+            self.results[res["key"]] = res
+
+    def remove_port(self, host, port):
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            return False, "Invalid port number."
+        key = self._port_key(host, port)
+        with self.lock:
+            self.custom_ports = [
+                p for p in self.custom_ports
+                if not (p.get("host") == host and int(p.get("port", 0)) == port)
+            ]
+            self._save()
+            self.results.pop(key, None)
+            self.history.pop(key, None)
+        return True, "Port {}:{} removed from monitoring.".format(host, port)
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  SERVER DOCTOR (Plain English Diagnoses & Actionable Solutions)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -4643,6 +4929,7 @@ class Engine:
         self.benchmark_engine = BenchmarkEngine(cfg)
         self.capacity_benchmark = CapacityBenchmark(cfg)
         self.site_monitor = SiteMonitor(cfg, state_dir=state_dir)
+        self.port_monitor = PortMonitor(cfg, state_dir=state_dir)
         self.license_manager = LicenseManager(cfg)
         self.fleet_manager = FleetManager(cfg, cfg_path=cfg_path)
         self._load_state()
@@ -4667,6 +4954,7 @@ class Engine:
                     self.capacity_benchmark.last_result = data.get("last_capacity_benchmark")
             self.security_shield._load()
             self.site_monitor._load()
+            self.port_monitor._load()
         except Exception:
             pass
 
@@ -4734,6 +5022,7 @@ class Engine:
         try:
             self.security_shield._save()
             self.site_monitor._save()
+            self.port_monitor._save()
             try:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
             except OSError:
@@ -4862,6 +5151,8 @@ class AlertManager:
             engine.alerts = self
         if hasattr(engine, "security_shield") and engine.security_shield:
             engine.security_shield.alert_callback = lambda ip, reason, path="": self.notify_auto_ban(ip, reason, path=path)
+        if hasattr(engine, "port_monitor") and engine.port_monitor:
+            engine.port_monitor.alert_callback = lambda entry: self.notify_port_down(entry)
 
     def process(self, report):
         if not self.cfg.get("enabled"):
@@ -4983,6 +5274,65 @@ class AlertManager:
         threading.Thread(
             target=self._send_raw_notification,
             args=(subject, text, htmlbody),
+            daemon=True
+        ).start()
+
+    # Per-port alert rate-limit: max 1 alert per port per hour
+    _port_alert_times = {}
+
+    def notify_port_down(self, port_entry):
+        """Send a human-readable alert when a monitored port becomes unreachable."""
+        if not self.cfg.get("enabled"):
+            return
+        key = port_entry.get("key", "")
+        now = time.time()
+        last = self.__class__._port_alert_times.get(key, 0)
+        if now - last < 3600:
+            return
+        self.__class__._port_alert_times[key] = now
+
+        label = port_entry.get("label", "Service")
+        host = port_entry.get("host", "?")
+        port = port_entry.get("port", "?")
+        consec = port_entry.get("consecutive_failures", 0)
+        error = port_entry.get("error") or "Connection failed"
+        ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+        subject = "Port Down: {} ({}:{}) on {}".format(label, host, port, self.host)
+        text = (
+            "Service Down Alert\n"
+            "------------------\n"
+            "Server:             {host}\n"
+            "Service:            {label}\n"
+            "Address:            {host_addr}:{port}\n"
+            "Status:             UNREACHABLE\n"
+            "Consecutive Fails:  {consec}\n"
+            "Error:              {error}\n"
+            "Time:               {ts}\n\n"
+            "Please check this service immediately to restore availability."
+        ).format(
+            host=self.host, label=label, host_addr=host,
+            port=port, consec=consec, error=error, ts=ts
+        )
+        html = (
+            "<h2 style='color:#ff5566;margin-bottom:8px;'>Port Down: {label}</h2>"
+            "<table style='border-collapse:collapse;font-family:monospace;font-size:13px;'>"
+            "<tr><td style='padding:4px 12px 4px 0;color:#888;'>Server</td><td><b>{host}</b></td></tr>"
+            "<tr><td style='padding:4px 12px 4px 0;color:#888;'>Service</td><td><b>{label}</b></td></tr>"
+            "<tr><td style='padding:4px 12px 4px 0;color:#888;'>Address</td><td><b>{host_addr}:{port}</b></td></tr>"
+            "<tr><td style='padding:4px 12px 4px 0;color:#888;'>Status</td>"
+            "<td><span style='color:#ff5566;font-weight:bold;'>UNREACHABLE</span></td></tr>"
+            "<tr><td style='padding:4px 12px 4px 0;color:#888;'>Consecutive Fails</td><td>{consec}</td></tr>"
+            "<tr><td style='padding:4px 12px 4px 0;color:#888;'>Error</td><td>{error}</td></tr>"
+            "<tr><td style='padding:4px 12px 4px 0;color:#888;'>Time</td><td>{ts}</td></tr>"
+            "</table>"
+        ).format(
+            label=label, host=self.host, host_addr=host,
+            port=port, consec=consec, error=error, ts=ts
+        )
+        threading.Thread(
+            target=self._send_raw_notification,
+            args=(subject, text, html),
             daemon=True
         ).start()
 
@@ -5595,6 +5945,7 @@ body.role-viewer .admin-only{display:none!important}
   <button class="tab-btn active" id="tab-overview-btn" onclick="switchTab('overview')"><svg viewBox="0 0 24 24"><path d="M3 12h18M3 6h18M3 18h18"/></svg>System Health</button>
   <button class="tab-btn" id="tab-fleet-btn" onclick="switchTab('fleet')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/><circle cx="12" cy="12" r="3"/></svg>Fleet Hub <span class="tab-badge" id="badge-fleet">0</span></button>
   <button class="tab-btn" id="tab-sites-btn" onclick="switchTab('sites')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>Websites &amp; Uptime <span class="tab-badge" id="badge-sites">0</span></button>
+  <button class="tab-btn" id="tab-ports-btn" onclick="switchTab('ports')"><svg viewBox="0 0 24 24"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/><line x1="12" y1="12" x2="12" y2="16"/><line x1="10" y1="14" x2="14" y2="14"/></svg>Port Services <span class="tab-badge" id="badge-ports">0</span></button>
   <button class="tab-btn" id="tab-visitors-btn" onclick="switchTab('visitors')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3v18M3 12h18"/></svg>Live Visitors &amp; Geo <span class="tab-badge" id="badge-visitors">0</span></button>
   <button class="tab-btn" id="tab-benchmark-btn" onclick="switchTab('benchmark')"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>VPS Benchmark <span class="tab-badge" id="badge-bench">Ready</span></button>
   <button class="tab-btn" id="tab-incidents-btn" onclick="switchTab('incidents')"><svg viewBox="0 0 24 24"><path d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>Incidents <span class="tab-badge" id="badge-inc">0</span></button>
@@ -5644,6 +5995,7 @@ body.role-viewer .admin-only{display:none!important}
 
  <div id="view-fleet" style="display:none;"></div>
  <div id="view-sites" style="display:none;"></div>
+ <div id="view-ports" style="display:none;"></div>
  <div id="view-visitors" style="display:none;"></div>
  <div id="view-benchmark" style="display:none;"></div>
  <div id="view-incidents" style="display:none;"></div>
@@ -5675,7 +6027,7 @@ const ICONS = {
  alert:'<path d="M12 3l9.5 17H2.5L12 3z"/><path d="M12 9v5M12 17h.01"/>'
 };
 const CLR={ok:'var(--ok)',warn:'var(--warn)',crit:'var(--crit)',info:'var(--acc)'};
-let REPORT=null, HIST=[], INCIDENTS=[], FILTER='all', AUTO=true, TIMER=null, OPEN=new Set(), ACTIVE_RANGES={cpu:'10m',mem:'10m',load:'10m',disk:'10m'}, VISITORS=null, BENCHMARK=null, CAPACITY_BENCHMARK=null, BENCH_SUBTAB='capacity', CAPACITY_TIMER=null, CAP_SELECTED_MODE='quick', DOCTOR=null, SITES=null, SECURITY=null, CURRENT_TAB='overview', BRANDING=(BOOT&&BOOT.branding)||null, FLEET=null, LICENSE=(BOOT&&BOOT.license)||null;
+let REPORT=null, HIST=[], INCIDENTS=[], FILTER='all', AUTO=true, TIMER=null, OPEN=new Set(), ACTIVE_RANGES={cpu:'10m',mem:'10m',load:'10m',disk:'10m'}, VISITORS=null, BENCHMARK=null, CAPACITY_BENCHMARK=null, BENCH_SUBTAB='capacity', CAPACITY_TIMER=null, CAP_SELECTED_MODE='quick', DOCTOR=null, SITES=null, PORTS=null, SECURITY=null, CURRENT_TAB='overview', BRANDING=(BOOT&&BOOT.branding)||null, FLEET=null, LICENSE=(BOOT&&BOOT.license)||null;
 
 const $=s=>document.querySelector(s), esc=s=>String(s==null?'':s)
  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -6028,7 +6380,7 @@ function switchTab(tabId){
   const btn = $('#tab-' + tabId + '-btn');
   if(btn) btn.classList.add('active');
 
-  const views = ['overview', 'fleet', 'sites', 'visitors', 'benchmark', 'incidents'];
+  const views = ['overview', 'fleet', 'sites', 'ports', 'visitors', 'benchmark', 'incidents'];
   views.forEach(v => {
     const el = $('#view-' + v);
     if(el) el.style.display = (v === tabId) ? 'block' : 'none';
@@ -6036,6 +6388,7 @@ function switchTab(tabId){
 
   if(tabId === 'fleet') renderFleet(FLEET);
   if(tabId === 'sites' && SITES) renderSites(SITES);
+  if(tabId === 'ports') renderPorts(PORTS);
   if(tabId === 'visitors' && VISITORS) renderVisitors(VISITORS);
   if(tabId === 'benchmark') renderBenchmark(BENCHMARK);
   if(tabId === 'incidents') renderIncidentsView();
@@ -7368,6 +7721,208 @@ async function removeSite(url){
   }
 }
 
+// ── Port Monitor ──────────────────────────────────────────────────────────────
+
+function renderPorts(p) {
+  const view = $('#view-ports');
+  if (!view) return;
+
+  if (!p || p.total === 0) {
+    const badge = $('#badge-ports');
+    if (badge) badge.textContent = '0';
+    view.innerHTML = `
+      <div style="text-align:center;padding:60px 20px;color:var(--mut);">
+        <div style="font-size:48px;margin-bottom:16px;">🔌</div>
+        <h3 style="font-size:18px;margin-bottom:8px;color:var(--txt);">No Ports Discovered Yet</h3>
+        <p style="font-size:13.5px;margin-bottom:20px;">Click <b>⚡ Check Now</b> to auto-discover listening services, or add a custom port to monitor.</p>
+        ${IS_VIEWER ? '' : `<button class="btn primary" onclick="checkPortsNow()" style="margin-right:10px;">⚡ Check Now</button>
+        <button class="btn" onclick="openAddPortModal()">+ Add Custom Port</button>`}
+      </div>`;
+    return;
+  }
+
+  const badge = $('#badge-ports');
+  if (badge) badge.textContent = p.closed_count > 0 ? p.open_count + '/' + p.total : p.open_count + '';
+
+  view.innerHTML = `
+    <!-- Stat Cards -->
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:20px;">
+      <div class="glass" style="padding:16px;">
+        <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">🔌 Monitored Ports</span>
+        <div style="font-size:32px;font-weight:800;margin-top:4px;">${fmtNum(p.total)}</div>
+        <div style="font-size:11.5px;color:var(--dim);">Auto-discovered + custom</div>
+      </div>
+      <div class="glass" style="padding:16px;">
+        <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">🟢 Open / Listening</span>
+        <div style="font-size:32px;font-weight:800;margin-top:4px;color:var(--ok);">${fmtNum(p.open_count)}</div>
+        <div style="font-size:11.5px;color:var(--dim);">Accepting TCP connections</div>
+      </div>
+      <div class="glass" style="padding:16px;">
+        <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">🔴 Closed / Down</span>
+        <div style="font-size:32px;font-weight:800;margin-top:4px;color:${p.closed_count > 0 ? 'var(--crit)' : 'var(--ok)'};">${fmtNum(p.closed_count)}</div>
+        <div style="font-size:11.5px;color:var(--dim);">${p.closed_count > 0 ? 'Alert: service unreachable' : 'All services reachable'}</div>
+      </div>
+      <div class="glass" style="padding:16px;">
+        <span style="font-size:11px;text-transform:uppercase;color:var(--mut);font-weight:700;">⚡ Avg Response</span>
+        <div style="font-size:32px;font-weight:800;margin-top:4px;color:var(--acc);">${fmtNum(Math.round(p.avg_latency_ms))} <small style="font-size:14px;color:var(--mut);">ms</small></div>
+        <div style="font-size:11.5px;color:var(--dim);">TCP connect latency</div>
+      </div>
+    </div>
+
+    <!-- Action Bar -->
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:12px;">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <h3 style="font-size:16px;margin:0;">TCP Services &amp; Port Health</h3>
+        <span style="font-size:12px;color:var(--dim);">Auto-discovered via ss · alerts on failure</span>
+      </div>
+      <div style="display:flex;gap:10px;">
+        ${IS_VIEWER ? '' : `<button class="btn" onclick="openAddPortModal()" style="height:34px;font-size:12.5px;">+ Add Port</button>`}
+        <button class="btn primary" id="check-ports-btn" onclick="checkPortsNow()" style="height:34px;font-size:12.5px;">
+          <svg viewBox="0 0 24 24" style="width:14px;height:14px;"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 4v5h-5"/></svg> ⚡ Check All Now
+        </button>
+      </div>
+    </div>
+
+    <!-- Port Cards Grid -->
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px;">
+      ${p.ports.map(port => {
+        const isOpen = port.is_open;
+        const latColor = port.latency_ms < 10 ? 'var(--ok)' : (port.latency_ms < 100 ? 'var(--warn)' : 'var(--crit)');
+        const borderColor = isOpen ? 'var(--stroke)' : 'color-mix(in srgb,var(--crit) 35%,transparent)';
+        return `
+          <div class="glass" style="padding:18px;display:flex;flex-direction:column;justify-content:space-between;gap:12px;border-color:${borderColor};">
+            <div>
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;gap:8px;">
+                <div style="font-size:15px;font-weight:700;color:var(--txt);display:flex;align-items:center;gap:6px;">
+                  <span style="font-size:18px;">${isOpen ? '🟢' : '🔴'}</span>
+                  <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px;" title="${esc(port.label)}">${esc(port.label)}</span>
+                </div>
+                ${isOpen
+                  ? `<span class="badge" style="color:var(--ok);background:rgba(37,227,154,.15);font-size:11px;">OPEN</span>`
+                  : `<span class="badge" style="color:var(--crit);background:rgba(255,85,102,.15);font-size:11px;">CLOSED</span>`}
+              </div>
+
+              <div style="font-size:12px;color:var(--mut);margin-bottom:10px;font-family:monospace;">
+                ${esc(port.host)}:<b style="color:var(--txt);">${port.port}</b>
+                <span style="margin-left:6px;padding:1px 6px;background:var(--card2);border-radius:4px;font-size:10px;text-transform:uppercase;">${esc(port.protocol)}</span>
+              </div>
+
+              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+                ${isOpen ? `<span class="badge" style="font-size:11px;color:${latColor};background:color-mix(in srgb,${latColor} 14%,transparent);">⚡ ${port.latency_ms} ms</span>` : ''}
+                <span class="badge" style="font-size:11px;color:var(--dim);background:var(--card2);">📈 ${port.uptime_pct}%</span>
+                ${!isOpen && port.error ? `<span class="badge" style="font-size:11px;color:var(--crit);background:rgba(255,85,102,.12);">⚠ ${esc(port.error)}</span>` : ''}
+                ${port.is_custom ? `<span class="badge" style="font-size:10px;color:var(--acc);background:color-mix(in srgb,var(--acc) 12%,transparent);">CUSTOM</span>` : ''}
+              </div>
+            </div>
+
+            <div style="display:flex;align-items:center;justify-content:space-between;padding-top:10px;border-top:1px solid var(--stroke);font-size:11.5px;color:var(--dim);">
+              <span>Checked: ${esc(port.checked_at || '–')}</span>
+              <div style="display:flex;gap:6px;">
+                <button class="btn" onclick="checkSinglePort('${esc(port.host)}',${port.port})" style="height:24px;padding:0 8px;font-size:11px;">🔄 Test</button>
+                ${(!IS_VIEWER && port.is_custom) ? `<button class="btn" onclick="removePort('${esc(port.host)}',${port.port})" style="height:24px;padding:0 8px;font-size:11px;color:var(--crit);">🗑️</button>` : ''}
+              </div>
+            </div>
+          </div>
+        `;
+      }).join('')}
+    </div>
+  `;
+}
+
+async function checkPortsNow() {
+  const b = $('#check-ports-btn');
+  if (b) b.disabled = true;
+  toast('Checking Ports', 'Testing all TCP services…', 'info');
+  try {
+    const r = await api('/api/ports/check', {method: 'POST'});
+    if (r.ok && r.ports) {
+      PORTS = r.ports;
+      renderPorts(PORTS);
+      toast('Ports Checked', r.ports.closed_count > 0
+        ? r.ports.closed_count + ' service(s) unreachable!'
+        : 'All ' + r.ports.open_count + ' services are online', r.ports.closed_count > 0 ? 'crit' : 'ok');
+    }
+  } catch(e) {
+    toast('Check Failed', e.message, 'crit');
+  } finally {
+    if (b) b.disabled = false;
+  }
+}
+
+async function checkSinglePort(host, port) {
+  toast('Testing Port', host + ':' + port + '…', 'info');
+  try {
+    const r = await api('/api/ports/add', {method:'POST', body:JSON.stringify({host,port,label:'',protocol:'tcp'})});
+    if (r.ports) { PORTS = r.ports; renderPorts(PORTS); }
+    toast('Port Tested', host + ':' + port + ' result updated', 'ok');
+  } catch(e) {
+    toast('Test Failed', e.message, 'crit');
+  }
+}
+
+function openAddPortModal() {
+  const modal = document.createElement('div');
+  modal.id = 'add-port-modal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:999;backdrop-filter:blur(8px);display:grid;place-items:center;padding:20px;';
+  modal.innerHTML = `
+    <div class="glass" style="max-width:460px;width:100%;padding:24px;background:var(--bg2);">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+        <h2 style="font-size:18px;">+ Add Port to Monitor</h2>
+        <button class="btn" onclick="this.closest('#add-port-modal').remove()">✕</button>
+      </div>
+      <div style="font-size:13px;color:var(--mut);margin-bottom:14px;">Monitor any TCP service by host and port number. Sentinel will alert you if it goes unreachable.</div>
+      <div style="display:grid;grid-template-columns:1fr 100px;gap:10px;margin-bottom:12px;">
+        <input type="text" id="new-port-host" placeholder="127.0.0.1 or hostname" value="127.0.0.1"
+          style="padding:10px 14px;border-radius:10px;border:1px solid var(--stroke);background:var(--card);color:var(--txt);font-size:14px;">
+        <input type="number" id="new-port-port" placeholder="Port" min="1" max="65535"
+          style="padding:10px 14px;border-radius:10px;border:1px solid var(--stroke);background:var(--card);color:var(--txt);font-size:14px;">
+      </div>
+      <input type="text" id="new-port-label" placeholder="Label (e.g. MySQL, Redis) — auto-filled if blank"
+        style="width:100%;padding:10px 14px;border-radius:10px;border:1px solid var(--stroke);background:var(--card);color:var(--txt);font-size:14px;margin-bottom:16px;box-sizing:border-box;">
+      <div style="display:flex;justify-content:flex-end;gap:10px;">
+        <button class="btn" onclick="this.closest('#add-port-modal').remove()">Cancel</button>
+        <button class="btn primary" onclick="submitAddPort()">Add &amp; Test Now</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+  setTimeout(() => { const inp = $('#new-port-port'); if(inp) inp.focus(); }, 50);
+}
+
+async function submitAddPort() {
+  const host = ($('#new-port-host') || {}).value || '127.0.0.1';
+  const port = parseInt(($('#new-port-port') || {}).value || '0');
+  const label = ($('#new-port-label') || {}).value || '';
+  if (!port || port < 1 || port > 65535) {
+    toast('Invalid Port', 'Please enter a port number between 1 and 65535', 'warn');
+    return;
+  }
+  try {
+    const r = await api('/api/ports/add', {method:'POST', body:JSON.stringify({host, port, label, protocol:'tcp'})});
+    if (r.ok) {
+      toast('Port Added', r.message, 'ok');
+      const m = $('#add-port-modal'); if(m) m.remove();
+      PORTS = r.ports; renderPorts(PORTS);
+    } else {
+      toast('Error', r.message || 'Failed to add port', 'crit');
+    }
+  } catch(e) {
+    toast('Error Adding Port', e.message, 'crit');
+  }
+}
+
+async function removePort(host, port) {
+  if (!confirm('Remove ' + host + ':' + port + ' from monitoring?')) return;
+  try {
+    const r = await api('/api/ports/remove', {method:'POST', body:JSON.stringify({host, port})});
+    if (r.ok) {
+      toast('Port Removed', r.message, 'ok');
+      PORTS = r.ports; renderPorts(PORTS);
+    }
+  } catch(e) {
+    toast('Error Removing Port', e.message, 'crit');
+  }
+}
+
 async function scan(){
   const b=$('#scanBtn');b.disabled=true;$('#scanIco').classList.add('spin');
   try{
@@ -7375,8 +7930,8 @@ async function scan(){
     HIST=r.history||HIST;INCIDENTS=r.incidents||INCIDENTS;
     VISITORS=r.visitors||VISITORS;BENCHMARK=r.benchmark||BENCHMARK;DOCTOR=r.server_doctor||DOCTOR;
     if(r.capacity_benchmark && r.capacity_benchmark.last_result) CAPACITY_BENCHMARK = r.capacity_benchmark.last_result;
-    SITES=r.sites||SITES;SECURITY=r.security||SECURITY;
-    render(r.report);renderSites(SITES);renderVisitors(VISITORS);renderBenchmark(BENCHMARK);renderServerDoctor(DOCTOR);
+    SITES=r.sites||SITES;PORTS=r.ports||PORTS;SECURITY=r.security||SECURITY;
+    render(r.report);renderSites(SITES);renderPorts(PORTS);renderVisitors(VISITORS);renderBenchmark(BENCHMARK);renderServerDoctor(DOCTOR);
     if(CURRENT_TAB==='incidents') renderIncidentsView();
     const bad=r.report.counts.crit+r.report.counts.warn;
     toast('Scan complete',bad?`${bad} issue(s) need attention`:'All ten checks healthy',bad?(r.report.counts.crit?'crit':'warn'):'ok');
@@ -7398,10 +7953,10 @@ async function load(){
     HIST=r.history||[];INCIDENTS=r.incidents||[];
     VISITORS=r.visitors||null;BENCHMARK=r.benchmark||null;DOCTOR=r.server_doctor||null;
     if(r.capacity_benchmark && r.capacity_benchmark.last_result) CAPACITY_BENCHMARK = r.capacity_benchmark.last_result;
-    SITES=r.sites||null;SECURITY=r.security||null;
+    SITES=r.sites||null;PORTS=r.ports||null;SECURITY=r.security||null;
     FLEET=r.fleet||null;
     if(r.report) render(r.report);
-    renderFleet(FLEET);renderSites(SITES);renderVisitors(VISITORS);renderBenchmark(BENCHMARK);renderServerDoctor(DOCTOR);
+    renderFleet(FLEET);renderSites(SITES);renderPorts(PORTS);renderVisitors(VISITORS);renderBenchmark(BENCHMARK);renderServerDoctor(DOCTOR);
     if(CURRENT_TAB==='incidents') renderIncidentsView();
   }catch(e){
     console.error('Sentinel load error:', e);
@@ -8584,7 +9139,7 @@ class Handler(BaseHTTPRequestHandler):
         "/api/benchmark/capacity", "/api/security/banned", "/api/sites",
         "/api/server-doctor", "/api/report/html", "/api/auto-heal",
         "/api/history", "/api/incidents", "/api/php-services", "/metrics",
-        "/api/system/update-check", "/api/alerts/config"
+        "/api/system/update-check", "/api/alerts/config", "/api/ports"
     }
 
     ALLOWED_POST_ROUTES = {
@@ -8594,7 +9149,7 @@ class Handler(BaseHTTPRequestHandler):
         "/api/auto-heal/toggle", "/api/php-action", "/api/system-action",
         "/api/test-alert", "/api/license/activate", "/api/fleet/add",
         "/api/fleet/remove", "/api/fleet/poll", "/api/system/update-run",
-        "/api/alerts/config"
+        "/api/alerts/config", "/api/ports/check", "/api/ports/add", "/api/ports/remove"
     }
 
     def log_message(self, *a):
@@ -8757,6 +9312,7 @@ class Handler(BaseHTTPRequestHandler):
                 "banned_ips": self.engine.security_shield.list_banned()
             },
             "sites": self.engine.site_monitor.get_summary(),
+            "ports": self.engine.port_monitor.get_summary(),
             "license": self.engine.license_manager.get_status(),
             "fleet": self.engine.fleet_manager.get_summary(),
             "server_doctor": generate_server_doctor(rep)
@@ -8824,6 +9380,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"banned_ips": self.engine.security_shield.list_banned()})
         if norm_path == "/api/sites":
             return self._send(200, self.engine.site_monitor.get_summary())
+        if norm_path == "/api/ports":
+            return self._send(200, self.engine.port_monitor.get_summary())
         if norm_path == "/api/server-doctor":
             rep = self.engine.get_report()
             return self._send(200, generate_server_doctor(rep))
@@ -9022,6 +9580,37 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": ok,
                 "message": msg,
                 "sites": self.engine.site_monitor.get_summary()
+            })
+        if norm_path == "/api/ports/check":
+            summary = self.engine.port_monitor.check_all(force=True)
+            return self._send(200, {"ok": True, "ports": summary})
+        if norm_path == "/api/ports/add":
+            try:
+                body = json.loads(data_bytes.decode() or "{}")
+            except Exception as e:
+                return self._send(400, {"ok": False, "error": f"Invalid JSON body: {e}"})
+            host = (body.get("host") or "127.0.0.1").strip()
+            port = body.get("port")
+            label = (body.get("label") or "").strip()
+            protocol = (body.get("protocol") or "tcp").strip()
+            ok, msg = self.engine.port_monitor.add_port(host, port, label, protocol)
+            return self._send(200 if ok else 400, {
+                "ok": ok,
+                "message": msg,
+                "ports": self.engine.port_monitor.get_summary()
+            })
+        if norm_path == "/api/ports/remove":
+            try:
+                body = json.loads(data_bytes.decode() or "{}")
+            except Exception as e:
+                return self._send(400, {"ok": False, "error": f"Invalid JSON body: {e}"})
+            host = (body.get("host") or "127.0.0.1").strip()
+            port = body.get("port")
+            ok, msg = self.engine.port_monitor.remove_port(host, port)
+            return self._send(200 if ok else 400, {
+                "ok": ok,
+                "message": msg,
+                "ports": self.engine.port_monitor.get_summary()
             })
         if norm_path == "/api/scan":
             rep = self.engine.scan(force=True)
@@ -9294,6 +9883,7 @@ def main():
     if alerts:
         engine.auto_healer.set_alert_manager(alerts)
         engine.security_shield.alert_callback = lambda ip, reason, path="": alerts.notify_auto_ban(ip, reason, path=path)
+        engine.port_monitor.alert_callback = lambda entry: alerts.notify_port_down(entry)
 
     if args.stress_test is not None:
         target_url = args.stress_test
