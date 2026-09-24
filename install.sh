@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — Automated Installer & Service Manager
-# Version: 2.2.19 (updated 2026-09-24 12:51)
+# Version: 2.2.20 (updated 2026-09-24 15:55)
 # ==============================================================================
 
 set -euo pipefail
 
-VERSION="2.2.19"
-UPDATED="2026-09-24 12:51"
+VERSION="2.2.20"
+UPDATED="2026-09-24 15:55"
 
 # Target installation paths
 INSTALL_DIR="/opt/health-sentinel"
@@ -470,48 +470,102 @@ if [ "$ENABLE_SSL" = true ]; then
     fi
 fi
 
-# Server IP detection
-SERVER_IP=$(curl -s -m 3 https://api.ipify.org 2>/dev/null || curl -s -m 3 https://icanhazip.com 2>/dev/null || curl -s -m 3 https://ifconfig.me 2>/dev/null || ip route get 1.1.1.1 2>/dev/null | awk '{print $7}' || hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
-[ -z "$SERVER_IP" ] && SERVER_IP="127.0.0.1"
+python3 - "${CONFIG_FILE}" "${VERSION}" <<'PYEOF'
+import json, sys, socket, urllib.request
 
-TARGET_HOST="${SERVER_IP}"
-if [ "$TARGET_HOST" = "0.0.0.0" ] || [ "$TARGET_HOST" = "127.0.0.1" ]; then
-    LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-    [ -n "$LOCAL_IP" ] && [ "$LOCAL_IP" != "127.0.0.1" ] && TARGET_HOST="$LOCAL_IP"
-fi
+config_path = sys.argv[1]
+version = sys.argv[2] if len(sys.argv) > 2 else "2.2.20"
 
-ADMIN_QUERY=""
-[ -n "$FINAL_ADMIN_TOKEN" ] && ADMIN_QUERY="/?token=${FINAL_ADMIN_TOKEN}"
-VIEW_QUERY=""
-[ -n "$FINAL_VIEW_TOKEN" ] && VIEW_QUERY="/?token=${FINAL_VIEW_TOKEN}"
+try:
+    with open(config_path) as f:
+        cfg = json.load(f)
+except Exception:
+    cfg = {}
 
-# Success Display
-echo ""
-echo -e "${C_GREEN}╔════════════════════════════════════════════════════════════════════════════╗${C_RESET}"
-echo -e "${C_GREEN}║  ${C_BOLD}✓  INSTALLATION SUCCESSFUL · LINUX HEALTH SENTINEL v${VERSION}${C_RESET}${C_GREEN}                 ║${C_RESET}"
-echo -e "${C_GREEN}╚════════════════════════════════════════════════════════════════════════════╝${C_RESET}"
-echo ""
-echo -e "  ▸ Dashboard Network: Bound to ${C_GREEN}${FINAL_BIND}:${FINAL_PORT}${C_RESET}\n"
-echo -e "  ${C_BOLD}🚀 DIRECT DASHBOARD URL (Click to Open in Browser):${C_RESET}"
-echo -e "     ${C_GREEN}http://${TARGET_HOST}:${FINAL_PORT}${ADMIN_QUERY}${C_RESET}"
-echo -e "     ${C_DIM}Permissions: Full system fixes, PHP recycle, benchmarks, firewall bans${C_RESET}"
-echo ""
-if [ -n "$FINAL_VIEW_TOKEN" ]; then
-    echo -e "  ${C_BOLD}👁️ View-Only Dashboard (Client & Team Access):${C_RESET}"
-    echo -e "     ${C_BLUE}http://${TARGET_HOST}:${FINAL_PORT}${VIEW_QUERY}${C_RESET}"
-    echo -e "     ${C_DIM}Permissions: Real-time health metrics, uptime status, reports (zero mutations)${C_RESET}"
-    echo ""
-fi
-echo -e "  ${C_BOLD}Prometheus Metrics:${C_RESET}    ${C_BLUE}http://127.0.0.1:${FINAL_PORT}/metrics${C_RESET}"
-echo -e "  ${C_BOLD}Config File:${C_RESET}           ${C_DIM}${CONFIG_FILE}${C_RESET}"
-echo -e "  ${C_BOLD}Service Status:${C_RESET}        ${C_DIM}systemctl status sentinel${C_RESET}"
-echo ""
-if [ "$FINAL_BIND" = "127.0.0.1" ] || [ "$FINAL_BIND" = "localhost" ]; then
-    echo -e "  ${C_BOLD}🔒 Secure Local Access (SSH Tunnel from your laptop):${C_RESET}"
-    echo -e "     ${C_DIM}If port ${FINAL_PORT} is not exposed publicly, run on your laptop terminal:${C_RESET}"
-    echo -e "     ${C_BLUE}ssh -L ${FINAL_PORT}:127.0.0.1:${FINAL_PORT} root@${TARGET_HOST}${C_RESET}"
-    echo -e "     ${C_DIM}Then open in your laptop browser:${C_RESET} ${C_GREEN}http://localhost:${FINAL_PORT}${ADMIN_QUERY}${C_RESET}\n"
-fi
+web = cfg.get("web", {})
+port = web.get("port", 8686)
+bind = web.get("bind", "127.0.0.1")
+admin_token = (web.get("admin_token") or web.get("token") or "").strip()
+view_token = (web.get("view_token") or "").strip()
+cfg_hostname = (cfg.get("hostname") or "").strip()
+
+# Detect public IP via fast HTTP check
+public_ip = ""
+for url in ["https://api.ipify.org", "https://icanhazip.com", "https://ifconfig.me/ip"]:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "curl/7.68.0"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            ip = resp.read().decode("utf-8").strip()
+            if ip and (len(ip.split(".")) == 4 or ":" in ip):
+                public_ip = ip
+                break
+    except Exception:
+        pass
+
+# Detect local IP safely
+local_ip = ""
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.connect(("8.8.8.8", 80))
+    local_ip = s.getsockname()[0]
+    s.close()
+except Exception:
+    pass
+
+sys_hostname = ""
+try:
+    sys_hostname = socket.gethostname()
+except Exception:
+    pass
+
+target_host = public_ip or local_ip or cfg_hostname or sys_hostname or "127.0.0.1"
+
+admin_query = f"/?token={admin_token}" if admin_token else ""
+view_query = f"/?token={view_token}" if view_token else ""
+
+dashboard_url = f"http://{target_host}:{port}{admin_query}"
+view_url = f"http://{target_host}:{port}{view_query}"
+
+# ANSI Colors
+C_GREEN = "\033[38;5;42m"
+C_BLUE = "\033[38;5;111m"
+C_BOLD = "\033[1m"
+C_DIM = "\033[38;5;245m"
+C_RESET = "\033[0m"
+
+print(f"\n{C_GREEN}╔════════════════════════════════════════════════════════════════════════════╗{C_RESET}")
+print(f"{C_GREEN}║  {C_BOLD}✓  INSTALLATION SUCCESSFUL — LINUX HEALTH SENTINEL v{version:<21}{C_RESET}{C_GREEN}║{C_RESET}")
+print(f"{C_GREEN}╚════════════════════════════════════════════════════════════════════════════╝{C_RESET}\n")
+
+print(f"  ▸ Service Status: {C_GREEN}active (running){C_RESET}")
+print(f"  ▸ Network Bind  : {bind}:{port}")
+if sys_hostname:
+    print(f"  ▸ Hostname      : {sys_hostname}")
+print()
+
+print(f"  {C_BOLD}🚀 DIRECT DASHBOARD URL (Click to Open in Browser):{C_RESET}")
+print(f"  {C_GREEN}{dashboard_url}{C_RESET}\n")
+
+if view_token:
+    print(f"  {C_BOLD}👁️ Client / View-Only Dashboard URL:{C_RESET}")
+    print(f"  {C_BLUE}{view_url}{C_RESET}\n")
+
+print(f"  {C_BOLD}Prometheus Metrics:{C_RESET}    {C_BLUE}http://127.0.0.1:{port}/metrics{C_RESET}")
+print(f"  {C_BOLD}Config File:{C_RESET}           {C_DIM}{config_path}{C_RESET}")
+print(f"  {C_BOLD}Service Status:{C_RESET}        {C_DIM}systemctl status sentinel{C_RESET}\n")
+
+if bind in ("127.0.0.1", "localhost"):
+    print(f"  {C_BOLD}🔒 Secure Local Access (SSH Tunnel from your laptop):{C_RESET}")
+    print(f"     {C_DIM}If port {port} is not opened in your VPS firewall, run on your laptop terminal:{C_RESET}")
+    print(f"     {C_BLUE}ssh -L {port}:127.0.0.1:{port} root@{target_host}{C_RESET}")
+    print(f"     {C_DIM}Then open in your laptop browser:{C_RESET}")
+    print(f"     {C_GREEN}http://localhost:{port}{admin_query}{C_RESET}\n")
+
+if cfg_hostname and cfg_hostname not in (public_ip, local_ip, "127.0.0.1"):
+    print(f"  {C_BOLD}🌐 Domain Access (if DNS points to this server):{C_RESET}")
+    print(f"     {C_BLUE}http://{cfg_hostname}:{port}{admin_query}{C_RESET}\n")
+PYEOF
+
 
 echo ""
 echo -e "  ${C_BOLD}Helpful Commands:${C_RESET}"
