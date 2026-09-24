@@ -49,8 +49,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.2.21"
-UPDATED = "2026-09-24 16:05"
+VERSION = "2.2.22"
+UPDATED = "2026-09-24 17:35"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -9871,6 +9871,7 @@ def main():
     ap.add_argument("--no-alerts", action="store_true")
     ap.add_argument("--test-alerts", action="store_true", help="send sample alerts and report status per channel")
     ap.add_argument("--activate-license", metavar="KEY", help="activate Sentinel Pro or Agency license key")
+    ap.add_argument("--show-token", "--token", action="store_true", help="display active admin and view tokens and dashboard URLs")
     ap.add_argument("--stress-test", metavar="URL", nargs="?", const="default",
                     help="run visitor traffic capacity benchmark from CLI (default: auto-detect port 80/443)")
     ap.add_argument("--stress-mode", choices=["quick", "full", "max"], default="quick",
@@ -9880,6 +9881,23 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    if getattr(args, "show_token", False):
+        web = cfg.get("web", {})
+        adm = (web.get("admin_token") or web.get("token") or "").strip()
+        viw = (web.get("view_token") or "").strip()
+        port = web.get("port", 8686)
+        bind = web.get("bind", "127.0.0.1")
+        print("\n  ╔════════════════════════════════════════════════════════════════════════════╗")
+        print(f"  ║  🛡  LINUX HEALTH SENTINEL — ACCESS CREDENTIALS v{VERSION:<26}║")
+        print("  ╚════════════════════════════════════════════════════════════════════════════╝\n")
+        print(f"  ▸ Admin Token : {adm or '(none)'}")
+        if viw:
+            print(f"  ▸ View Token  : {viw}")
+        print(f"  ▸ Network Bind: {bind}:{port}")
+        print(f"\n  🚀 Dashboard URL:")
+        print(f"  http://{bind}:{port}/?token={adm}\n")
+        return 0
+
     if args.activate_license:
         lic = LicenseManager(cfg)
         ok, msg = lic.activate(args.activate_license, cfg_path=args.config)

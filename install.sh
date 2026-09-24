@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — Automated Installer & Service Manager
-# Version: 2.2.21 (updated 2026-09-24 16:05)
+# Version: 2.2.22 (updated 2026-09-24 17:35)
 # ==============================================================================
 
 set -euo pipefail
 
-VERSION="2.2.21"
-UPDATED="2026-09-24 16:05"
+VERSION="2.2.22"
+UPDATED="2026-09-24 17:35"
 
 # Target installation paths
 INSTALL_DIR="/opt/health-sentinel"
@@ -470,10 +470,10 @@ if [ "$ENABLE_SSL" = true ]; then
 fi
 
 python3 - "${CONFIG_FILE}" "${VERSION}" <<'PYEOF'
-import json, sys, socket, urllib.request
+import json, sys, socket, urllib.request, secrets
 
 config_path = sys.argv[1]
-version = sys.argv[2] if len(sys.argv) > 2 else "2.2.21"
+version = sys.argv[2] if len(sys.argv) > 2 else "2.2.22"
 
 try:
     with open(config_path) as f:
@@ -481,12 +481,32 @@ try:
 except Exception:
     cfg = {}
 
-web = cfg.get("web", {})
+web = cfg.setdefault("web", {})
 port = web.get("port", 8686)
 bind = web.get("bind", "127.0.0.1")
 admin_token = (web.get("admin_token") or web.get("token") or "").strip()
 view_token = (web.get("view_token") or "").strip()
 cfg_hostname = (cfg.get("hostname") or "").strip()
+
+# Guarantee tokens exist and meet security requirements (>= 32 chars)
+tokens_changed = False
+if not admin_token or len(admin_token) < 32:
+    admin_token = "adm_" + secrets.token_urlsafe(24)
+    web["admin_token"] = admin_token
+    web["token"] = admin_token
+    tokens_changed = True
+
+if not view_token or len(view_token) < 32:
+    view_token = "viw_" + secrets.token_urlsafe(24)
+    web["view_token"] = view_token
+    tokens_changed = True
+
+if tokens_changed:
+    try:
+        with open(config_path, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception:
+        pass
 
 # Detect public IP via fast HTTP check
 public_ip = ""
@@ -540,6 +560,11 @@ print(f"  ▸ Service Status: {C_GREEN}active (running){C_RESET}")
 print(f"  ▸ Network Bind  : {bind}:{port}")
 if sys_hostname:
     print(f"  ▸ Hostname      : {sys_hostname}")
+print()
+
+print(f"  {C_BOLD}🔑 Admin Token  :{C_RESET} {C_GREEN}{admin_token}{C_RESET}")
+if view_token:
+    print(f"  {C_BOLD}👁️ View Token   :{C_RESET} {C_BLUE}{view_token}{C_RESET}")
 print()
 
 print(f"  {C_BOLD}🚀 DIRECT DASHBOARD URL (Click to Open in Browser):{C_RESET}")
