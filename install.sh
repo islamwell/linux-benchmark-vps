@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — Automated Installer & Service Manager
-# Version: 2.2.20 (updated 2026-09-24 15:55)
+# Version: 2.2.21 (updated 2026-09-24 16:05)
 # ==============================================================================
 
 set -euo pipefail
 
-VERSION="2.2.20"
-UPDATED="2026-09-24 15:55"
+VERSION="2.2.21"
+UPDATED="2026-09-24 16:05"
 
 # Target installation paths
 INSTALL_DIR="/opt/health-sentinel"
@@ -399,12 +399,6 @@ PYEOF
 
 chmod 640 "${CONFIG_FILE}"
 
-# Retrieve active settings for display
-FINAL_BIND=$(python3 -c "import json; print(json.load(open('${CONFIG_FILE}'))['web'].get('bind', '127.0.0.1'))")
-FINAL_PORT=$(python3 -c "import json; print(json.load(open('${CONFIG_FILE}'))['web'].get('port', 8686))")
-FINAL_ADMIN_TOKEN=$(python3 -c "import json; w=json.load(open('${CONFIG_FILE}'))['web']; print(w.get('admin_token') or w.get('token') or '')")
-FINAL_VIEW_TOKEN=$(python3 -c "import json; print(json.load(open('${CONFIG_FILE}'))['web'].get('view_token', ''))")
-
 # 6. Install and enable Systemd service
 echo -e "${C_BOLD}[5/6] Registering and starting systemd service (sentinel.service)...${C_RESET}"
 cat <<'EOF' > "${SERVICE_FILE}"
@@ -430,10 +424,15 @@ ProtectHome=read-only
 WantedBy=multi-user.target
 EOF
 
-chmod 644 "${SERVICE_FILE}"
-systemctl daemon-reload
-systemctl enable --now sentinel
+chmod 644 "${SERVICE_FILE}" || true
+systemctl daemon-reload || true
+systemctl enable --now sentinel || systemctl restart sentinel || true
 sleep 1.5
+if systemctl is-active --quiet sentinel 2>/dev/null; then
+    echo -e "    ${C_GREEN}✓${C_RESET} Sentinel service is active and running"
+else
+    echo -e "    ${C_WARN}[!] Sentinel service may need a moment to initialize or check logs via 'systemctl status sentinel'${C_RESET}"
+fi
 
 # Optional Cron Timer Setup
 if [ "$ENABLE_TIMER" = true ]; then
@@ -474,7 +473,7 @@ python3 - "${CONFIG_FILE}" "${VERSION}" <<'PYEOF'
 import json, sys, socket, urllib.request
 
 config_path = sys.argv[1]
-version = sys.argv[2] if len(sys.argv) > 2 else "2.2.20"
+version = sys.argv[2] if len(sys.argv) > 2 else "2.2.21"
 
 try:
     with open(config_path) as f:
@@ -494,7 +493,7 @@ public_ip = ""
 for url in ["https://api.ipify.org", "https://icanhazip.com", "https://ifconfig.me/ip"]:
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "curl/7.68.0"})
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        with urllib.request.urlopen(req, timeout=2) as resp:
             ip = resp.read().decode("utf-8").strip()
             if ip and (len(ip.split(".")) == 4 or ":" in ip):
                 public_ip = ip
@@ -561,9 +560,13 @@ if bind in ("127.0.0.1", "localhost"):
     print(f"     {C_DIM}Then open in your laptop browser:{C_RESET}")
     print(f"     {C_GREEN}http://localhost:{port}{admin_query}{C_RESET}\n")
 
-if cfg_hostname and cfg_hostname not in (public_ip, local_ip, "127.0.0.1"):
+domain_cand = cfg_hostname if (cfg_hostname and cfg_hostname not in (public_ip, local_ip, "127.0.0.1")) else ""
+if not domain_cand and sys_hostname and "." in sys_hostname and sys_hostname not in (public_ip, local_ip, "127.0.0.1"):
+    domain_cand = sys_hostname
+
+if domain_cand:
     print(f"  {C_BOLD}🌐 Domain Access (if DNS points to this server):{C_RESET}")
-    print(f"     {C_BLUE}http://{cfg_hostname}:{port}{admin_query}{C_RESET}\n")
+    print(f"     {C_BLUE}http://{domain_cand}:{port}{admin_query}{C_RESET}\n")
 PYEOF
 
 

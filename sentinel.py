@@ -49,8 +49,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.2.20"
-UPDATED = "2026-09-24 15:55"
+VERSION = "2.2.21"
+UPDATED = "2026-09-24 16:05"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")

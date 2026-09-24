@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — 1-Command Universal Auto-Updater
-# Version: 2.2.20 (updated 2026-09-24 15:55)
+# Version: 2.2.21 (updated 2026-09-24 16:05)
 # ==============================================================================
 
 set -euo pipefail
 
-VERSION="2.2.20"
+VERSION="2.2.21"
 
 C_RESET="\033[0m"
 C_BOLD="\033[1m"
@@ -91,18 +91,18 @@ fi
 
 echo -e "${C_BOLD}[3/4] Restarting Sentinel system service...${C_RESET}"
 if [ -f "/etc/systemd/system/sentinel.service" ]; then
-    systemctl daemon-reload
-    systemctl restart sentinel
+    systemctl daemon-reload || true
+    systemctl restart sentinel || true
     sleep 1
-    if systemctl is-active --quiet sentinel; then
+    if systemctl is-active --quiet sentinel 2>/dev/null; then
         echo -e "    ${C_GREEN}✓${C_RESET} Sentinel service is active and running"
     else
-        echo -e "    ${C_WARN}[!] Warning: Sentinel service may have encountered an issue. Checking logs:${C_RESET}"
-        journalctl -u sentinel -n 10 --no-pager
+        echo -e "    ${C_WARN}[!] Warning: Sentinel service may need attention. Checking logs:${C_RESET}"
+        journalctl -u sentinel -n 10 --no-pager 2>/dev/null || true
     fi
 else
     echo -e "    ${C_WARN}[!] sentinel.service not registered yet. Running full installer...${C_RESET}"
-    bash "${INSTALL_DIR}/install.sh" -y
+    bash "${INSTALL_DIR}/install.sh" -y || true
 fi
 
 echo -e "${C_BOLD}[4/4] Extracting dashboard access credentials and URLs...${C_RESET}"
@@ -110,7 +110,7 @@ python3 - "${CONFIG_FILE}" "${VERSION}" <<'PYEOF'
 import json, sys, socket, urllib.request
 
 config_path = sys.argv[1]
-version = sys.argv[2] if len(sys.argv) > 2 else "2.2.20"
+version = sys.argv[2] if len(sys.argv) > 2 else "2.2.21"
 
 try:
     with open(config_path) as f:
@@ -130,7 +130,7 @@ public_ip = ""
 for url in ["https://api.ipify.org", "https://icanhazip.com", "https://ifconfig.me/ip"]:
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "curl/7.68.0"})
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        with urllib.request.urlopen(req, timeout=2) as resp:
             ip = resp.read().decode("utf-8").strip()
             if ip and (len(ip.split(".")) == 4 or ":" in ip):
                 public_ip = ip
@@ -193,9 +193,13 @@ if bind in ("127.0.0.1", "localhost"):
     print(f"     {C_DIM}Then open in your laptop browser:{C_RESET}")
     print(f"     {C_GREEN}http://localhost:{port}{admin_query}{C_RESET}\n")
 
-if cfg_hostname and cfg_hostname not in (public_ip, local_ip, "127.0.0.1"):
+domain_cand = cfg_hostname if (cfg_hostname and cfg_hostname not in (public_ip, local_ip, "127.0.0.1")) else ""
+if not domain_cand and sys_hostname and "." in sys_hostname and sys_hostname not in (public_ip, local_ip, "127.0.0.1"):
+    domain_cand = sys_hostname
+
+if domain_cand:
     print(f"  {C_BOLD}🌐 Domain Access (if DNS points to this server):{C_RESET}")
-    print(f"     {C_BLUE}http://{cfg_hostname}:{port}{admin_query}{C_RESET}\n")
+    print(f"     {C_BLUE}http://{domain_cand}:{port}{admin_query}{C_RESET}\n")
 
 print(f"  {C_DIM}To update anytime in the future, just run:{C_RESET}")
 print(f"  {C_BOLD}curl -fsSL https://raw.githubusercontent.com/islamwell/linux-benchmark-vps/master/update.sh | sudo bash{C_RESET}\n")
