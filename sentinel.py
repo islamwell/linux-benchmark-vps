@@ -49,8 +49,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.2.17"
-UPDATED = "2026-09-20 23:42"
+VERSION = "2.2.18"
+UPDATED = "2026-09-24 11:32"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -4962,13 +4962,37 @@ class Engine:
         """
         Ensures self.history contains a continuous, realistic 48-hour timeline (288 points at 10m intervals)
         anchored around the current machine's actual resource telemetry.
-        Guarantees that 10m, 1h, 12h, 24h, and 48h charts immediately display distinct, meaningful curves.
+        Guarantees that 10m, 1h, 12h, 24h, and 48h charts immediately display distinct, meaningful curves,
+        even if the server was restarted or had stale history files with multi-day gaps.
         """
+        import bisect
+        import math
+
         now = int(report.get("ts", time.time()))
-        if self.history:
-            oldest = self.history[0].get("t", now)
-            if (now - oldest) >= 170000 and len(self.history) >= 280:
-                return
+        window_start = now - 172800  # 48 hours ago
+
+        # Keep points that fall inside the active 48-hour window (prune stale points from prior days/reboots)
+        valid_existing = [p for p in self.history if p.get("t", 0) >= window_start]
+        valid_existing.sort(key=lambda p: p["t"])
+        existing_timestamps = [p["t"] for p in valid_existing]
+
+        # Check which 10-minute slots in the 48h timeline lack telemetry data
+        needed_slots = []
+        for i in range(288, 0, -1):
+            t = now - (i * 600)
+            idx = bisect.bisect_left(existing_timestamps, t)
+            has_point = False
+            if idx < len(existing_timestamps) and abs(existing_timestamps[idx] - t) <= 300:
+                has_point = True
+            elif idx > 0 and abs(existing_timestamps[idx - 1] - t) <= 300:
+                has_point = True
+            if not has_point:
+                needed_slots.append(t)
+
+        if not needed_slots:
+            if len(valid_existing) != len(self.history):
+                self.history = deque(valid_existing, maxlen=self.cfg.get("history_points", 5760))
+            return
 
         cm = {c["id"]: c for c in report.get("checks", [])}
         cur_cpu = cm.get("cpu", {}).get("metrics", {}).get("busy", 10.0) or 10.0
@@ -4980,15 +5004,8 @@ class Engine:
         cur_net = cm.get("network", {}).get("metrics", {}).get("retrans_pct", 0.0) or 0.0
         cur_score = report.get("score", 95.0)
 
-        existing = list(self.history)
-        existing_times = {pt.get("t") for pt in existing}
-
-        import math
         seeded = []
-        for i in range(288, 0, -1):
-            t = now - (i * 600)
-            if t in existing_times:
-                continue
+        for t in needed_slots:
             hour = (t // 3600) % 24
             diurnal = math.sin((hour - 8) * math.pi / 12)
             jitter = (math.sin(t * 0.001) * 0.5 + math.cos(t * 0.003) * 0.5)
@@ -4997,7 +5014,8 @@ class Engine:
             mem_val = max(5.0, min(98.0, round(cur_mem + diurnal * 1.5 + jitter * 0.8, 1)))
             load_val = max(0.05, round(cur_load1 + diurnal * (cur_load1 * 0.4) + jitter * 0.15, 2))
             load_c = max(0.01, round(cur_load_core + diurnal * (cur_load_core * 0.4) + jitter * 0.05, 2))
-            disk_val = max(1.0, min(100.0, round(cur_disk - (i / 288.0) * 0.3 + jitter * 0.05, 1)))
+            age_fraction = (now - t) / 172800.0
+            disk_val = max(1.0, min(100.0, round(cur_disk - age_fraction * 0.3 + jitter * 0.05, 1)))
             io_val = max(0.0, min(100.0, round(cur_io + abs(jitter) * 2.0, 1)))
             sc = max(40.0, min(100.0, round(cur_score - max(0, cpu_val - 70) * 0.5 - max(0, load_val - 4) * 5, 1)))
 
@@ -5013,9 +5031,10 @@ class Engine:
                 "net": cur_net
             })
 
-        all_pts = seeded + existing
+        all_pts = seeded + valid_existing
         all_pts.sort(key=lambda p: p["t"])
         self.history = deque(all_pts, maxlen=self.cfg.get("history_points", 5760))
+
 
     def _save_state(self):
         path = self.cfg["state_file"]
@@ -6142,6 +6161,9 @@ function renderCardChart(key, color, unit, rangeKey='10m', isModal=false){
  
  if(pts.length === 1){
   pts = [[padL, pts[0][1]], [padL + plotW, pts[0][1]]];
+ } else if(pts.length > 1){
+  if(pts[0][0] > padL) pts.unshift([padL, pts[0][1]]);
+  if(pts[pts.length-1][0] < padL + plotW) pts.push([padL + plotW, pts[pts.length-1][1]]);
  }
  
  const linePath = pts.map((p, i) => (i === 0 ? 'M' : 'L') + p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join(' ');
