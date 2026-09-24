@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — 1-Command Universal Auto-Updater
-# Version: 2.2.18 (updated 2026-09-24 11:32)
+# Version: 2.2.19 (updated 2026-09-24 12:51)
 # ==============================================================================
 
 set -euo pipefail
 
-VERSION="2.2.18"
+VERSION="2.2.19"
 
 C_RESET="\033[0m"
 C_BOLD="\033[1m"
@@ -116,15 +116,31 @@ try:
     bind = w.get('bind', '127.0.0.1')
     admin_tok = (w.get('admin_token') or w.get('token') or '').strip()
     view_tok = (w.get('view_token') or '').strip()
-    print(f"{bind}|{port}|{admin_tok}|{view_tok}")
+    domain = (w.get('domain') or cfg.get('hostname') or '').strip()
+    print(f"{bind}|{port}|{admin_tok}|{view_tok}|{domain}")
 except Exception as e:
-    print("127.0.0.1|8686||")
+    print("127.0.0.1|8686|||")
 PYEOF
 )
 
-IFS='|' read -r CFG_BIND CFG_PORT CFG_ADMIN_TOKEN CFG_VIEW_TOKEN <<< "${ACCESS_INFO}"
+IFS='|' read -r CFG_BIND CFG_PORT CFG_ADMIN_TOKEN CFG_VIEW_TOKEN CFG_DOMAIN <<< "${ACCESS_INFO}"
 
-PUBLIC_IP=$(curl -s -m 2 https://api.ipify.org 2>/dev/null || curl -s -m 2 https://icanhazip.com 2>/dev/null || echo "${CFG_BIND}")
+PUBLIC_IP=$(curl -s -m 3 https://api.ipify.org 2>/dev/null || curl -s -m 3 https://icanhazip.com 2>/dev/null || curl -s -m 3 https://ifconfig.me 2>/dev/null || ip route get 1.1.1.1 2>/dev/null | awk '{print $7}' || hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
+[ -z "$PUBLIC_IP" ] && PUBLIC_IP="127.0.0.1"
+
+TARGET_HOST="${PUBLIC_IP}"
+if [ "$TARGET_HOST" = "0.0.0.0" ] || [ "$TARGET_HOST" = "127.0.0.1" ]; then
+    LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+    [ -n "$LOCAL_IP" ] && [ "$LOCAL_IP" != "127.0.0.1" ] && TARGET_HOST="$LOCAL_IP"
+fi
+
+ADMIN_QUERY=""
+[ -n "$CFG_ADMIN_TOKEN" ] && ADMIN_QUERY="/?token=${CFG_ADMIN_TOKEN}"
+VIEW_QUERY=""
+[ -n "$CFG_VIEW_TOKEN" ] && VIEW_QUERY="/?token=${CFG_VIEW_TOKEN}"
+
+DASHBOARD_URL="http://${TARGET_HOST}:${CFG_PORT}${ADMIN_QUERY}"
+VIEW_URL="http://${TARGET_HOST}:${CFG_PORT}${VIEW_QUERY}"
 
 echo -e "\n${C_GREEN}╔════════════════════════════════════════════════════════════════════════════╗${C_RESET}"
 echo -e "${C_GREEN}║  ${C_BOLD}✓  UPDATE SUCCESSFUL — LINUX HEALTH SENTINEL v${VERSION}${C_RESET}${C_GREEN}                 ║${C_RESET}"
@@ -133,28 +149,27 @@ echo -e "${C_GREEN}╚═══════════════════�
 echo -e "  ▸ Service Status: ${C_GREEN}active (running)${C_RESET}"
 echo -e "  ▸ Network Bind  : ${CFG_BIND}:${CFG_PORT}\n"
 
-if [ "$CFG_BIND" = "127.0.0.1" ] || [ "$CFG_BIND" = "localhost" ]; then
-    echo -e "  ${C_BOLD}🔒 Secure Local Access (SSH Tunnel from your laptop):${C_RESET}"
-    echo -e "     ${C_DIM}Run this command in your local laptop terminal:${C_RESET}"
-    echo -e "     ${C_BLUE}ssh -L ${CFG_PORT}:127.0.0.1:${CFG_PORT} root@${PUBLIC_IP}${C_RESET}\n"
-    if [ -n "$CFG_ADMIN_TOKEN" ]; then
-        echo -e "     ${C_DIM}Then open in your laptop browser (Full Control):${C_RESET}"
-        echo -e "     ${C_GREEN}http://localhost:${CFG_PORT}/?token=${CFG_ADMIN_TOKEN}${C_RESET}\n"
-    fi
-    if [ -n "$CFG_VIEW_TOKEN" ]; then
-        echo -e "     ${C_DIM}Client / Team View-Only URL:${C_RESET}"
-        echo -e "     ${C_BLUE}http://localhost:${CFG_PORT}/?token=${CFG_VIEW_TOKEN}${C_RESET}\n"
-    fi
-else
-    if [ -n "$CFG_ADMIN_TOKEN" ]; then
-        echo -e "  ${C_BOLD}⚡ Admin Dashboard (Full Access):${C_RESET}"
-        echo -e "     ${C_GREEN}http://${PUBLIC_IP}:${CFG_PORT}/?token=${CFG_ADMIN_TOKEN}${C_RESET}\n"
-    fi
-    if [ -n "$CFG_VIEW_TOKEN" ]; then
-        echo -e "  ${C_BOLD}👁️ View-Only Dashboard (Client & Team Access):${C_RESET}"
-        echo -e "     ${C_BLUE}http://${PUBLIC_IP}:${CFG_PORT}/?token=${CFG_VIEW_TOKEN}${C_RESET}\n"
-    fi
+echo -e "  ${C_BOLD}🚀 DIRECT DASHBOARD URL (Click to Open in Browser):${C_RESET}"
+echo -e "  ${C_GREEN}${DASHBOARD_URL}${C_RESET}\n"
+
+if [ -n "$CFG_VIEW_TOKEN" ]; then
+    echo -e "  ${C_BOLD}👁️ Client / View-Only Dashboard URL:${C_RESET}"
+    echo -e "  ${C_BLUE}${VIEW_URL}${C_RESET}\n"
 fi
 
-echo -e "\n  ${C_DIM}To update anytime in the future, just run:${C_RESET}"
+if [ "$CFG_BIND" = "127.0.0.1" ] || [ "$CFG_BIND" = "localhost" ]; then
+    echo -e "  ${C_BOLD}🔒 Secure Local Access (SSH Tunnel from your laptop):${C_RESET}"
+    echo -e "     ${C_DIM}If port ${CFG_PORT} is not exposed publicly, run this on your laptop terminal:${C_RESET}"
+    echo -e "     ${C_BLUE}ssh -L ${CFG_PORT}:127.0.0.1:${CFG_PORT} root@${TARGET_HOST}${C_RESET}"
+    echo -e "     ${C_DIM}Then open in your laptop browser:${C_RESET}"
+    echo -e "     ${C_GREEN}http://localhost:${CFG_PORT}${ADMIN_QUERY}${C_RESET}\n"
+fi
+
+if [ -n "$CFG_DOMAIN" ] && [ "$CFG_DOMAIN" != "null" ]; then
+    echo -e "  ${C_BOLD}🌐 Domain / SSL Access (if configured):${C_RESET}"
+    echo -e "     ${C_BLUE}https://${CFG_DOMAIN}${ADMIN_QUERY}${C_RESET}\n"
+fi
+
+echo -e "  ${C_DIM}To update anytime in the future, just run:${C_RESET}"
 echo -e "  ${C_BOLD}curl -fsSL https://raw.githubusercontent.com/islamwell/linux-benchmark-vps/master/update.sh | sudo bash${C_RESET}\n"
+

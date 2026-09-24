@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — Automated Installer & Service Manager
-# Version: 2.2.18 (updated 2026-09-24 11:32)
+# Version: 2.2.19 (updated 2026-09-24 12:51)
 # ==============================================================================
 
 set -euo pipefail
 
-VERSION="2.2.18"
-UPDATED="2026-09-24 11:32"
+VERSION="2.2.19"
+UPDATED="2026-09-24 12:51"
 
 # Target installation paths
 INSTALL_DIR="/opt/health-sentinel"
@@ -471,8 +471,19 @@ if [ "$ENABLE_SSL" = true ]; then
 fi
 
 # Server IP detection
-SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
+SERVER_IP=$(curl -s -m 3 https://api.ipify.org 2>/dev/null || curl -s -m 3 https://icanhazip.com 2>/dev/null || curl -s -m 3 https://ifconfig.me 2>/dev/null || ip route get 1.1.1.1 2>/dev/null | awk '{print $7}' || hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
 [ -z "$SERVER_IP" ] && SERVER_IP="127.0.0.1"
+
+TARGET_HOST="${SERVER_IP}"
+if [ "$TARGET_HOST" = "0.0.0.0" ] || [ "$TARGET_HOST" = "127.0.0.1" ]; then
+    LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+    [ -n "$LOCAL_IP" ] && [ "$LOCAL_IP" != "127.0.0.1" ] && TARGET_HOST="$LOCAL_IP"
+fi
+
+ADMIN_QUERY=""
+[ -n "$FINAL_ADMIN_TOKEN" ] && ADMIN_QUERY="/?token=${FINAL_ADMIN_TOKEN}"
+VIEW_QUERY=""
+[ -n "$FINAL_VIEW_TOKEN" ] && VIEW_QUERY="/?token=${FINAL_VIEW_TOKEN}"
 
 # Success Display
 echo ""
@@ -480,23 +491,28 @@ echo -e "${C_GREEN}╔═══════════════════�
 echo -e "${C_GREEN}║  ${C_BOLD}✓  INSTALLATION SUCCESSFUL · LINUX HEALTH SENTINEL v${VERSION}${C_RESET}${C_GREEN}                 ║${C_RESET}"
 echo -e "${C_GREEN}╚════════════════════════════════════════════════════════════════════════════╝${C_RESET}"
 echo ""
-echo -e "  ${C_BOLD}Dashboard Network:${C_RESET}     Bound to ${C_GREEN}${FINAL_BIND}:${FINAL_PORT}${C_RESET}"
-echo ""
-echo -e "  ${C_BOLD}⚡ Admin Dashboard (Full Control):${C_RESET}"
-echo -e "     ${C_GREEN}http://${FINAL_BIND}:${FINAL_PORT}?token=${FINAL_ADMIN_TOKEN}${C_RESET}"
+echo -e "  ▸ Dashboard Network: Bound to ${C_GREEN}${FINAL_BIND}:${FINAL_PORT}${C_RESET}\n"
+echo -e "  ${C_BOLD}🚀 DIRECT DASHBOARD URL (Click to Open in Browser):${C_RESET}"
+echo -e "     ${C_GREEN}http://${TARGET_HOST}:${FINAL_PORT}${ADMIN_QUERY}${C_RESET}"
 echo -e "     ${C_DIM}Permissions: Full system fixes, PHP recycle, benchmarks, firewall bans${C_RESET}"
 echo ""
-echo -e "  ${C_BOLD}👁️ View-Only Dashboard (Client & Team Access):${C_RESET}"
-echo -e "     ${C_BLUE}http://${FINAL_BIND}:${FINAL_PORT}?token=${FINAL_VIEW_TOKEN}${C_RESET}"
-echo -e "     ${C_DIM}Permissions: Real-time health metrics, uptime status, reports (zero mutations)${C_RESET}"
-echo ""
+if [ -n "$FINAL_VIEW_TOKEN" ]; then
+    echo -e "  ${C_BOLD}👁️ View-Only Dashboard (Client & Team Access):${C_RESET}"
+    echo -e "     ${C_BLUE}http://${TARGET_HOST}:${FINAL_PORT}${VIEW_QUERY}${C_RESET}"
+    echo -e "     ${C_DIM}Permissions: Real-time health metrics, uptime status, reports (zero mutations)${C_RESET}"
+    echo ""
+fi
 echo -e "  ${C_BOLD}Prometheus Metrics:${C_RESET}    ${C_BLUE}http://127.0.0.1:${FINAL_PORT}/metrics${C_RESET}"
 echo -e "  ${C_BOLD}Config File:${C_RESET}           ${C_DIM}${CONFIG_FILE}${C_RESET}"
 echo -e "  ${C_BOLD}Service Status:${C_RESET}        ${C_DIM}systemctl status sentinel${C_RESET}"
 echo ""
-echo -e "  ${C_BOLD}🔒 Recommended Secure Access (SSH Tunnel from your laptop):${C_RESET}"
-echo -e "  ${C_BLUE}ssh -L ${FINAL_PORT}:127.0.0.1:${FINAL_PORT} root@${SERVER_IP}${C_RESET}"
-echo -e "  Then open: ${C_GREEN}http://localhost:${FINAL_PORT}?token=${FINAL_ADMIN_TOKEN}${C_RESET}"
+if [ "$FINAL_BIND" = "127.0.0.1" ] || [ "$FINAL_BIND" = "localhost" ]; then
+    echo -e "  ${C_BOLD}🔒 Secure Local Access (SSH Tunnel from your laptop):${C_RESET}"
+    echo -e "     ${C_DIM}If port ${FINAL_PORT} is not exposed publicly, run on your laptop terminal:${C_RESET}"
+    echo -e "     ${C_BLUE}ssh -L ${FINAL_PORT}:127.0.0.1:${FINAL_PORT} root@${TARGET_HOST}${C_RESET}"
+    echo -e "     ${C_DIM}Then open in your laptop browser:${C_RESET} ${C_GREEN}http://localhost:${FINAL_PORT}${ADMIN_QUERY}${C_RESET}\n"
+fi
+
 echo ""
 echo -e "  ${C_BOLD}Helpful Commands:${C_RESET}"
 echo -e "  • Instant CLI report:   ${C_BLUE}sudo python3 ${INSTALL_DIR}/sentinel.py --once${C_RESET}"
