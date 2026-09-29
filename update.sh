@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — 1-Command Universal Auto-Updater
-# Version: 2.2.22 (updated 2026-09-24 17:35)
+# Version: 2.2.23 (updated 2026-09-29 20:15)
 # ==============================================================================
 
 set -euo pipefail
 
-VERSION="2.2.22"
+VERSION="2.2.23"
 
 C_RESET="\033[0m"
 C_BOLD="\033[1m"
@@ -89,6 +89,38 @@ else
     echo -e "    ${C_GREEN}✓${C_RESET} Preserved existing configuration and tokens at ${CONFIG_FILE}"
 fi
 
+# Pre-validate security tokens and bind address BEFORE service restart
+python3 - "${CONFIG_FILE}" <<'PREPY'
+import json, sys, secrets
+cfg_path = sys.argv[1]
+try:
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+except Exception:
+    cfg = {}
+web = cfg.setdefault("web", {})
+if not web.get("bind"):
+    web["bind"] = "0.0.0.0"
+if not web.get("port"):
+    web["port"] = 8686
+adm = (web.get("admin_token") or web.get("token") or "").strip()
+viw = (web.get("view_token") or "").strip()
+changed = False
+if not adm or len(adm) < 32:
+    web["admin_token"] = "adm_" + secrets.token_urlsafe(24)
+    web["token"] = web["admin_token"]
+    changed = True
+if not viw or len(viw) < 32:
+    web["view_token"] = "viw_" + secrets.token_urlsafe(24)
+    changed = True
+if changed:
+    try:
+        with open(cfg_path, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception:
+        pass
+PREPY
+
 echo -e "${C_BOLD}[3/4] Restarting Sentinel system service...${C_RESET}"
 if [ -f "/etc/systemd/system/sentinel.service" ]; then
     systemctl daemon-reload || true
@@ -100,9 +132,19 @@ if [ -f "/etc/systemd/system/sentinel.service" ]; then
         echo -e "    ${C_WARN}[!] Warning: Sentinel service may need attention. Checking logs:${C_RESET}"
         journalctl -u sentinel -n 10 --no-pager 2>/dev/null || true
     fi
+
+    # Automatically permit dashboard access in firewall
+    TARGET_PORT=$(python3 -c "import json; print(json.load(open('${CONFIG_FILE}')).get('web', {}).get('port', 8686))" 2>/dev/null || echo "8686")
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "status: active"; then
+        ufw allow "${TARGET_PORT}/tcp" comment "Linux Health Sentinel" >/dev/null 2>&1 || true
+    elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --add-port="${TARGET_PORT}/tcp" --permanent >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
 else
     echo -e "    ${C_WARN}[!] sentinel.service not registered yet. Running full installer...${C_RESET}"
     bash "${INSTALL_DIR}/install.sh" -y || true
+    exit 0
 fi
 
 echo -e "${C_BOLD}[4/4] Extracting dashboard access credentials and URLs...${C_RESET}"
@@ -110,7 +152,7 @@ python3 - "${CONFIG_FILE}" "${VERSION}" <<'PYEOF'
 import json, sys, socket, urllib.request, secrets
 
 config_path = sys.argv[1]
-version = sys.argv[2] if len(sys.argv) > 2 else "2.2.22"
+version = sys.argv[2] if len(sys.argv) > 2 else "2.2.23"
 
 try:
     with open(config_path) as f:
@@ -120,7 +162,7 @@ except Exception:
 
 web = cfg.setdefault("web", {})
 port = web.get("port", 8686)
-bind = web.get("bind", "127.0.0.1")
+bind = web.get("bind", "0.0.0.0")
 admin_token = (web.get("admin_token") or web.get("token") or "").strip()
 view_token = (web.get("view_token") or "").strip()
 cfg_hostname = (cfg.get("hostname") or "").strip()

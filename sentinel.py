@@ -49,8 +49,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.2.22"
-UPDATED = "2026-09-24 17:35"
+VERSION = "2.2.23"
+UPDATED = "2026-09-29 20:15"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -75,7 +75,7 @@ DEFAULTS = {
     "state_file": "/var/lib/health-sentinel/state.json",
     "incidents_dir": "/var/lib/health-sentinel/incidents",
     "incident_history": 50,
-    "web": {"enabled": True, "bind": "127.0.0.1", "port": 8686, "token": "", "admin_token": "", "view_token": ""},
+    "web": {"enabled": True, "bind": "0.0.0.0", "port": 8686, "token": "", "admin_token": "", "view_token": ""},
     "thresholds": {
         "cpu_warn": 85, "cpu_crit": 95,
         "steal_warn": 5, "steal_crit": 12,

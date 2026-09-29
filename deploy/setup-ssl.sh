@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — Automated SSL/TLS Reverse Proxy Deployer
-# Version: 2.2.22 (updated 2026-09-24 17:35)
+# Version: 2.2.23 (updated 2026-09-29 20:15)
 # ==============================================================================
 
 set -euo pipefail

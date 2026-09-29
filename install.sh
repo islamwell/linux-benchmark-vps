@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — Automated Installer & Service Manager
-# Version: 2.2.22 (updated 2026-09-24 17:35)
+# Version: 2.2.23 (updated 2026-09-29 20:15)
 # ==============================================================================
 
 set -euo pipefail
 
-VERSION="2.2.22"
-UPDATED="2026-09-24 17:35"
+VERSION="2.2.23"
+UPDATED="2026-09-29 20:15"
 
 # Target installation paths
 INSTALL_DIR="/opt/health-sentinel"
@@ -21,7 +21,7 @@ CRON_TIMER_FILE="/etc/systemd/system/sentinel-cron.timer"
 
 # Defaults
 PORT=""
-BIND=""
+BIND="0.0.0.0"
 TOKEN=""
 ADMIN_TOKEN=""
 VIEW_TOKEN=""
@@ -112,7 +112,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --port <port>             Web dashboard port (default: 8686)"
-            echo "  --bind <ip>               Bind IP address (default: 127.0.0.1 for security)"
+            echo "  --bind <ip>               Bind IP address (default: 0.0.0.0 for dashboard access)"
             echo "  --admin-token <token>     Admin authentication token (full control, auto-generated if omitted)"
             echo "  --view-token <token>      View-Only token for clients/staff (read-only, auto-generated if omitted)"
             echo "  --token <token>           Legacy alias for --admin-token"
@@ -348,18 +348,25 @@ if 'web' not in cfg:
     cfg['web'] = {}
 
 # Set secure defaults if not configured
-if not cfg['web'].get('bind'):
-    cfg['web']['bind'] = '127.0.0.1'
-if not cfg['web'].get('port'):
+if arg_bind:
+    cfg['web']['bind'] = arg_bind
+elif not cfg['web'].get('bind'):
+    cfg['web']['bind'] = '0.0.0.0'
+
+if arg_port:
+    cfg['web']['port'] = int(arg_port)
+elif not cfg['web'].get('port'):
     cfg['web']['port'] = 8686
 
-# Configure admin token
+# Configure admin token (AppSec requires len >= 32)
 current_admin = (cfg['web'].get('admin_token') or cfg['web'].get('token') or '').strip()
-if arg_admin:
-    cfg['web']['admin_token'] = arg_admin
-elif arg_token:
-    cfg['web']['admin_token'] = arg_token
-elif not current_admin:
+raw_admin = (arg_admin or arg_token or '').strip()
+if raw_admin:
+    if len(raw_admin) < 32:
+        cfg['web']['admin_token'] = raw_admin + "_" + secrets.token_urlsafe(16)
+    else:
+        cfg['web']['admin_token'] = raw_admin
+elif not current_admin or len(current_admin) < 32:
     cfg['web']['admin_token'] = 'adm_' + secrets.token_urlsafe(24)
 else:
     cfg['web']['admin_token'] = current_admin
@@ -367,18 +374,18 @@ else:
 # Keep legacy token synchronized with admin token
 cfg['web']['token'] = cfg['web']['admin_token']
 
-# Configure view-only token
+# Configure view-only token (AppSec requires len >= 32)
 current_view = (cfg['web'].get('view_token') or '').strip()
-if arg_view:
-    cfg['web']['view_token'] = arg_view
-elif not current_view:
+raw_view = (arg_view or '').strip()
+if raw_view:
+    if len(raw_view) < 32:
+        cfg['web']['view_token'] = raw_view + "_" + secrets.token_urlsafe(16)
+    else:
+        cfg['web']['view_token'] = raw_view
+elif not current_view or len(current_view) < 32:
     cfg['web']['view_token'] = 'viw_' + secrets.token_urlsafe(24)
-
-# Apply explicit network overrides if provided on CLI
-if arg_bind:
-    cfg['web']['bind'] = arg_bind
-if arg_port:
-    cfg['web']['port'] = int(arg_port)
+else:
+    cfg['web']['view_token'] = current_view
 
 # Configure branding options
 if 'branding' not in cfg:
@@ -434,6 +441,21 @@ else
     echo -e "    ${C_WARN}[!] Sentinel service may need a moment to initialize or check logs via 'systemctl status sentinel'${C_RESET}"
 fi
 
+# Firewall configuration: automatically permit dashboard access
+TARGET_PORT=$(python3 -c "import json; print(json.load(open('${CONFIG_FILE}')).get('web', {}).get('port', 8686))" 2>/dev/null || echo "8686")
+FW_ACTION=""
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "status: active"; then
+    ufw allow "${TARGET_PORT}/tcp" comment "Linux Health Sentinel" >/dev/null 2>&1 || true
+    FW_ACTION="UFW (port ${TARGET_PORT}/tcp allowed)"
+elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+    firewall-cmd --add-port="${TARGET_PORT}/tcp" --permanent >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    FW_ACTION="firewalld (port ${TARGET_PORT}/tcp allowed)"
+fi
+if [ -n "$FW_ACTION" ]; then
+    echo -e "    ${C_GREEN}✓${C_RESET} Firewall configuration: ${FW_ACTION}"
+fi
+
 # Optional Cron Timer Setup
 if [ "$ENABLE_TIMER" = true ]; then
     echo "    Enabling scheduled timer (sentinel-cron.timer)..."
@@ -473,7 +495,7 @@ python3 - "${CONFIG_FILE}" "${VERSION}" <<'PYEOF'
 import json, sys, socket, urllib.request, secrets
 
 config_path = sys.argv[1]
-version = sys.argv[2] if len(sys.argv) > 2 else "2.2.22"
+version = sys.argv[2] if len(sys.argv) > 2 else "2.2.23"
 
 try:
     with open(config_path) as f:
@@ -483,7 +505,7 @@ except Exception:
 
 web = cfg.setdefault("web", {})
 port = web.get("port", 8686)
-bind = web.get("bind", "127.0.0.1")
+bind = web.get("bind", "0.0.0.0")
 admin_token = (web.get("admin_token") or web.get("token") or "").strip()
 view_token = (web.get("view_token") or "").strip()
 cfg_hostname = (cfg.get("hostname") or "").strip()
