@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — Automated Installer & Service Manager
-# Version: 2.2.23 (updated 2026-09-29 20:15)
+# Version: 2.2.24 (updated 2026-10-14 00:05)
 # ==============================================================================
 
 set -euo pipefail
 
-VERSION="2.2.23"
-UPDATED="2026-09-29 20:15"
+VERSION="2.2.24"
+UPDATED="2026-10-14 00:05"
 
 # Target installation paths
 INSTALL_DIR="/opt/health-sentinel"
@@ -408,14 +408,15 @@ chmod 640 "${CONFIG_FILE}"
 
 # 6. Install and enable Systemd service
 echo -e "${C_BOLD}[5/6] Registering and starting systemd service (sentinel.service)...${C_RESET}"
-cat <<'EOF' > "${SERVICE_FILE}"
+PYTHON_BIN=$(command -v python3 2>/dev/null || echo "/usr/bin/python3")
+cat <<EOF > "${SERVICE_FILE}"
 [Unit]
 Description=Linux Health Sentinel (dashboard + alerts)
 After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/health-sentinel/sentinel.py -c /etc/health-sentinel/config.json
+ExecStart=${PYTHON_BIN} /opt/health-sentinel/sentinel.py -c /etc/health-sentinel/config.json
 Restart=always
 RestartSec=5
 User=root
@@ -495,7 +496,7 @@ python3 - "${CONFIG_FILE}" "${VERSION}" <<'PYEOF'
 import json, sys, socket, urllib.request, secrets
 
 config_path = sys.argv[1]
-version = sys.argv[2] if len(sys.argv) > 2 else "2.2.23"
+version = sys.argv[2] if len(sys.argv) > 2 else "2.2.24"
 
 try:
     with open(config_path) as f:
@@ -527,6 +528,8 @@ if tokens_changed:
     try:
         with open(config_path, "w") as f:
             json.dump(cfg, f, indent=2)
+        import subprocess
+        subprocess.run(["systemctl", "restart", "sentinel"], capture_output=True)
     except Exception:
         pass
 

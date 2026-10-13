@@ -27,7 +27,6 @@ import pwd
 import re
 import secrets
 import shutil
-import signal
 import smtplib
 import socket
 import stat
@@ -49,8 +48,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.2.23"
-UPDATED = "2026-09-29 20:15"
+VERSION = "2.2.24"
+UPDATED = "2026-10-14 00:05"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -1033,7 +1032,7 @@ def check_load(cur, prev, dt, T):
             l1, l5, l15 = os.getloadavg()
     except Exception:
         return c.finalize()
-    n1, n15 = l1 / CORES, l15 / CORES
+    n1 = l1 / CORES
     blocked = cur["procs"][1].get("D", 0)
     running = cur["procs"][1].get("R", 0)
     c.metrics = {"load1": round(l1, 2), "load5": round(l5, 2), "load15": round(l15, 2),
@@ -1050,14 +1049,20 @@ def check_load(cur, prev, dt, T):
     trend = "rising ↑" if l1 > l5 * 1.25 else ("falling ↓" if l1 < l5 * 0.75 else "stable →")
     c.summary = f"1m {l1:.2f} · 5m {l5:.2f} · 15m {l15:.2f} · {trend} · {n1:.2f} per core"
 
-    # Trigger alert if normalized load is high OR if absolute load reaches 8.0
-    if n1 >= T["load_warn"] or l1 >= T.get("load_absolute_warn", 8.0):
-        sev = "crit" if (n1 >= T["load_crit"] or l1 >= T.get("load_absolute_crit", 12.0)) else "warn"
+    # Trigger alert if normalized load is high OR if absolute load reaches the absolute threshold
+    abs_warn = T.get("load_absolute_warn", 8.0)
+    abs_crit = T.get("load_absolute_crit", 12.0)
+    if n1 >= T["load_warn"] or l1 >= abs_warn:
+        sev = "crit" if (n1 >= T["load_crit"] or l1 >= abs_crit) else "warn"
         cause = ("waiting on hard drive / disk (I/O Wait)"
                  if blocked >= max(2, running) else "too many active programs running on CPU")
-        c.add(sev, f"High Server Load: {l1:.2f} (Threshold 8.0 reached)",
-              f"Current state: {running} tasks actively running, {blocked} tasks waiting on disk storage.",
-              "Why this happens: Too many programs or web requests are waiting for attention at the same time. When load reaches 8.0 or higher, web pages will load slowly, PHP scripts may time out, and SSH logins become sluggish.",
+        if l1 >= abs_warn:
+            reason = f"absolute threshold {abs_warn:g} reached"
+        else:
+            reason = f"{n1:.2f} per core, threshold {T['load_warn']:g}"
+        c.add(sev, f"High Server Load: {l1:.2f} ({reason})",
+              f"Current state: {running} tasks actively running, {blocked} tasks waiting on disk storage. Likely cause: {cause}.",
+              "Why this happens: Too many programs or web requests are waiting for attention at the same time. When load stays this high, web pages will load slowly, PHP scripts may time out, and SSH logins become sluggish.",
               ["uptime                              # Check current 1-min, 5-min, 15-min load numbers",
                "top -bn1 -o %CPU | head -20          # See which programs are using the most CPU power",
                "ps -eo state,pid,user,%cpu,cmd | awk '$1~/^[RD]/' | head -15 # List busy/waiting processes",
@@ -1215,7 +1220,7 @@ def check_disk_space(cur, prev, dt, T):
             c.add(sev, f"Disk Drive {mp} is {r['pct']:.0f}% full ({fmt_bytes(r['free'])} free space left)",
                   f"Partition {r['dev']} ({r['fs']}) · total {fmt_bytes(r['total'])}",
                   "Why this happens: The hard drive partition has little free space remaining. When a disk fills to 100%, databases stop working, website uploads fail, and log files cannot be saved.",
-                  [f"df -h                                 # Check free space across all hard drive partitions",
+                  ["df -h                                 # Check free space across all hard drive partitions",
                    f"du -xh --max-depth=1 {mp} 2>/dev/null | sort -h | tail -10 # Find the largest folders in {mp}",
                    f"find {mp} -xdev -type f -size +200M 2>/dev/null | head -10 # Find single files larger than 200MB",
                    "sudo journalctl --disk-usage           # Check how much space system log files take up"],
@@ -1264,8 +1269,8 @@ def check_disk_io(cur, prev, dt, T):
             c.add(sev, f"Storage Drive {name} is Busy / Slow ({util:.0f}% busy, {awt:.1f}ms delay)",
                   f"Activity: {ios/dt:.0f} reads/writes per second · {'HDD' if a['rot'] else 'SSD/NVMe'}",
                   "Why this happens: The hard drive is struggling to keep up with disk read/write requests. Programs have to wait on the disk, making web requests feel sluggish.",
-                  [f"iostat -xz 2 3                        # Check %util and await times for all drives",
-                   f"sudo iotop -oPa -n 3                  # See which program is writing/reading the most data"],
+                  ["iostat -xz 2 3                        # Check %util and await times for all drives",
+                   "sudo iotop -oPa -n 3                  # See which program is writing/reading the most data"],
                   ["Identify heavy writing program in iotop and lower its priority: `sudo ionice -c3 -p <PID>`",
                    "Enable Redis or database query caching to reduce repeated hard drive reads",
                    "Mount partition with `noatime` in `/etc/fstab` to stop unnecessary file timestamp writes"])
@@ -2439,6 +2444,10 @@ class VisitorTracker:
             self.last_scan_time = now
             return snapshot
 
+    def get_geo_cache_items(self, limit=200):
+        with self.lock:
+            return dict(list(self.geo_cache.items())[-limit:])
+
     def _resolve_geo_batch(self, ips):
         if not ips:
             return
@@ -2455,13 +2464,15 @@ class VisitorTracker:
                     ip = item.get("query")
                     if item.get("status") == "success" and ip:
                         cc = item.get("countryCode", "")
-                        self.geo_cache[ip] = {
+                        entry = {
                             "country": item.get("country", "Unknown"),
                             "country_code": cc,
                             "city": item.get("city", "–"),
                             "isp": item.get("isp", "–"),
                             "flag": flag_emoji(cc)
                         }
+                        with self.lock:
+                            self.geo_cache[ip] = entry
         except Exception:
             pass
 
@@ -2943,15 +2954,21 @@ class CapacityBenchmark:
                 stats_lock = threading.Lock()
                 stage_end_time = time.time() + stage_dur
                 stage_t0 = time.time()
+                stage_stop = threading.Event()
 
-                def _sim_worker():
+                # Bind per-stage state as defaults so straggler threads from this stage
+                # never read or write the next stage's counters (late-binding closure).
+                def _sim_worker(stage_end_time=stage_end_time, stage_stop=stage_stop,
+                                stats_lock=stats_lock, latencies=latencies,
+                                success_count=success_count, fail_count=fail_count):
                     conn = None
                     headers = {
                         "User-Agent": "Linux-Health-Sentinel-CapacityBench/2.0",
                         "Connection": "keep-alive",
                         "Accept": "*/*"
                     }
-                    while time.time() < stage_end_time and not self.stop_requested:
+                    while (time.time() < stage_end_time and not self.stop_requested
+                           and not stage_stop.is_set()):
                         req_t0 = time.time()
                         try:
                             if conn is None:
@@ -3033,8 +3050,12 @@ class CapacityBenchmark:
 
                     time.sleep(0.12)
 
+                # Signal workers to stop (covers circuit-breaker aborts before stage end),
+                # then wait long enough for an in-flight request to hit its 3s timeout.
+                stage_stop.set()
+                join_deadline = time.time() + 4.0
                 for th in threads:
-                    th.join(timeout=1.0)
+                    th.join(timeout=max(join_deadline - time.time(), 0.0))
 
                 stage_elapsed = max(time.time() - stage_t0, 0.001)
                 tot_req = success_count[0] + fail_count[0]
@@ -3351,11 +3372,13 @@ class SecurityShield:
                     os.chmod(d, 0o700)
                 except OSError:
                     pass
+            with self.lock:
+                banned_copy = dict(self.banned_ips)
             fd, tmp = tempfile.mkstemp(prefix=".banned_ips-", suffix=".tmp", dir=d)
             try:
                 os.chmod(tmp, 0o600)
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(self.banned_ips, f, indent=2)
+                    json.dump(banned_copy, f, indent=2)
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(tmp, self.banned_file)
@@ -3830,11 +3853,11 @@ class SiteMonitor:
             status_code = 0
             error_msg = str(e)
 
-        if url not in self.history:
-            self.history[url] = deque(maxlen=30)
-        self.history[url].append(1 if is_up else 0)
-
-        hist = list(self.history[url])
+        with self.lock:
+            if url not in self.history:
+                self.history[url] = deque(maxlen=30)
+            self.history[url].append(1 if is_up else 0)
+            hist = list(self.history[url])
         uptime_pct = round((sum(hist) / len(hist)) * 100.0, 1) if hist else (100.0 if is_up else 0.0)
 
         return {
@@ -3921,8 +3944,8 @@ class SiteMonitor:
             if url in self.custom_sites:
                 self.custom_sites.remove(url)
                 self._save()
-            if url in self.results:
-                del self.results[url]
+            self.results.pop(url, None)
+            self.history.pop(url, None)
             return True, f"Website {url} removed."
 
 
@@ -3998,28 +4021,28 @@ class PortMonitor:
                 if len(parts) < 4:
                     continue
                 local_addr = parts[3]
-                if local_addr.startswith("["):
-                    # IPv6 bracket notation: [::]:22
-                    port_str = local_addr.rsplit(":", 1)[-1]
-                    host_part = "127.0.0.1"
-                elif ":" in local_addr:
-                    pieces = local_addr.rsplit(":", 1)
-                    raw_h = pieces[0] or "0.0.0.0"
-                    host_part = "127.0.0.1" if raw_h in ("0.0.0.0", "*", "") else raw_h
-                    port_str = pieces[1]
-                else:
+                if ":" not in local_addr:
                     continue
+                raw_h, port_str = local_addr.rsplit(":", 1)
+                # IPv6 bracket notation ([::]:22) and interface suffixes (127.0.0.53%lo)
+                raw_h = raw_h.strip("[]").split("%", 1)[0]
+                if raw_h in ("", "*", "0.0.0.0", "::", "::ffff:0.0.0.0"):
+                    # Wildcard bind: reachable via loopback
+                    host_part = "127.0.0.1"
+                else:
+                    # Bound to a specific address: probe that address, not loopback
+                    host_part = raw_h
                 try:
                     port = int(port_str)
                 except ValueError:
                     continue
-                key = "127.0.0.1:{}".format(port)
-                if key in seen or port < 1 or port > 65535:
+                # One entry per port (a service bound on both 0.0.0.0 and [::] is listed once)
+                if port in seen or port < 1 or port > 65535:
                     continue
-                seen.add(key)
+                seen.add(port)
                 label = WELL_KNOWN_PORTS.get(port, "Port {}".format(port))
                 discovered.append({
-                    "host": "127.0.0.1",
+                    "host": host_part,
                     "port": port,
                     "label": label,
                     "protocol": "tcp",
@@ -4185,6 +4208,24 @@ class PortMonitor:
         res = self._check_single_port(entry)
         with self.lock:
             self.results[res["key"]] = res
+
+    def check_single(self, host, port):
+        host = (host or "127.0.0.1").strip()
+        try:
+            port = int(port)
+            if not (1 <= port <= 65535):
+                return None
+        except (TypeError, ValueError):
+            return None
+        key = self._port_key(host, port)
+        with self.lock:
+            existing = self.results.get(key)
+        label = (existing.get("label") if existing else None) or WELL_KNOWN_PORTS.get(port, "Port {}".format(port))
+        is_custom = existing.get("is_custom", False) if existing else any(p.get("host") == host and int(p.get("port", 0)) == port for p in self.custom_ports)
+        res = self._check_single_port({"host": host, "port": port, "label": label, "protocol": "tcp", "is_custom": is_custom})
+        with self.lock:
+            self.results[key] = res
+        return res
 
     def remove_port(self, host, port):
         try:
@@ -4640,7 +4681,6 @@ def generate_executive_html(report, history, branding, healing_history):
     grade_label = report.get("grade_label", "Healthy")
     host = report.get("host") or socket.getfqdn()
     os_info = report.get("os", "Linux")
-    kernel = report.get("kernel", "Linux")
     cores = report.get("cores", 1)
     uptime = report.get("uptime", "up")
     now_str = datetime.now(timezone.utc).astimezone().strftime("%B %d, %Y at %H:%M %Z")
@@ -4654,8 +4694,6 @@ def generate_executive_html(report, history, branding, healing_history):
     cm = {c["id"]: c for c in report.get("checks", [])}
     mem_c = cm.get("memory", {})
     disk_c = cm.get("disk", {})
-    srv_c = cm.get("services", {})
-    log_c = cm.get("logs", {})
 
     mem_avail = fmt_bytes(mem_c.get("metrics", {}).get("available", 0))
     mem_used_pct = mem_c.get("metrics", {}).get("used_pct", 0)
@@ -4909,12 +4947,112 @@ def grade(score):
     return "F", "Critical"
 
 
+# ── Metric history (feeds the 10m/1h/12h/24h/48h charts) ────────────────────
+HISTORY_RETENTION_S = 48 * 3600          # keep exactly 48h of real samples
+HISTORY_RAW_WINDOW_S = 2 * 3600          # dashboard payload: full resolution for the last 2h
+HISTORY_BUCKET_S = 300                   # older samples are averaged into 5-minute buckets
+HISTORY_METRICS = ("score", "cpu", "mem", "load", "load_core", "disk", "io", "net")
+HISTORY_STATE_VERSION = 2                # v1 state files may contain synthetic seeded points
+
+
+def _history_min_gap(cfg):
+    """Minimum spacing between stored samples; forced scans closer than this replace the last sample."""
+    try:
+        interval = float(cfg.get("scan_interval", 30))
+    except (TypeError, ValueError):
+        interval = 30.0
+    return max(5.0, min(interval, 60.0) * 0.5)
+
+
+def _history_maxlen(cfg):
+    """Capacity large enough to always hold the full 48h window at the configured scan rate."""
+    need = int(HISTORY_RETENTION_S / _history_min_gap(cfg)) + 16
+    try:
+        configured = int(cfg.get("history_points", 0))
+    except (TypeError, ValueError):
+        configured = 0
+    return max(need, configured)
+
+
+def _clean_history_point(p):
+    """Returns a sanitized history point or None if the entry is malformed."""
+    if not isinstance(p, dict):
+        return None
+    try:
+        t = int(p.get("t"))
+    except (TypeError, ValueError):
+        return None
+    if t <= 0:
+        return None
+    out = {"t": t}
+    for k in HISTORY_METRICS:
+        v = p.get(k, 0)
+        out[k] = v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+    return out
+
+
+def _drop_legacy_seeded_points(points, scan_interval):
+    """
+    State files written by <=2.2.23 contain synthetic 'baseline' points generated at exact
+    10-minute spacing to fill gaps. Real scans never land on an exact 600s grid (scan duration
+    adds jitter), so drop any point whose distance to a neighbour is exactly 600s.
+    """
+    if int(scan_interval or 30) == 600 or len(points) < 2:
+        return points
+    ts = [p["t"] for p in points]
+    keep = []
+    for i, p in enumerate(points):
+        prev_gap = ts[i] - ts[i - 1] if i > 0 else None
+        next_gap = ts[i + 1] - ts[i] if i + 1 < len(ts) else None
+        if prev_gap == 600 or next_gap == 600:
+            continue
+        keep.append(p)
+    return keep
+
+
+def compact_history(points, now=None):
+    """
+    Shrinks the history payload sent to the dashboard on every poll: the last 2h stay at full
+    resolution, older samples are averaged into 5-minute buckets. Each bucket also carries the
+    bucket maximum (<metric>_hi) so peak values survive the averaging.
+    """
+    if not points:
+        return []
+    now = now if now is not None else points[-1]["t"]
+    raw_from = now - HISTORY_RAW_WINDOW_S
+    out, bucket, bucket_key = [], [], None
+
+    def flush():
+        if not bucket:
+            return
+        n = len(bucket)
+        pt = {"t": int(sum(b["t"] for b in bucket) / n), "n": n}
+        for k in HISTORY_METRICS:
+            vals = [b.get(k, 0) or 0 for b in bucket]
+            pt[k] = round(sum(vals) / n, 2)
+            pt[k + "_hi"] = round(max(vals), 2)
+        out.append(pt)
+
+    for p in points:
+        if p["t"] >= raw_from:
+            continue
+        key = p["t"] // HISTORY_BUCKET_S
+        if key != bucket_key:
+            flush()
+            bucket, bucket_key = [], key
+        bucket.append(p)
+    flush()
+    out.extend(p for p in points if p["t"] >= raw_from)
+    return out
+
+
 class Engine:
     def __init__(self, cfg, cfg_path=None):
         self.cfg = cfg
         self.cfg_path = cfg_path
         self.sampler = Sampler()
-        self.history = deque(maxlen=cfg.get("history_points", 5760))
+        self.history = deque(maxlen=_history_maxlen(cfg))
+        self.state_lock = threading.Lock()
         self.report = None
         self.lock = threading.RLock()
         self.scan_lock = threading.Lock()
@@ -4945,7 +5083,9 @@ class Engine:
                 with open(state_file) as fh:
                     data = json.load(fh)
                     for pt in data.get("history", []):
-                        self.history.append(pt)
+                        cleaned = _clean_history_point(pt)
+                        if cleaned:
+                            self.history.append(cleaned)
                     self.alert_state = data.get("alerts", {})
                     for ev in data.get("healing_history", []):
                         self.healing_history.append(ev)
@@ -4970,6 +5110,7 @@ class Engine:
 
         now = int(report.get("ts", time.time()))
         window_start = now - 172800  # 48 hours ago
+        maxlen = _history_maxlen(self.cfg)
 
         # Keep points that fall inside the active 48-hour window (prune stale points from prior days/reboots)
         valid_existing = [p for p in self.history if p.get("t", 0) >= window_start]
@@ -4991,7 +5132,7 @@ class Engine:
 
         if not needed_slots:
             if len(valid_existing) != len(self.history):
-                self.history = deque(valid_existing, maxlen=self.cfg.get("history_points", 5760))
+                self.history = deque(valid_existing, maxlen=maxlen)
             return
 
         cm = {c["id"]: c for c in report.get("checks", [])}
@@ -5033,8 +5174,14 @@ class Engine:
 
         all_pts = seeded + valid_existing
         all_pts.sort(key=lambda p: p["t"])
-        self.history = deque(all_pts, maxlen=self.cfg.get("history_points", 5760))
+        self.history = deque(all_pts, maxlen=maxlen)
 
+    def get_history(self, limit=None):
+        with self.lock:
+            pts = list(self.history)
+        if limit is not None:
+            return pts[-limit:]
+        return pts
 
     def _save_state(self):
         path = self.cfg["state_file"]
@@ -5048,12 +5195,17 @@ class Engine:
                 path = "/tmp/health-sentinel-state.json"
                 os.makedirs(os.path.dirname(path), exist_ok=True)
             tmp = path + ".tmp"
+            with self.lock:
+                hist_copy = list(self.history)[-_history_maxlen(self.cfg):]
+                alert_copy = dict(self.alert_state)
+                heal_copy = list(self.healing_history)
+            geo_copy = self.visitor_tracker.get_geo_cache_items(200)
             with open(tmp, "w") as fh:
                 json.dump({
-                    "history": list(self.history)[-self.cfg.get("history_points", 5760):],
-                    "alerts": self.alert_state,
-                    "healing_history": list(self.healing_history),
-                    "geo_cache": dict(list(self.visitor_tracker.geo_cache.items())[-200:]),
+                    "history": hist_copy,
+                    "alerts": alert_copy,
+                    "healing_history": heal_copy,
+                    "geo_cache": geo_copy,
                     "last_benchmark": self.benchmark_engine.last_result,
                     "last_capacity_benchmark": self.capacity_benchmark.last_result
                 }, fh)
@@ -5117,22 +5269,22 @@ class Engine:
                 self.auto_healer.process(report)
             
             cm = {c["id"]: c for c in report["checks"]}
-            self.history.append({
-                "t": int(report["ts"]), "score": report["score"],
-                "cpu": cm["cpu"]["metrics"].get("busy", 0),
-                "mem": cm["memory"]["metrics"].get("used_pct", 0),
-                "load": cm["load"]["metrics"].get("load1", 0),
-                "load_core": cm["load"]["metrics"].get("per_core", 0),
-                "disk": cm["disk"]["metrics"].get("worst_pct", 0),
-                "io": cm["io"]["metrics"].get("worst_util", 0),
-                "net": cm["network"]["metrics"].get("retrans_pct", 0),
-            })
-            self._seed_baseline_history(report)
+            with self.lock:
+                self.history.append({
+                    "t": int(report["ts"]), "score": report["score"],
+                    "cpu": cm["cpu"]["metrics"].get("busy", 0),
+                    "mem": cm["memory"]["metrics"].get("used_pct", 0),
+                    "load": cm["load"]["metrics"].get("load1", 0),
+                    "load_core": cm["load"]["metrics"].get("per_core", 0),
+                    "disk": cm["disk"]["metrics"].get("worst_pct", 0),
+                    "io": cm["io"]["metrics"].get("worst_util", 0),
+                    "net": cm["network"]["metrics"].get("retrans_pct", 0),
+                })
+                self._seed_baseline_history(report)
+                self.report = report
             
             self.cached_report = report
             self.last_scan_time = time.time()
-            with self.lock:
-                self.report = report
             self._save_state()
             return report
 
@@ -5485,7 +5637,7 @@ class AlertManager:
         provider = cfg.get("provider", "callmebot").lower()
         
         # Format a clean, emoji-rich WhatsApp message
-        lines = [f"🛡️ *Linux Health Sentinel Alert*",
+        lines = ["🛡️ *Linux Health Sentinel Alert*",
                  f"📍 *Server:* `{report['host']}`",
                  f"📊 *Health:* `{report['score']:.0f}/100 ({report['grade']})`",
                  f"⏰ *Time:* {report['time']}", ""]
@@ -7874,8 +8026,8 @@ async function checkPortsNow() {
 async function checkSinglePort(host, port) {
   toast('Testing Port', host + ':' + port + '…', 'info');
   try {
-    const r = await api('/api/ports/add', {method:'POST', body:JSON.stringify({host,port,label:'',protocol:'tcp'})});
-    if (r.ports) { PORTS = r.ports; renderPorts(PORTS); }
+    const r = await api('/api/ports/check', {method:'POST', body:JSON.stringify({host,port})});
+    if (r.ok && r.ports) { PORTS = r.ports; renderPorts(PORTS); }
     toast('Port Tested', host + ':' + port + ' result updated', 'ok');
   } catch(e) {
     toast('Test Failed', e.message, 'crit');
@@ -9317,7 +9469,7 @@ class Handler(BaseHTTPRequestHandler):
         return {
             "role": role,
             "report": rep,
-            "history": list(self.engine.history)[-5760:],
+            "history": self.engine.get_history(5760),
             "incidents": list(self.engine.incidents.recent_incidents)[-20:],
             "auto_heal": {
                 "enabled": self.engine.auto_healer.cfg.get("enabled", True),
@@ -9417,7 +9569,7 @@ class Handler(BaseHTTPRequestHandler):
             if "title" in q:
                 branding_override["report_title"] = q["title"][0]
             rep = self.engine.get_report()
-            html = generate_executive_html(rep, self.engine.history, branding_override, self.engine.healing_history)
+            html = generate_executive_html(rep, self.engine.get_history(), branding_override, self.engine.healing_history)
             return self._send(200, html, "text/html; charset=utf-8")
         if norm_path == "/api/auto-heal":
             return self._send(200, {
@@ -9427,7 +9579,7 @@ class Handler(BaseHTTPRequestHandler):
                 "history": list(self.engine.healing_history)
             })
         if norm_path == "/api/history":
-            return self._send(200, {"history": list(self.engine.history)})
+            return self._send(200, {"history": self.engine.get_history()})
         if norm_path == "/api/incidents":
             return self._send(200, {"incidents": list(self.engine.incidents.recent_incidents)})
         if norm_path == "/api/php-services":
@@ -9482,7 +9634,7 @@ class Handler(BaseHTTPRequestHandler):
         if err == 401:
             return self._send(401, {"ok": False, "error": "unauthorized"})
 
-        if role != "admin" and norm_path != "/api/sites/check":
+        if role != "admin" and norm_path not in ("/api/sites/check", "/api/ports/check"):
             return self._send(403, {"ok": False, "error": "Forbidden: View-only role cannot execute administrative actions."})
 
         cl_hdr = self.headers.get("Content-Length")
@@ -9604,8 +9756,17 @@ class Handler(BaseHTTPRequestHandler):
                 "sites": self.engine.site_monitor.get_summary()
             })
         if norm_path == "/api/ports/check":
-            summary = self.engine.port_monitor.check_all(force=True)
-            return self._send(200, {"ok": True, "ports": summary})
+            body = {}
+            if data_bytes:
+                try:
+                    body = json.loads(data_bytes.decode() or "{}")
+                except Exception:
+                    pass
+            if body.get("port") is not None:
+                self.engine.port_monitor.check_single(body.get("host", "127.0.0.1"), body.get("port"))
+            else:
+                self.engine.port_monitor.check_all(force=True)
+            return self._send(200, {"ok": True, "ports": self.engine.port_monitor.get_summary()})
         if norm_path == "/api/ports/add":
             try:
                 body = json.loads(data_bytes.decode() or "{}")
@@ -9894,7 +10055,7 @@ def main():
         if viw:
             print(f"  ▸ View Token  : {viw}")
         print(f"  ▸ Network Bind: {bind}:{port}")
-        print(f"\n  🚀 Dashboard URL:")
+        print("\n  🚀 Dashboard URL:")
         print(f"  http://{bind}:{port}/?token={adm}\n")
         return 0
 

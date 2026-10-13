@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — 1-Command Universal Auto-Updater
-# Version: 2.2.23 (updated 2026-09-29 20:15)
+# Version: 2.2.24 (updated 2026-10-14 00:05)
 # ==============================================================================
 
 set -euo pipefail
 
-VERSION="2.2.23"
+VERSION="2.2.24"
 
 C_RESET="\033[0m"
 C_BOLD="\033[1m"
@@ -152,7 +152,7 @@ python3 - "${CONFIG_FILE}" "${VERSION}" <<'PYEOF'
 import json, sys, socket, urllib.request, secrets
 
 config_path = sys.argv[1]
-version = sys.argv[2] if len(sys.argv) > 2 else "2.2.23"
+version = sys.argv[2] if len(sys.argv) > 2 else "2.2.24"
 
 try:
     with open(config_path) as f:
@@ -184,6 +184,8 @@ if tokens_changed:
     try:
         with open(config_path, "w") as f:
             json.dump(cfg, f, indent=2)
+        import subprocess
+        subprocess.run(["systemctl", "restart", "sentinel"], capture_output=True)
     except Exception:
         pass
 
