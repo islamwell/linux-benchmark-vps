@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — Plesk & Linux PHP-FPM Slowlog Safe Configuration
-# Version: 1.5.0 (updated 2026-08-27 16:05)
+# Version: 2.2.25 (updated 2026-11-02 06:20)
 #
 # Safely configures PHP-FPM slow logging with:
 #  - Automatic configuration backups
@@ -66,12 +66,14 @@ configure_pool_file() {
 rollback_all() {
     echo ""
     echo "[-] Configuration validation failed! Rolling back all modified pool files..." >&2
-    for F in "${MODIFIED_FILES[@]}"; do
-        if [ -f "${F}${BACKUP_SUFFIX}" ]; then
-            cp "${F}${BACKUP_SUFFIX}" "$F"
-            rm -f "${F}${BACKUP_SUFFIX}"
-        fi
-    done
+    if [ ${#MODIFIED_FILES[@]} -gt 0 ]; then
+        for F in "${MODIFIED_FILES[@]}"; do
+            if [ -f "${F}${BACKUP_SUFFIX}" ]; then
+                cp "${F}${BACKUP_SUFFIX}" "$F"
+                rm -f "${F}${BACKUP_SUFFIX}"
+            fi
+        done
+    fi
     echo "[!] Rollback complete. No services were reloaded." >&2
     exit 1
 }
@@ -148,17 +150,22 @@ for SYS_POOL_DIR in /etc/php/*/fpm/pool.d /etc/php-fpm.d; do
 done
 
 # 3. Reload services safely
-for SVC in $(printf "%s\n" "${SERVICES_TO_RELOAD[@]}" | sort -u); do
-    if systemctl is-active --quiet "$SVC" 2>/dev/null; then
-        echo "    Reloading active service: ${SVC}"
-        systemctl reload "$SVC" || echo "    [!] Warning: Could not reload ${SVC}"
-    fi
-done
+if [ ${#SERVICES_TO_RELOAD[@]} -gt 0 ]; then
+    for SVC in $(printf "%s\n" "${SERVICES_TO_RELOAD[@]}" | sort -u); do
+        [ -n "$SVC" ] || continue
+        if systemctl is-active --quiet "$SVC" 2>/dev/null; then
+            echo "    Reloading active service: ${SVC}"
+            systemctl reload "$SVC" || echo "    [!] Warning: Could not reload ${SVC}"
+        fi
+    done
+fi
 
 # Clean up backups on success
-for F in "${MODIFIED_FILES[@]}"; do
-    rm -f "${F}${BACKUP_SUFFIX}"
-done
+if [ ${#MODIFIED_FILES[@]} -gt 0 ]; then
+    for F in "${MODIFIED_FILES[@]}"; do
+        rm -f "${F}${BACKUP_SUFFIX}"
+    done
+fi
 
 echo ""
 echo "[✓] Successfully configured slow logging across ${#MODIFIED_FILES[@]} pool file(s)."

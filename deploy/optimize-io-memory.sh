@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — Automated Software-Level I/O & Memory Tuning Script
-# Version: 1.6.1 (updated 2026-09-02 07:10)
+# Version: 2.2.25 (updated 2026-11-02 06:20)
 #
 # This script applies non-destructive kernel, filesystem, and database tweaks
 # to drastically reduce disk I/O bottlenecks (iowait) and maximize RAM usage
@@ -25,14 +25,14 @@ fi
 # 1. Eliminate Access-Time Metadata Writes (noatime, nodiratime)
 # ------------------------------------------------------------------------------
 echo "[1/4] Optimizing filesystem mount flags (noatime, nodiratime)..."
-if grep -q " / " /etc/fstab; then
+if [ -f /etc/fstab ] && awk '$1 !~ /^#/ && $2 == "/" { found=1 } END { exit !found }' /etc/fstab; then
     cp /etc/fstab "/etc/fstab.bak.${TIMESTAMP}"
     echo "  [✓] Backed up /etc/fstab to /etc/fstab.bak.${TIMESTAMP}"
     
-    # Check if noatime is already in /etc/fstab for root
-    if ! grep " / " /etc/fstab | grep -q "noatime"; then
+    # Check if noatime is already in /etc/fstab for root (supports both tabs and spaces, ignores comments)
+    if awk '$1 !~ /^#/ && $2 == "/" && $4 !~ /(^|,)noatime(,|$)/ { need=1 } END { exit !need }' /etc/fstab; then
         # Add noatime,nodiratime to root partition options
-        awk '$2 == "/" { $4 = $4 ",noatime,nodiratime" } 1' /etc/fstab > /etc/fstab.tmp && mv /etc/fstab.tmp /etc/fstab
+        awk '$1 !~ /^#/ && $2 == "/" && $4 !~ /(^|,)noatime(,|$)/ { $4 = $4 ",noatime,nodiratime" } 1' /etc/fstab > /etc/fstab.tmp && mv /etc/fstab.tmp /etc/fstab
         echo "  [✓] Updated /etc/fstab with noatime,nodiratime for /"
     else
         echo "  [✓] /etc/fstab already has noatime configured for /"
@@ -65,11 +65,14 @@ vm.dirty_writeback_centisecs = 500
 EOF
 
 chmod 644 "${SYSCTL_CONF}"
-sysctl --system >/dev/null 2>&1 || sysctl -p "${SYSCTL_CONF}" >/dev/null 2>&1
-echo "  [✓] Applied kernel parameters in ${SYSCTL_CONF}"
-echo "      • vm.swappiness = $(sysctl -n vm.swappiness)"
-echo "      • vm.vfs_cache_pressure = $(sysctl -n vm.vfs_cache_pressure)"
-echo "      • vm.dirty_ratio = $(sysctl -n vm.dirty_ratio)"
+if sysctl --system >/dev/null 2>&1 || sysctl -p "${SYSCTL_CONF}" >/dev/null 2>&1; then
+    echo "  [✓] Applied kernel parameters in ${SYSCTL_CONF}"
+else
+    echo "  [i] Saved ${SYSCTL_CONF} (some sysctl keys are read-only in container/virtualized environments)"
+fi
+echo "      • vm.swappiness = $(sysctl -n vm.swappiness 2>/dev/null || echo 'n/a')"
+echo "      • vm.vfs_cache_pressure = $(sysctl -n vm.vfs_cache_pressure 2>/dev/null || echo 'n/a')"
+echo "      • vm.dirty_ratio = $(sysctl -n vm.dirty_ratio 2>/dev/null || echo 'n/a')"
 
 # ------------------------------------------------------------------------------
 # 3. Compressed In-RAM Swap (zram) Setup

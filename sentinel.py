@@ -48,8 +48,8 @@ from email.message import EmailMessage
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.2.24"
-UPDATED = "2026-10-14 00:05"
+VERSION = "2.2.25"
+UPDATED = "2026-11-02 06:20"
 
 try:
     PAGE = os.sysconf("SC_PAGE_SIZE")
@@ -1091,6 +1091,15 @@ def check_memory(cur, prev, dt, T):
             mi[k] = int(v.split()[0]) * 1024
         except Exception:
             pass
+    if "MemTotal" not in mi:
+        c.metrics = {"total": 0, "available": 0, "used_pct": 0.0,
+                     "cached": 0, "buffers": 0,
+                     "swap_total": 0, "swap_used_pct": 0.0,
+                     "swap_in_s": 0.0, "swap_out_s": 0.0,
+                     "psi10": 0.0, "commit": 0, "slab": 0, "hugepages": 0}
+        c.value, c.unit = "—", ""
+        c.summary = "memory telemetry unavailable"
+        return c.finalize()
     total = mi.get("MemTotal", 1)
     avail = mi.get("MemAvailable", mi.get("MemFree", 0))
     used_pct = clamp((1 - avail / total) * 100) if total else 0.0
@@ -1235,7 +1244,7 @@ def check_disk_space(cur, prev, dt, T):
                   "Why this happens: The hard drive experienced hardware errors or filesystem errors. No new files can be written.",
                   ["dmesg -T | grep -iE 'ext4|xfs|i/o error|remount' | tail -20"],
                   ["Back up critical files immediately",
-                   "Schedule a reboot and run filesystem repair: `sudo fsck -y {r['dev']}`"])
+                   f"Schedule a reboot and run filesystem repair: `sudo fsck -y {r['dev']}`"])
     return c.finalize()
 
 
@@ -1765,6 +1774,17 @@ def _root_trusted(path):
 
 def control_system_action(action):
     """Safely executes one-click server maintenance actions without shell execution."""
+    if action == "restart_php_active":
+        svcs = [s for s in detect_php_services() if s.get("is_active")]
+        if not svcs:
+            return {"ok": True, "action": action, "results": [], "detail": "No active PHP-FPM services detected to restart"}
+        results = [control_php_service(s["service"], "restart") for s in svcs]
+        any_ok = any(r.get("ok") for r in results)
+        if any_ok:
+            return {"ok": True, "action": action, "results": results, "detail": f"Restarted {sum(1 for r in results if r.get('ok'))} active PHP-FPM service(s)"}
+        errs = "; ".join(r.get("error", "") for r in results if r.get("error"))
+        return {"ok": False, "action": action, "results": results, "error": errs or "Failed to restart active PHP-FPM services"}
+
     if action == "drop_caches":
         try:
             sh(["sync"], timeout=5)
@@ -1854,9 +1874,35 @@ def check_logs(cur, prev, dt, T):
         top_err[key] = top_err.get(key, 0) + 1
     top = sorted(top_err.items(), key=lambda kv: -kv[1])[:5]
 
-    rc2, auth = sh(["journalctl", "--since", "-1h", "--no-pager", "-q", "-t", "sshd"], timeout=8, ttl=120)
-    if rc2 != 0 or not auth.strip():
-        auth = read_tail("/var/log/auth.log", 262144) + read_tail("/var/log/secure", 262144)
+    rc2, auth = sh(["journalctl", "--since", "-1h", "--no-pager", "-q", "-t", "sshd", "-t", "ssh"], timeout=8, ttl=120)
+    if rc2 != 0:
+        raw_auth = read_tail("/var/log/auth.log", 262144) + "\n" + read_tail("/var/log/secure", 262144)
+        now_dt = datetime.now().astimezone()
+        now_ts = now_dt.timestamp()
+        recent_lines = []
+        for aline in raw_auth.splitlines():
+            if "Failed " not in aline:
+                continue
+            keep = True
+            # Filter ISO-8601 or RFC-3164 ("Nov  2 06:10:00") lines to the past 1 hour
+            m_iso = re.match(r"^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)", aline)
+            if m_iso:
+                ts_parsed = _parse_log_ts(m_iso.group(1))
+                if ts_parsed is not None:
+                    keep = (-60 <= (now_ts - ts_parsed) <= 3600)
+            else:
+                m_bsd = re.match(r"^([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\b", aline)
+                if m_bsd:
+                    try:
+                        dt_bsd = datetime.strptime(f"{now_dt.year} {m_bsd.group(1)}", "%Y %b %d %H:%M:%S").replace(tzinfo=now_dt.tzinfo)
+                        if dt_bsd.timestamp() - now_ts > 86400:
+                            dt_bsd = dt_bsd.replace(year=now_dt.year - 1)
+                        keep = (-60 <= (now_ts - dt_bsd.timestamp()) <= 3600)
+                    except Exception:
+                        pass
+            if keep:
+                recent_lines.append(aline)
+        auth = "\n".join(recent_lines)
     fails = re.findall(r"Failed (?:password|publickey).* from ([\d.a-f:]+)", auth)
     ips = {}
     for ip in fails:
@@ -2223,13 +2269,33 @@ def flag_emoji(cc):
         return "🌐"
 
 
+def _parse_log_ts(ts_str):
+    if not ts_str:
+        return None
+    ts_str = ts_str.strip()
+    try:
+        if " " in ts_str and (ts_str.split()[-1].startswith("+") or ts_str.split()[-1].startswith("-")):
+            return datetime.strptime(ts_str, "%d/%b/%Y:%H:%M:%S %z").timestamp()
+        return datetime.strptime(ts_str.split()[0], "%d/%b/%Y:%H:%M:%S").astimezone().timestamp()
+    except Exception:
+        pass
+    try:
+        clean = ts_str.replace("T", " ")
+        if "+" in clean or clean.count("-") >= 3:
+            return datetime.fromisoformat(ts_str).timestamp()
+        return datetime.fromisoformat(clean.split()[0] + " " + clean.split()[1]).astimezone().timestamp()
+    except Exception:
+        pass
+    return None
+
+
 class VisitorTracker:
     def __init__(self, cfg, security_shield=None):
         self.cfg = cfg.get("visitors", {})
         self.security_shield = security_shield
         self.geo_cache = {}
         self.last_geo_lookup = 0.0
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.cached_snapshot = {
             "live_connections": 0,
             "active_visitors_5m": 0,
@@ -2324,9 +2390,12 @@ class VisitorTracker:
                 for line in tail.splitlines():
                     m = log_re.match(line)
                     if m:
+                        ts_str = m.group(2)
+                        ts_val = _parse_log_ts(ts_str)
                         log_entries.append({
                             "ip": m.group(1),
-                            "ts_str": m.group(2),
+                            "ts_str": ts_str,
+                            "ts": ts_val,
                             "method": m.group(3),
                             "path": m.group(4),
                             "code": int(m.group(5)),
@@ -2336,6 +2405,10 @@ class VisitorTracker:
             status_codes = {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0}
             path_counts = {}
             ip_stats = {}
+            ips_5m = set(live_conn_ips)
+            ips_15m = set(live_conn_ips)
+            parsed_ts_count = 0
+            recent_1m_hits = 0
 
             for entry in log_entries:
                 c = entry["code"]
@@ -2350,6 +2423,18 @@ class VisitorTracker:
 
                 ip = entry["ip"]
                 path = entry["path"]
+                ts = entry.get("ts")
+                if ts is not None:
+                    parsed_ts_count += 1
+                    age = now - ts
+                    if -30 <= age <= 300:
+                        ips_5m.add(ip)
+                        ips_15m.add(ip)
+                        if -30 <= age <= 60:
+                            recent_1m_hits += 1
+                    elif -30 <= age <= 900:
+                        ips_15m.add(ip)
+
                 if self.security_shield and getattr(self.security_shield, "auto_block_hidden_files", True):
                     is_hidden, hidden_reason = self.security_shield.is_hidden_file_probe(path)
                     if is_hidden and not self.is_private_ip(ip):
@@ -2376,6 +2461,11 @@ class VisitorTracker:
                         "count": 1,
                         "ua": "Live Web Client"
                     }
+
+            if parsed_ts_count == 0:
+                # If logs have custom unparseable timestamps, count unique active IPs without the artificial 50-cap
+                ips_5m = set(ip_stats.keys())
+                ips_15m = set(ip_stats.keys())
 
             unknown_ips = [ip for ip in ip_stats.keys() if not self.is_private_ip(ip) and ip not in self.geo_cache]
             if unknown_ips and now - self.last_geo_lookup > 12.0:
@@ -2428,14 +2518,19 @@ class VisitorTracker:
 
             top_paths = sorted(path_counts.items(), key=lambda x: -x[1])[:8]
 
+            if parsed_ts_count > 0:
+                rps_est = round(recent_1m_hits / 60.0, 1) if recent_1m_hits else round(len(live_conn_ips) * 0.4, 1)
+            else:
+                rps_est = round(len(log_entries) / 60.0, 1) if log_entries else round(len(live_conn_ips) * 0.4, 1)
+
             snapshot = {
                 "live_connections": len(live_conn_ips),
-                "active_visitors_5m": max(len(live_conn_ips), len(visitors_list)),
-                "active_visitors_15m": len(ip_stats),
+                "active_visitors_5m": len(ips_5m),
+                "active_visitors_15m": max(len(ips_15m), len(ips_5m)),
                 "threat_count": sum(1 for v in visitors_list if v.get("threat", {}).get("level") in ("threat_high", "threat_med")),
                 "banned_count": len(self.security_shield.banned_ips) if self.security_shield else 0,
                 "banned_ips": self.security_shield.list_banned() if self.security_shield else [],
-                "requests_per_second": round(len(log_entries) / 60.0, 1) if log_entries else round(len(live_conn_ips) * 0.4, 1),
+                "requests_per_second": rps_est,
                 "status_codes": status_codes,
                 "top_paths": [{"path": p, "hits": h} for p, h in top_paths],
                 "visitors": visitors_list
@@ -2634,10 +2729,9 @@ class BenchmarkEngine:
     def _ping_target(self, host, port):
         try:
             t0 = time.time()
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(1.2)
-            s.connect((host, port))
-            s.close()
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1.2)
+                s.connect((host, port))
             return round((time.time() - t0) * 1000.0, 1)
         except Exception:
             return 99.9
@@ -2794,10 +2888,9 @@ class CapacityBenchmark:
     def _detect_default_target(self):
         for port, scheme in [(80, "http"), (443, "https"), (8686, "http"), (8080, "http")]:
             try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(0.3)
-                s.connect(("127.0.0.1", port))
-                s.close()
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(0.3)
+                    s.connect(("127.0.0.1", port))
                 return f"{scheme}://127.0.0.1:{port}/"
             except Exception:
                 pass
@@ -3346,7 +3439,7 @@ class SecurityShield:
         self.state_dir = state_dir
         self.banned_file = os.path.join(state_dir, "banned_ips.json")
         self.banned_ips = {}
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.whitelist = set(self.cfg.get("whitelist_ips", ["127.0.0.1", "::1"]))
         self.auto_block_hidden_files = bool(self.cfg.get("auto_block_hidden_files", True))
         self.alert_callback = None
@@ -3509,12 +3602,14 @@ class SecurityShield:
                 "firewall_applied": applied
             }
             self._save()
-            if self.alert_callback:
-                try:
-                    self.alert_callback(norm_ip, reason, path)
-                except Exception:
-                    pass
-            return True, f"IP {norm_ip} successfully banned."
+            cb = self.alert_callback
+
+        if cb:
+            try:
+                cb(norm_ip, reason, path)
+            except Exception:
+                pass
+        return True, f"IP {norm_ip} successfully banned."
 
     def unban_ip(self, ip):
         if not ip or not isinstance(ip, str):
@@ -3727,7 +3822,7 @@ class SiteMonitor:
         self.custom_sites = set(self.cfg.get("custom_sites", []))
         self.results = {}
         self.history = {}
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.last_check_time = 0.0
         self._load()
 
@@ -3743,11 +3838,21 @@ class SiteMonitor:
 
     def _save(self):
         try:
-            os.makedirs(os.path.dirname(self.sites_file), exist_ok=True)
-            tmp = self.sites_file + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump({"custom_sites": list(self.custom_sites)}, f, indent=2)
-            os.replace(tmp, self.sites_file)
+            d = os.path.dirname(os.path.abspath(self.sites_file))
+            os.makedirs(d, exist_ok=True)
+            with self.lock:
+                sites_copy = sorted(self.custom_sites)
+            fd, tmp = tempfile.mkstemp(prefix=".monitored_sites-", suffix=".tmp", dir=d)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump({"custom_sites": sites_copy}, f, indent=2)
+                os.replace(tmp, self.sites_file)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
         except Exception:
             pass
 
@@ -3978,12 +4083,13 @@ class PortMonitor:
         self.cfg = cfg.get("port_monitor", {})
         self.state_dir = state_dir
         self.ports_file = os.path.join(state_dir, "port_monitor.json")
-        self.custom_ports = []     # list of {host, port, label, protocol}
+        self.custom_ports = list(self.cfg.get("custom_ports", []))
         self.results = {}          # "host:port" -> result dict
         self.history = {}          # "host:port" -> deque(maxlen=30)
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.last_check_time = 0.0
         self.alert_callback = None  # wired by AlertManager
+        self._load()
 
     # ── persistence ──────────────────────────────────────────────────────────
 
@@ -3992,17 +4098,32 @@ class PortMonitor:
             if os.path.isfile(self.ports_file):
                 with open(self.ports_file) as f:
                     data = json.load(f)
-                    self.custom_ports = data.get("custom_ports", [])
+                    loaded = data.get("custom_ports", [])
+                    if isinstance(loaded, list):
+                        existing = {(p.get("host", "127.0.0.1"), p.get("port")) for p in self.custom_ports if isinstance(p, dict)}
+                        for p in loaded:
+                            if isinstance(p, dict) and (p.get("host", "127.0.0.1"), p.get("port")) not in existing:
+                                self.custom_ports.append(p)
         except Exception:
             pass
 
     def _save(self):
         try:
-            os.makedirs(os.path.dirname(self.ports_file), exist_ok=True)
-            tmp = self.ports_file + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump({"custom_ports": self.custom_ports}, f, indent=2)
-            os.replace(tmp, self.ports_file)
+            d = os.path.dirname(os.path.abspath(self.ports_file))
+            os.makedirs(d, exist_ok=True)
+            with self.lock:
+                ports_copy = list(self.custom_ports)
+            fd, tmp = tempfile.mkstemp(prefix=".port_monitor-", suffix=".tmp", dir=d)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump({"custom_ports": ports_copy}, f, indent=2)
+                os.replace(tmp, self.ports_file)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
         except Exception:
             pass
 
@@ -4013,9 +4134,11 @@ class PortMonitor:
         discovered = []
         seen = set()
         try:
-            out = subprocess.check_output(
-                ["ss", "-tlnp"], timeout=5, stderr=subprocess.DEVNULL
-            ).decode(errors="ignore")
+            rc, out = sh(["ss", "-tlnp"], timeout=5)
+            if rc != 0 or not out:
+                rc, out = sh(["ss", "-tln"], timeout=5)
+            if rc != 0 or not out:
+                return discovered
             for line in out.splitlines()[1:]:
                 parts = line.split()
                 if len(parts) < 4:
@@ -4476,7 +4599,7 @@ class FleetManager:
     def __init__(self, cfg, cfg_path=None):
         self.cfg = cfg
         self.cfg_path = cfg_path
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.poll_interval = int(cfg.get("fleet", {}).get("poll_interval_seconds", 60))
         self.timeout = float(cfg.get("fleet", {}).get("timeout_seconds", 4))
         self.last_summary = None
@@ -4752,7 +4875,8 @@ def generate_executive_html(report, history, branding, healing_history):
     logo_markup = f'<img src="{_esc(logo_url)}" style="max-height:44px;max-width:180px;object-fit:contain;margin-bottom:10px;display:block;" alt="{_esc(agency)}">' if logo_url else ''
 
     if white_label:
-        sig_text = branding.get("custom_footer_text") or f"Certified by <b>{_esc(agency)}</b> · All rights reserved."
+        custom_ft = (branding.get("custom_footer_text") or "").strip()
+        sig_text = _esc(custom_ft) if custom_ft else f"Certified by <b>{_esc(agency)}</b> · All rights reserved."
         footer_sub = f'<div>{sig_text} <span style="font-size:11px;color:#94a3b8;margin-left:8px;">v{VERSION}</span></div>'
     else:
         footer_sub = f"<div>Certified by <b>{_esc(agency)}</b> · Generated autonomously by {_esc(app_name)} v{VERSION}</div>"
@@ -5185,33 +5309,42 @@ class Engine:
 
     def _save_state(self):
         path = self.cfg["state_file"]
-        try:
-            self.security_shield._save()
-            self.site_monitor._save()
-            self.port_monitor._save()
+        with self.state_lock:
             try:
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-            except OSError:
-                path = "/tmp/health-sentinel-state.json"
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-            tmp = path + ".tmp"
-            with self.lock:
-                hist_copy = list(self.history)[-_history_maxlen(self.cfg):]
-                alert_copy = dict(self.alert_state)
-                heal_copy = list(self.healing_history)
-            geo_copy = self.visitor_tracker.get_geo_cache_items(200)
-            with open(tmp, "w") as fh:
-                json.dump({
-                    "history": hist_copy,
-                    "alerts": alert_copy,
-                    "healing_history": heal_copy,
-                    "geo_cache": geo_copy,
-                    "last_benchmark": self.benchmark_engine.last_result,
-                    "last_capacity_benchmark": self.capacity_benchmark.last_result
-                }, fh)
-            os.replace(tmp, path)
-        except Exception:
-            pass
+                self.security_shield._save()
+                self.site_monitor._save()
+                self.port_monitor._save()
+                try:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                except OSError:
+                    path = "/tmp/health-sentinel-state.json"
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                with self.lock:
+                    hist_copy = list(self.history)[-_history_maxlen(self.cfg):]
+                    alert_copy = dict(self.alert_state)
+                    heal_copy = list(self.healing_history)
+                geo_copy = self.visitor_tracker.get_geo_cache_items(200)
+                state_dir = os.path.dirname(os.path.abspath(path))
+                fd, tmp = tempfile.mkstemp(prefix=".state-", suffix=".tmp", dir=state_dir)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        json.dump({
+                            "history": hist_copy,
+                            "alerts": alert_copy,
+                            "healing_history": heal_copy,
+                            "geo_cache": geo_copy,
+                            "last_benchmark": self.benchmark_engine.last_result,
+                            "last_capacity_benchmark": self.capacity_benchmark.last_result
+                        }, fh)
+                    os.replace(tmp, path)
+                except Exception:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    raise
+            except Exception:
+                pass
 
     def scan(self, force=False):
         now = time.time()
@@ -5417,7 +5550,7 @@ class AlertManager:
             self._recent_ban_notifs = {k: v for k, v in recent_bans.items() if now - v < 3600}
 
         path_line = f"Path: {path}\n" if path else ""
-        path_row = f"<tr><td style='padding:4px 0;color:#94a3b8;'>Path:</td><td><code>{path}</code></td></tr>" if path else ""
+        path_row = f"<tr><td style='padding:4px 0;color:#94a3b8;'>Path:</td><td><code>{_esc(path)}</code></td></tr>" if path else ""
 
         subject = f"🚨 SECURITY SHIELD: Auto-Blocked {ip} · {self.host}"
         text = (
@@ -5435,9 +5568,9 @@ class AlertManager:
             f"<h3 style='color:#ef4444;margin:0 0 8px;'>🚨 Security Shield Auto-Block</h3>"
             f"<p style='font-size:13px;color:#cbd5e1;margin:0 0 12px;'>A malicious scanner was automatically banned in the firewall for probing hidden files.</p>"
             f"<table style='font-size:13px;border-collapse:collapse;width:100%;'>"
-            f"<tr><td style='padding:4px 0;color:#94a3b8;'>Server:</td><td><b>{self.host}</b></td></tr>"
-            f"<tr><td style='padding:4px 0;color:#94a3b8;'>Blocked IP:</td><td><code style='color:#f43f5e;'>{ip}</code></td></tr>"
-            f"<tr><td style='padding:4px 0;color:#94a3b8;'>Reason:</td><td>{reason}</td></tr>"
+            f"<tr><td style='padding:4px 0;color:#94a3b8;'>Server:</td><td><b>{_esc(self.host)}</b></td></tr>"
+            f"<tr><td style='padding:4px 0;color:#94a3b8;'>Blocked IP:</td><td><code style='color:#f43f5e;'>{_esc(ip)}</code></td></tr>"
+            f"<tr><td style='padding:4px 0;color:#94a3b8;'>Reason:</td><td>{_esc(reason)}</td></tr>"
             f"{path_row}"
             f"<tr><td style='padding:4px 0;color:#94a3b8;'>Firewall Status:</td><td><b style='color:#10b981;'>DROPPED (Active)</b></td></tr>"
             f"</table></div>"
@@ -5498,8 +5631,8 @@ class AlertManager:
             "<tr><td style='padding:4px 12px 4px 0;color:#888;'>Time</td><td>{ts}</td></tr>"
             "</table>"
         ).format(
-            label=label, host=self.host, host_addr=host,
-            port=port, consec=consec, error=error, ts=ts
+            label=_esc(label), host=_esc(self.host), host_addr=_esc(host),
+            port=_esc(port), consec=_esc(consec), error=_esc(error), ts=_esc(ts)
         )
         threading.Thread(
             target=self._send_raw_notification,
@@ -6581,7 +6714,7 @@ function renderServerDoctor(doc){
             <span style="font-size:12.5px;color:var(--mut);">No critical bottlenecks detected. Your server has plenty of CPU, RAM, and disk storage headroom.</span>
           </div>
         </div>
-        <button class="btn" onclick="openQuickActionsModal()" style="height:32px;font-size:12px;">⚡ Server Actions</button>
+        <button class="btn admin-only" onclick="openQuickActionsModal()" style="height:32px;font-size:12px;">⚡ Server Actions</button>
       </div>`;
     return;
   }
@@ -6605,7 +6738,7 @@ function renderServerDoctor(doc){
           <div style="padding:12px 14px;border-radius:12px;background:var(--card);border:1px solid var(--stroke);">
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;flex-wrap:wrap;gap:6px;">
               <b style="font-size:13.5px;color:var(--txt);">⚠️ ${esc(r.problem)}</b>
-              ${r.one_click_action ? `<button class="btn" onclick="doDoctorAction('${r.one_click_action}')" style="height:28px;font-size:11.5px;color:var(--ok);border-color:color-mix(in srgb,var(--ok) 35%,transparent);">⚡ Fix Now</button>` : ''}
+              ${r.one_click_action ? `<button class="btn admin-only" onclick="doDoctorAction('${esc(r.one_click_action)}')" style="height:28px;font-size:11.5px;color:var(--ok);border-color:color-mix(in srgb,var(--ok) 35%,transparent);">⚡ Fix Now</button>` : ''}
             </div>
             <div style="font-size:12px;color:var(--mut);line-height:1.45;margin-bottom:6px;">
               <b>Why this matters:</b> ${esc(r.why_it_matters)}
@@ -6613,7 +6746,7 @@ function renderServerDoctor(doc){
             ${r.fix_command ? `
               <div class="cmd" style="margin-top:6px;">
                 <pre><code>${esc(r.fix_command)}</code></pre>
-                <button class="cp" onclick="cp('${esc(r.fix_command).replace(/'/g,"\\'")}',this)"><svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg></button>
+                <button class="cp" title="Copy Command" onclick="cp(this,${JSON.stringify(r.fix_command).replace(/"/g,'&quot;')})"><svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg></button>
               </div>` : ''}
           </div>
         `).join('')}
@@ -6622,11 +6755,7 @@ function renderServerDoctor(doc){
 }
 
 async function doDoctorAction(act){
-  if(act === 'restart_php_active'){
-    await doPhpAction('all', 'restart');
-  } else {
-    await doSystemAction(act);
-  }
+  await doSystemAction(act);
 }
 
 function renderVisitors(v){
@@ -8671,6 +8800,13 @@ async function saveAlertsConfig(btn){
 
     if(res.ok){
       ALERTS_CONFIG = res.alerts;
+      const enabledChans = Object.entries(ALERTS_CONFIG || {}).filter(([k, v]) => v && typeof v === 'object' && v.enabled).map(([k]) => k);
+      const chansEl = $('#chans');
+      if(chansEl){
+        chansEl.innerHTML = enabledChans.length
+          ? 'Active Alert Channels: ' + enabledChans.map(c => `<span class="ch2 on">${esc(c)}</span>`).join(' ')
+          : '<span class="ch2">No alert channel enabled — configure in config.json</span>';
+      }
       toast('Alerts Config Saved', 'Notification channels and rules saved successfully', 'ok');
       const m = $('#alerts-modal');
       if(m) m.remove();
@@ -9254,7 +9390,8 @@ function confirmStopPhp(service){
 }
 
 document.addEventListener('keydown',e=>{
- if(e.target.tagName==='INPUT')return;
+ if(e.metaKey||e.ctrlKey||e.altKey)return;
+ if(['INPUT','TEXTAREA','SELECT'].includes(e.target.tagName)||e.target.isContentEditable)return;
  if(e.key==='r')scan(); if(e.key==='e')allOpen(!document.querySelector('.card.open'));
  if(e.key==='t')toggleTheme(); if(e.key==='/'){e.preventDefault();$('#q').focus()}});
 
@@ -9828,6 +9965,9 @@ class Handler(BaseHTTPRequestHandler):
                 for s in detect_php_services():
                     if s["is_active"]:
                         results.append(control_php_service(s["service"], action))
+                if not results:
+                    return self._send(200, {"ok": True, "action": action, "batch": True, "results": [],
+                                             "detail": f"No active PHP-FPM services detected to {action}"})
                 any_ok = any(r.get("ok") for r in results)
                 return self._send(200, {"ok": any_ok, "action": action, "batch": True, "results": results,
                                          "detail": f"Ran {action} on {len(results)} active PHP service(s)"})
@@ -10162,7 +10302,7 @@ def main():
         pass
     finally:
         stop.set()
-        srv.shutdown()
+        srv.server_close()
     return 0
 
 

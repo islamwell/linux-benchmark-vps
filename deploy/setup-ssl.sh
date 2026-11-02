@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — Automated SSL/TLS Reverse Proxy Deployer
-# Version: 2.2.23 (updated 2026-09-29 20:15)
+# Version: 2.2.25 (updated 2026-11-02 06:20)
 # ==============================================================================
 
 set -euo pipefail
@@ -25,13 +25,24 @@ echo -e "${C_BLUE}║  ${C_BOLD}🔒  LINUX HEALTH SENTINEL — AUTOMATED SSL/TL
 echo -e "${C_BLUE}╚════════════════════════════════════════════════════════════════════════════╝${C_RESET}\n"
 
 SENTINEL_PORT="8686"
+if [ -f "/etc/health-sentinel/config.json" ] && command -v python3 >/dev/null 2>&1; then
+    SENTINEL_PORT=$(python3 -c "import json; print(json.load(open('/etc/health-sentinel/config.json')).get('web', {}).get('port', 8686))" 2>/dev/null || echo "8686")
+fi
 DOMAIN="${1:-}"
 PROXY_TYPE="${2:-auto}"
 
 if [ -z "$DOMAIN" ]; then
     echo -e "${C_BOLD}Configure HTTPS for Linux Health Sentinel${C_RESET}"
     echo -e "Protects tokens and dashboard metrics from network eavesdropping.\n"
-    read -rp "Enter your fully qualified domain (e.g. status.yourdomain.com) or IP: " DOMAIN
+    if [ -t 0 ]; then
+        read -rp "Enter your fully qualified domain (e.g. status.yourdomain.com) or IP: " DOMAIN || DOMAIN=""
+    elif [ -r /dev/tty ] && [ -t 1 ]; then
+        read -rp "Enter your fully qualified domain (e.g. status.yourdomain.com) or IP: " DOMAIN </dev/tty || DOMAIN=""
+    fi
+    if [ -z "$DOMAIN" ]; then
+        DOMAIN=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "localhost")
+        echo -e "    ${C_DIM}Auto-selected host: ${DOMAIN}${C_RESET}"
+    fi
 fi
 
 if [ -z "$DOMAIN" ]; then
@@ -151,7 +162,12 @@ else
         setup_nginx
     else
         echo -e "Available SSL setups:\n  1) Caddy (Recommended — 100% automatic Let's Encrypt HTTPS)\n  2) Nginx + Certbot\n  3) Self-signed SSL certificate\n"
-        read -rp "Select option [1-3, default 1]: " CHO || CHO="1"
+        CHO="1"
+        if [ -t 0 ]; then
+            read -rp "Select option [1-3, default 1]: " CHO || CHO="1"
+        elif [ -r /dev/tty ] && [ -t 1 ]; then
+            read -rp "Select option [1-3, default 1]: " CHO </dev/tty || CHO="1"
+        fi
         case "$CHO" in
             2) setup_nginx ;;
             3) setup_self_signed ;;

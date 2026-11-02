@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — Automated Installer & Service Manager
-# Version: 2.2.24 (updated 2026-10-14 00:05)
+# Version: 2.2.25 (updated 2026-11-02 06:20)
 # ==============================================================================
 
 set -euo pipefail
 
-VERSION="2.2.24"
-UPDATED="2026-10-14 00:05"
+VERSION="2.2.25"
+UPDATED="2026-11-02 06:20"
 
 # Target installation paths
 INSTALL_DIR="/opt/health-sentinel"
@@ -493,10 +493,10 @@ if [ "$ENABLE_SSL" = true ]; then
 fi
 
 python3 - "${CONFIG_FILE}" "${VERSION}" <<'PYEOF'
-import json, sys, socket, urllib.request, secrets
+import json, sys, socket, subprocess, urllib.request, secrets
 
 config_path = sys.argv[1]
-version = sys.argv[2] if len(sys.argv) > 2 else "2.2.24"
+version = sys.argv[2] if len(sys.argv) > 2 else "2.2.25"
 
 try:
     with open(config_path) as f:
@@ -573,15 +573,19 @@ view_url = f"http://{target_host}:{port}{view_query}"
 # ANSI Colors
 C_GREEN = "\033[38;5;42m"
 C_BLUE = "\033[38;5;111m"
+C_WARN = "\033[38;5;214m"
 C_BOLD = "\033[1m"
 C_DIM = "\033[38;5;245m"
 C_RESET = "\033[0m"
+
+svc_active = subprocess.run(["systemctl", "is-active", "--quiet", "sentinel"]).returncode == 0
+svc_label = f"{C_GREEN}active (running){C_RESET}" if svc_active else f"{C_WARN}starting / check 'systemctl status sentinel'{C_RESET}"
 
 print(f"\n{C_GREEN}╔════════════════════════════════════════════════════════════════════════════╗{C_RESET}")
 print(f"{C_GREEN}║  {C_BOLD}✓  INSTALLATION SUCCESSFUL — LINUX HEALTH SENTINEL v{version:<21}{C_RESET}{C_GREEN}║{C_RESET}")
 print(f"{C_GREEN}╚════════════════════════════════════════════════════════════════════════════╝{C_RESET}\n")
 
-print(f"  ▸ Service Status: {C_GREEN}active (running){C_RESET}")
+print(f"  ▸ Service Status: {svc_label}")
 print(f"  ▸ Network Bind  : {bind}:{port}")
 if sys_hostname:
     print(f"  ▸ Hostname      : {sys_hostname}")
