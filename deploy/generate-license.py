@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Linux Health Sentinel — Commercial License Generator
-Version: 2.2.25 (updated 2026-11-02 06:20)
+Version: 2.2.26 (updated 2026-11-07 22:20)
 
 Generates tamper-proof cryptographic license keys for Sentinel Pro and Agency tiers.
 Usage:

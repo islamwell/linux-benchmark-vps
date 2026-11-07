@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — Automated Installer & Service Manager
-# Version: 2.2.25 (updated 2026-11-02 06:20)
+# Version: 2.2.26 (updated 2026-11-07 22:20)
 # ==============================================================================
 
 set -euo pipefail
 
-VERSION="2.2.25"
-UPDATED="2026-11-02 06:20"
+VERSION="2.2.26"
+UPDATED="2026-11-07 22:20"
 
 # Target installation paths
 INSTALL_DIR="/opt/health-sentinel"
@@ -496,7 +496,7 @@ python3 - "${CONFIG_FILE}" "${VERSION}" <<'PYEOF'
 import json, sys, socket, subprocess, urllib.request, secrets
 
 config_path = sys.argv[1]
-version = sys.argv[2] if len(sys.argv) > 2 else "2.2.25"
+version = sys.argv[2] if len(sys.argv) > 2 else "2.2.26"
 
 try:
     with open(config_path) as f:

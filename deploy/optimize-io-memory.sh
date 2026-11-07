@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — Automated Software-Level I/O & Memory Tuning Script
-# Version: 2.2.25 (updated 2026-11-02 06:20)
+# Version: 2.2.26 (updated 2026-11-07 22:20)
 #
 # This script applies non-destructive kernel, filesystem, and database tweaks
 # to drastically reduce disk I/O bottlenecks (iowait) and maximize RAM usage

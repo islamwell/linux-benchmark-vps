@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — 1-Command Universal Auto-Updater
-# Version: 2.2.25 (updated 2026-11-02 06:20)
+# Version: 2.2.26 (updated 2026-11-07 22:20)
 # ==============================================================================
 
 set -euo pipefail
 
-VERSION="2.2.25"
+VERSION="2.2.26"
 
 C_RESET="\033[0m"
 C_BOLD="\033[1m"
@@ -158,7 +158,7 @@ python3 - "${CONFIG_FILE}" "${VERSION}" <<'PYEOF'
 import json, sys, socket, subprocess, urllib.request, secrets
 
 config_path = sys.argv[1]
-version = sys.argv[2] if len(sys.argv) > 2 else "2.2.25"
+version = sys.argv[2] if len(sys.argv) > 2 else "2.2.26"
 
 try:
     with open(config_path) as f:

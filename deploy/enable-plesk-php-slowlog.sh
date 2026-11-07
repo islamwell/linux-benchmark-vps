@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux Health Sentinel — Plesk & Linux PHP-FPM Slowlog Safe Configuration
-# Version: 2.2.25 (updated 2026-11-02 06:20)
+# Version: 2.2.26 (updated 2026-11-07 22:20)
 #
 # Safely configures PHP-FPM slow logging with:
 #  - Automatic configuration backups
@@ -91,10 +91,17 @@ for PLESK_PHP_DIR in /opt/plesk/php/*/etc/php-fpm.d; do
 
         echo "[+] Processing Plesk PHP ${PHP_VER} in ${PLESK_PHP_DIR}..."
 
+        MOD_IN_DIR=0
         for CONF in "$PLESK_PHP_DIR"/*.conf; do
             [ -e "$CONF" ] || continue
             configure_pool_file "$CONF" "$SLOW_LOG"
+            MOD_IN_DIR=$((MOD_IN_DIR + 1))
         done
+
+        if [ "$MOD_IN_DIR" -eq 0 ]; then
+            echo "    No custom pools found in ${PLESK_PHP_DIR} (skipping syntax check until customer pools exist)."
+            continue
+        fi
 
         # Syntax test for Plesk PHP
         FPM_BIN="${PHP_ROOT}/sbin/php-fpm"
@@ -118,10 +125,17 @@ for SYS_POOL_DIR in /etc/php/*/fpm/pool.d /etc/php-fpm.d; do
         SYS_LOG="/var/log/php-fpm-slow.log"
         touch "$SYS_LOG" && chmod 640 "$SYS_LOG"
 
+        MOD_IN_DIR=0
         for CONF in "$SYS_POOL_DIR"/*.conf; do
             [ -e "$CONF" ] || continue
             configure_pool_file "$CONF" "$SYS_LOG"
+            MOD_IN_DIR=$((MOD_IN_DIR + 1))
         done
+
+        if [ "$MOD_IN_DIR" -eq 0 ]; then
+            echo "    No custom pools found in ${SYS_POOL_DIR}."
+            continue
+        fi
 
         # Detect service name
         if [[ "$SYS_POOL_DIR" =~ /etc/php/([0-9.]+)/fpm/pool.d ]]; then
